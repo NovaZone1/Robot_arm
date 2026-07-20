@@ -1,0 +1,22 @@
+grasp_pipeline:
+  ros__parameters:
+    prompt: ""
+    robot_backend: "fake"
+    execute: false
+    probe_robot: false
+    enable_robot: false
+    show_pointcloud: false
+    precenter: false
+    confirm: false
+    pointcloud_filter_mode: "bilateral"
+    pointcloud_backend: "sdk"
+    depth_fusion_frames: 8
+    can: "can0"
+    speed: 15
+    graspnet_checkpoint: "checkpoint.tar"
+    hand_eye_config: ""
+    extra_cli_args: []
+    auto_start: false
+    rviz_camera_frame: "camera_color_optical_frame"
+    rviz_base_frame: "base_link"
+    rviz_candidate_topk: 5

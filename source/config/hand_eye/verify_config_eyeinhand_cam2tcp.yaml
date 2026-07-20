@@ -1,0 +1,5 @@
+calibration:
+  camera_to_tcp_xyz_mm: [-56.17, 45.34, 69.01]
+  camera_to_tcp_rpy_deg: [-26.98, -0.80, -92.23]
+  base_frame: "base_link"
+  camera_frame: "camera_color_optical_frame"

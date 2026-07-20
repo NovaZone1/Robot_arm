@@ -1,0 +1,9 @@
+int32 instance_index
+float64 score
+float64 width_m
+float64 depth_m
+geometry_msgs/Point translation_camera_m
+geometry_msgs/Quaternion orientation_camera
+bool has_object_center
+geometry_msgs/Point object_center_camera_m
+float64 center_offset_m

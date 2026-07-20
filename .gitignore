@@ -1,0 +1,43 @@
+# ROS build artifacts
+build/
+build.pre_move_*/
+devel/
+install/
+install.pre_move_*/
+build_msgs/
+install_msgs/
+log_msgs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Logs & temp
+log/
+logs/
+tmp/
+*.log
+output/
+viz/
+*.npy
+*.ply
+*.pcd
+*.db3
+*.mcap
+
+# Large model files
+*.tar
+*.tar.gz
+*.zip
+
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# ROS
+*.bag

@@ -1,0 +1,6 @@
+vision_worker:
+  ros__parameters:
+    worker_python_executable: "/home/ybw/miniforge3/envs/piper/bin/python"
+    worker_script: "/home/ybw/piper_grasp_project/source/src/perception/external_inference_worker.py"
+    worker_timeout_s: 300.0
+    worker_mode: "daemon"

@@ -1,0 +1,19 @@
+string run_id
+string scene_id
+string prompt
+string camera_frame
+sensor_msgs/Image color_image
+sensor_msgs/Image depth_image
+sensor_msgs/CameraInfo camera_info
+Pose6D tcp_pose
+geometry_msgs/TransformStamped base_to_camera
+string options_json
+---
+bool success
+string message
+PerceptionSummary perception
+GraspCandidate[] candidate_pool
+bool has_selected_candidate
+GraspCandidate selected_candidate
+string diagnostics_json
+string summary

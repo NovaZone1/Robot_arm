@@ -1,0 +1,46 @@
+grasp_pipeline:
+  ros__parameters:
+    prompt: ""
+    execute: false
+    move_home_after: false
+    enable_pregrasp: false
+    show_pointcloud: false
+    precenter: false
+    confirm: false
+    pointcloud_filter_mode: "bilateral"
+    pointcloud_backend: "sdk"
+    depth_fusion_frames: 8
+    speed: 5
+    graspnet_checkpoint: "checkpoint.tar"
+    hand_eye_config: "/home/ybw/piper_grasp_project/source/config/hand_eye/verify_config_eyeinhand_cam2tcp.yaml"
+    apply_npoint_tool_offset: false
+    npoint_tool_offset_file: ""
+    tool_contact_offset_scale: 0.5
+    safe_top_down_candidate_filter: true
+    use_object_center_contact: true
+    object_center_contact_max_offset_m: 0.08
+    manual_target_bias_x_mm: 0.0
+    manual_target_bias_y_mm: 0.0
+    manual_target_bias_z_mm: 0.0
+    table_z_m: 0.161
+    min_gripper_table_clearance_m: 0.03
+    pregrasp_offset_m: 0.08
+    descend_offset_m: 0.015
+    grasp_z_offset_m: 0.050
+    retreat_offset_m: 0.10
+    workspace_x: [-1.20, 1.20]
+    workspace_y: [-0.50, 0.50]
+    workspace_z: [-0.15, 0.60]
+    robot_validation_candidate_limit: 6
+    robot_validation_variant_limit: 4
+    extra_cli_args: [""]
+    auto_start: false
+    skip_observation_move: false
+    observe_pose: [0.0, 35.5, 491.1, 180.0, 67.77, -89.97]
+    camera_capture_service: "/camera_server/capture"
+    vision_analyze_service: "/vision_worker/analyze"
+    robot_state_service: "/robot_executor/get_state"
+    robot_named_pose_service: "/robot_executor/execute_named_pose"
+    robot_execute_plan_service: "/robot_executor/execute_grasp_plan"
+    robot_stop_service: "/robot_executor/stop_robot"
+    artifact_root: ""

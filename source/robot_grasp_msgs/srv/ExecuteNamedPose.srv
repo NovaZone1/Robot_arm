@@ -1,0 +1,8 @@
+string name
+Pose6D pose
+float32 speed_percent
+bool open_gripper_first
+---
+bool success
+string message
+Pose6D actual_pose

@@ -1,0 +1,12 @@
+string run_id
+int32 depth_fusion_frames
+string pointcloud_filter_mode
+string pointcloud_backend
+---
+bool success
+string message
+string scene_id
+string camera_frame
+sensor_msgs/Image color_image
+sensor_msgs/Image depth_image
+sensor_msgs/CameraInfo camera_info

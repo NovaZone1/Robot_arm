@@ -1,0 +1,5 @@
+---
+bool success
+string message
+Pose6D current_pose
+string arm_status

@@ -1,0 +1,10 @@
+GraspCandidate candidate
+Pose6D target_pose
+Pose6D pregrasp_pose
+Pose6D grasp_pose
+Pose6D retreat_pose
+bool within_workspace
+string[] workspace_violations
+bool has_tool_contact_geometry
+geometry_msgs/Vector3 target_contact_point_base_m
+geometry_msgs/Vector3 tool_contact_offset_tool_m
