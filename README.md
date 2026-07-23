@@ -1,35 +1,328 @@
-# Piper Grasp Project Layout
+# Robot Arm - Piper Grasp Project
 
-这个目录把比赛抓取任务的源码、ROS 工作区、Piper 依赖、GraspNet 和运行产物集中在一起。
+无人系统大赛机械臂抓取项目源码。
 
-## Directory Map
+本项目基于 **Piper 机械臂 + ROS2 + GraspNet** 构建，实现目标物体识别、抓取规划以及机械臂执行控制功能。
 
-- `source/`：抓取项目主源码；日常开发入口。
-- `ros_ws/`：抓取系统 ROS2 工作区；`src/` 指向 `source/` 中的包。
-- `piper_ros_ws/`：AgileX `piper_ros` 源码和安装 overlay。
-- `piper_sdk/`：Piper ROS 驱动运行时使用的底层 SDK。
-- `graspnet/`：GraspNet baseline 和 `checkpoint-rs.tar`。
-- `logs/`：分布式单次抓取产物和一键启动日志。
-- `tmp/`：Piper 驱动的临时 ROS 日志。
+项目将机械臂驱动、视觉抓取算法、ROS 工作空间以及运行工具统一管理，方便开发、调试和比赛部署。
 
-## Main Entry Points
+---
+
+## ✨ 项目简介
+
+本项目主要面向机器人自动抓取任务，包含：
+
+* 机械臂 ROS2 控制
+* 视觉感知与目标检测
+* GraspNet 抓取姿态预测
+* 抓取任务规划
+* 自动化启动与运行管理
+
+系统整体流程：
+
+```
+Camera
+  │
+  ▼
+Object Perception
+  │
+  ▼
+Grasp Pose Prediction (GraspNet)
+  │
+  ▼
+Motion Planning
+  │
+  ▼
+Piper Robot Arm
+  │
+  ▼
+Object Grasping
+```
+
+---
+
+# 📂 项目结构
+
+```
+Robot_arm/
+│
+├── source/
+│   └── 抓取任务核心源码
+│
+├── ros_ws/
+│   └── ROS2 工作空间
+│       └── src/
+│           └── 指向 source 中的 ROS package
+│
+├── piper_ros_ws/
+│   └── Piper ROS 驱动源码及环境
+│
+├── piper_sdk/
+│   └── Piper 底层控制 SDK
+│
+├── graspnet/
+│   ├── GraspNet baseline
+│   └── 模型 checkpoint 文件
+│
+├── logs/
+│   └── 抓取运行日志
+│
+├── tmp/
+│   └── ROS 临时运行文件
+│
+└── README.md
+```
+
+---
+
+# 🛠️ 环境要求
+
+推荐环境：
+
+* Ubuntu 22.04
+* ROS2 Humble
+* Python 3.x
+* CUDA（根据 GraspNet 推理需求配置）
+* Piper Robot Arm
+
+主要依赖：
+
+* ROS2
+* MoveIt2
+* OpenCV
+* PyTorch
+* GraspNet
+* Piper SDK
+
+---
+
+# 🚀 快速开始
+
+## 1. 克隆仓库
 
 ```bash
-cd /home/ybw/piper_grasp_project/source
+git clone https://github.com/NovaZone1/Robot_arm.git
+
+cd Robot_arm
+```
+
+---
+
+# 2. 配置 ROS2 工作空间
+
+进入 ROS 工作空间：
+
+```bash
+cd ros_ws
+```
+
+编译：
+
+```bash
+colcon build
+```
+
+加载环境：
+
+```bash
+source install/setup.bash
+```
+
+---
+
+# 3. 配置 Piper 驱动
+
+进入 Piper ROS 工作空间：
+
+```bash
+cd piper_ros_ws
+```
+
+编译：
+
+```bash
+colcon build
+```
+
+加载环境：
+
+```bash
+source install/setup.bash
+```
+
+---
+
+# 4. 启动抓取系统
+
+进入项目源码目录：
+
+```bash
+cd source
+```
+
+运行抓取控制程序：
+
+```bash
 ./scripts/run_grasp_dashboard.py
 ```
 
-或者：
+或者使用一键启动：
 
 ```bash
-cd /home/ybw/piper_grasp_project/source
 ./scripts/run_live_grasp_one_click.sh
 ```
 
-## Development Rules
+---
 
-- 只在 `source/` 中修改抓取业务代码。
-- `ros_ws/src/` 是软链接，不是另一份源码。
-- 修改 `robot_grasp_msgs/msg`、`srv` 或 `action` 后，需要在 `ros_ws/` 重新构建。
-- 真机控制必须经过 `piper_ros`，业务代码不要直接依赖 `piper_sdk`。
-- 正常失能机械臂前必须先回到 Home；急停除外。
+# 🦾 系统模块说明
+
+## Piper Robot Control
+
+负责：
+
+* 机械臂通信
+* 关节控制
+* 运动执行
+
+目录：
+
+```
+piper_sdk/
+piper_ros_ws/
+```
+
+---
+
+## GraspNet Grasp Detection
+
+负责：
+
+* RGB-D 数据处理
+* 抓取姿态预测
+* 最优抓取点生成
+
+目录：
+
+```
+graspnet/
+```
+
+---
+
+## ROS2 Workspace
+
+负责：
+
+* 节点管理
+* 消息通信
+* 机械臂任务调度
+
+目录：
+
+```
+ros_ws/
+```
+
+---
+
+# 📌 开发规范
+
+为了保持项目结构清晰：
+
+* 业务代码统一修改：
+
+```
+source/
+```
+
+* ROS workspace 中：
+
+```
+ros_ws/src/
+```
+
+仅作为源码链接和 ROS 编译入口。
+
+* 不建议直接修改生成文件：
+
+```
+build/
+install/
+log/
+```
+
+---
+
+# 🧪 调试
+
+查看 ROS 节点：
+
+```bash
+ros2 node list
+```
+
+查看话题：
+
+```bash
+ros2 topic list
+```
+
+查看日志：
+
+```bash
+ls logs/
+```
+
+---
+
+# 📊 项目流程
+
+```
+启动 ROS 环境
+        │
+        ▼
+加载 Piper 驱动
+        │
+        ▼
+启动视觉系统
+        │
+        ▼
+GraspNet 推理
+        │
+        ▼
+生成抓取姿态
+        │
+        ▼
+机械臂执行抓取
+```
+
+---
+
+# 🤝 Contribution
+
+欢迎提交：
+
+* Bug 修复
+* 功能优化
+* 算法改进
+* 文档完善
+
+提交 Pull Request 前请确保：
+
+* 代码能够正常编译
+* ROS 节点运行正常
+* 不提交大规模模型文件
+
+---
+
+# 📜 License
+
+本项目仅用于学习、研究以及机器人竞赛用途。
+
+---
+
+# 👥 Author
+
+NovaZone1
+
+Robot Arm Grasp Project
