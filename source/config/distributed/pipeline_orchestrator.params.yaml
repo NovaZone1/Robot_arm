@@ -24,6 +24,9 @@ grasp_pipeline:
     manual_target_bias_z_mm: 0.0
     table_z_m: 0.161
     min_gripper_table_clearance_m: 0.03
+    # Grip the fixed 60 mm cubes 15 mm above geometric center to keep the
+    # fingertips safely clear of the table.
+    color_block_center_height_m: 0.045
     pregrasp_offset_m: 0.08
     descend_offset_m: 0.015
     grasp_z_offset_m: 0.050

@@ -143,6 +143,7 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("manual_target_bias_z_mm", 0.0)
         self.declare_parameter("table_z_m", 0.0)
         self.declare_parameter("min_gripper_table_clearance_m", 0.03)
+        self.declare_parameter("color_block_center_height_m", 0.045)
         self.declare_parameter("pregrasp_offset_m", 0.0)
         self.declare_parameter("descend_offset_m", 0.0)
         self.declare_parameter("grasp_z_offset_m", 0.0)
@@ -420,6 +421,9 @@ class PipelineOrchestratorNode(Node):
             "manual_target_bias_z_mm": float(self.get_parameter("manual_target_bias_z_mm").value),
             "table_z_m": float(self.get_parameter("table_z_m").value),
             "min_gripper_table_clearance_m": float(self.get_parameter("min_gripper_table_clearance_m").value),
+            "color_block_center_height_m": float(
+                self.get_parameter("color_block_center_height_m").value
+            ),
             "pregrasp_offset_m": float(self.get_parameter("pregrasp_offset_m").value),
             "descend_offset_m": float(self.get_parameter("descend_offset_m").value),
             "grasp_z_offset_m": float(self.get_parameter("grasp_z_offset_m").value),
@@ -665,6 +669,7 @@ class PipelineOrchestratorNode(Node):
         plan,
         candidate,
         base_to_camera: np.ndarray,
+        prompt: str = "",
     ):
         if not bool(self.get_parameter("use_object_center_contact").value):
             return plan
@@ -715,6 +720,15 @@ class PipelineOrchestratorNode(Node):
         # only the GraspNet contact sample with the segmented object's geometric center.
         planner_contact_offset = original_contact - selected_base
         center_contact = center_base + planner_contact_offset
+        normalized_prompt = str(prompt or "").strip().lower()
+        if any(token in normalized_prompt for token in ("block", "物块", "方块", "立方体")):
+            table_z_m = float(self.get_parameter("table_z_m").value)
+            center_height_m = float(self.get_parameter("color_block_center_height_m").value)
+            manual_bias_z_m = float(self.get_parameter("manual_target_bias_z_mm").value) / 1000.0
+            # The competition blocks are fixed 60 mm cubes. Their RGB-D depth
+            # can drift near the image edge, so use the known table-relative
+            # grasp center instead of lowering the tool based on that drift.
+            center_contact[2] = table_z_m + center_height_m + manual_bias_z_m
         minimum_contact_z_m = float(self.get_parameter("table_z_m").value) + float(
             self.get_parameter("min_gripper_table_clearance_m").value
         )
@@ -1240,6 +1254,7 @@ class PipelineOrchestratorNode(Node):
                             plan=built_plan,
                             candidate=item,
                             base_to_camera=base_to_camera,
+                            prompt=prompt,
                         )
                         for built_plan in planner.plan_grasp_variants(
                             item,
@@ -1303,6 +1318,7 @@ class PipelineOrchestratorNode(Node):
                     plan=plan,
                     candidate=candidate,
                     base_to_camera=base_to_camera,
+                    prompt=prompt,
                 )
 
             result_payload.update(

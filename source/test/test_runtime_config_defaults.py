@@ -38,7 +38,7 @@ def test_build_parser_defaults_match_robotarm_exp_runtime():
     assert args.grasp_close_effort_nm == 0.6
     assert args.gripper_length_m == 0.105
     assert args.tool_contact_offset_scale == 1.0
-    assert args.max_reachable_rotation_delta_deg == 120.0
+    assert args.max_reachable_rotation_delta_deg == 180.0
     assert args.min_gripper_table_clearance_m == 0.03
     assert tuple(args.home_pose) == (57.0, 0.0, 215.0, 0.0, 85.0, 0.0)
     assert tuple(args.handoff_pose) == (200.0, 20.0, 300.0, 10.0, 120.0, 0.0)
@@ -53,7 +53,7 @@ def test_grasp_execution_config_defaults_match_runtime_defaults():
     assert config.handoff_pose_mm_deg == (200.0, 20.0, 300.0, 10.0, 120.0, 0.0)
     assert config.observe_pose_mm_deg == (30.0, 0.0, 400.0, 0.0, 120.0, 0.0)
     assert config.precenter_before_grasp is False
-    assert config.max_reachable_rotation_delta_deg == 120.0
+    assert config.max_reachable_rotation_delta_deg == 180.0
     assert config.gripper_length_m == 0.105
     assert config.grasp_close_effort_nm == 0.6
     assert config.min_gripper_table_clearance_m == 0.03
@@ -80,7 +80,14 @@ def test_distributed_competition_defaults_use_center_horizontal_grasp():
         PROJECT_ROOT / "config" / "distributed" / "robot_executor.params.yaml"
     ).read_text(encoding="utf-8")
     dashboard_source = (PROJECT_ROOT / "scripts" / "run_grasp_dashboard.py").read_text(encoding="utf-8")
+    executor_source = (PROJECT_ROOT / "robot_grasp_ros2" / "robot_executor_node.py").read_text(
+        encoding="utf-8"
+    )
 
+    assert 'ARTIFACT_ROOT = BUNDLE_ROOT / "log" / "distributed_runs"' in dashboard_source
+    assert "stack_ready = all(components.values())" in dashboard_source
+    assert '"timeout_s": 12.0' not in executor_source
+    assert "timeout_s=self._plan_pose_timeout_s()" in executor_source
     assert "use_object_center_contact: true" in pipeline_yaml
     assert "object_center_contact_max_offset_m: 0.08" in pipeline_yaml
     assert 'execution_strategy: "center_horizontal"' in executor_yaml
@@ -94,6 +101,20 @@ def test_distributed_competition_defaults_use_center_horizontal_grasp():
     assert "speed: 5" in pipeline_yaml
     assert 'id="centerContactInput" type="checkbox" checked' in dashboard_source
     assert 'id="speedRangeInput" type="range" min="1" max="100" step="1" value="5"' in dashboard_source
+    assert (
+        'data-prompt="red block" data-center-contact="true" '
+        'data-execution-strategy="safe_top_down"'
+    ) in dashboard_source
+    assert (
+        'data-prompt="yellow block" data-center-contact="true" '
+        'data-execution-strategy="safe_top_down"'
+    ) in dashboard_source
+    assert (
+        'data-prompt="blue block" data-center-contact="true" '
+        'data-execution-strategy="safe_top_down"'
+    ) in dashboard_source
+    assert 'id="executionStrategyInput"' in dashboard_source
+    assert 'execution_strategy: document.getElementById("executionStrategyInput").value' in dashboard_source
 
 
 def test_build_runtime_config_applies_npoint_tool_offset(tmp_path):

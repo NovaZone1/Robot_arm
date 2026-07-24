@@ -108,6 +108,9 @@ class RobotExecutorNode(Node):
         self.declare_parameter("center_horizontal_follow_target_azimuth", True)
         self.declare_parameter("center_horizontal_reference_azimuth_deg", 90.0)
         self.declare_parameter("center_horizontal_max_yaw_adjust_deg", 45.0)
+        self.declare_parameter("safe_top_down_follow_target_azimuth", True)
+        self.declare_parameter("safe_top_down_reference_azimuth_deg", 90.0)
+        self.declare_parameter("safe_top_down_max_yaw_adjust_deg", 45.0)
         self.declare_parameter("top_down_min_safe_z_mm", 300.0)
         self.declare_parameter("top_down_min_target_z_mm", 300.0)
         self.declare_parameter("top_down_approach_height_mm", 110.0)
@@ -115,6 +118,8 @@ class RobotExecutorNode(Node):
         self.declare_parameter("top_down_lift_to_safe_z", True)
         self.declare_parameter("top_down_lateral_step_mm", 35.0)
         self.declare_parameter("top_down_vertical_step_mm", 25.0)
+        self.declare_parameter("safe_top_down_vertical_step_mm", 80.0)
+        self.declare_parameter("safe_top_down_final_speed_percent", 2.0)
         self.declare_parameter("top_down_max_speed_percent", 10.0)
         self.declare_parameter("handoff_pose", [200.0, 20.0, 300.0, 10.0, 120.0, 0.0])
         self.declare_parameter("home_pose", [57.0, 0.0, 215.0, 0.0, 85.0, 0.0])
@@ -215,9 +220,18 @@ class RobotExecutorNode(Node):
 
     def _safe_cartesian_rpy_variants(self, plan) -> list[tuple[float, float, float]]:
         variants = self._top_down_rpy_variants_deg()
-        if self._execution_strategy() != "center_horizontal":
+        strategy = self._execution_strategy()
+        if strategy == "center_horizontal":
+            follow_parameter = "center_horizontal_follow_target_azimuth"
+            reference_parameter = "center_horizontal_reference_azimuth_deg"
+            max_adjust_parameter = "center_horizontal_max_yaw_adjust_deg"
+        elif strategy == "safe_top_down":
+            follow_parameter = "safe_top_down_follow_target_azimuth"
+            reference_parameter = "safe_top_down_reference_azimuth_deg"
+            max_adjust_parameter = "safe_top_down_max_yaw_adjust_deg"
+        else:
             return variants
-        if not bool(self.get_parameter("center_horizontal_follow_target_azimuth").value):
+        if not bool(self.get_parameter(follow_parameter).value):
             return variants
         contact = plan.target_contact_point_base_m
         if contact is None or len(contact) < 2:
@@ -227,13 +241,11 @@ class RobotExecutorNode(Node):
         if math.hypot(x_m, y_m) <= 1e-6:
             raise RuntimeError("center_horizontal target contact point is too close to base axis")
         target_azimuth_deg = math.degrees(math.atan2(y_m, x_m))
-        reference_azimuth_deg = float(
-            self.get_parameter("center_horizontal_reference_azimuth_deg").value
-        )
+        reference_azimuth_deg = float(self.get_parameter(reference_parameter).value)
         yaw_delta_deg = self._normalize_angle_deg(target_azimuth_deg - reference_azimuth_deg)
         max_adjust_deg = max(
             0.0,
-            float(self.get_parameter("center_horizontal_max_yaw_adjust_deg").value),
+            float(self.get_parameter(max_adjust_parameter).value),
         )
         yaw_delta_deg = max(-max_adjust_deg, min(max_adjust_deg, yaw_delta_deg))
         return [
@@ -260,7 +272,18 @@ class RobotExecutorNode(Node):
         return max(5.0, float(self.get_parameter("top_down_lateral_step_mm").value or 35.0))
 
     def _top_down_vertical_step_mm(self) -> float:
+        if self._execution_strategy() == "safe_top_down":
+            return max(
+                5.0,
+                float(self.get_parameter("safe_top_down_vertical_step_mm").value or 80.0),
+            )
         return max(5.0, float(self.get_parameter("top_down_vertical_step_mm").value or 25.0))
+
+    def _safe_top_down_final_speed_percent(self) -> float:
+        return max(
+            1.0,
+            float(self.get_parameter("safe_top_down_final_speed_percent").value or 2.0),
+        )
 
     def _top_down_speed_percent(self) -> float:
         return min(self._default_speed(), max(1.0, float(self.get_parameter("top_down_max_speed_percent").value or 10.0)))
@@ -1100,38 +1123,50 @@ class RobotExecutorNode(Node):
         )
 
         descend_steps = 0
+        descend_step_total = sum(
+            1 for name, _pose in top_down_waypoints if name.startswith("topdown_descend")
+        )
         lift_steps = 0
         for step_name, waypoint in top_down_waypoints:
+            command_speed_percent = speed_percent
+            is_descend = step_name.startswith("topdown_descend")
+            if (
+                strategy == "safe_top_down"
+                and is_descend
+                and descend_steps + 1 == descend_step_total
+            ):
+                command_speed_percent = min(
+                    speed_percent,
+                    self._safe_top_down_final_speed_percent(),
+                )
             actual = self._run_traced_action(
                 execution_trace=execution_trace,
                 step_name=step_name,
                 command_type="move_pose",
                 command_payload={
                     "pose_mm_deg": self._pose_to_dict(waypoint),
-                    "speed_percent": float(speed_percent),
+                    "speed_percent": float(command_speed_percent),
                     "timeout_s": float(self._plan_pose_timeout_s()),
                     "execution_strategy": strategy,
                 },
-                action=lambda pose=waypoint, name=step_name: self._move_pose_sync(
+                action=lambda pose=waypoint, name=step_name, move_speed=command_speed_percent: self._move_pose_sync(
                     name=name,
                     pose=pose,
-                    speed_percent=speed_percent,
+                    speed_percent=move_speed,
                     timeout_s=self._plan_pose_timeout_s(),
                     tighten_position_tolerance=True,
                 ),
             )
             if step_name.startswith("topdown_lift_clear") or step_name.startswith("topdown_lateral"):
                 pregrasp_actual = actual
-            elif step_name.startswith("topdown_descend"):
+            elif is_descend:
                 target_actual = actual
                 descend_steps += 1
             elif step_name.startswith("topdown_lift_object"):
                 retreat_pose = actual
                 lift_steps += 1
 
-            if step_name.startswith("topdown_descend") and descend_steps == sum(
-                1 for name, _pose in top_down_waypoints if name.startswith("topdown_descend")
-            ):
+            if is_descend and descend_steps == descend_step_total:
                 self._run_traced_action(
                     execution_trace=execution_trace,
                     step_name="close_gripper",
@@ -1154,14 +1189,14 @@ class RobotExecutorNode(Node):
                 command_payload={
                     "pose_mm_deg": self._pose_to_dict(handoff_target),
                     "speed_percent": float(speed_percent),
-                    "timeout_s": 12.0,
+                    "timeout_s": float(self._plan_pose_timeout_s()),
                     "execution_strategy": strategy,
                 },
                 action=lambda: self._move_configured_pose(
                     name="handoff",
                     pose=handoff_target,
                     speed_percent=speed_percent,
-                    timeout_s=12.0,
+                    timeout_s=self._plan_pose_timeout_s(),
                 ),
             )
             self._run_traced_action(
@@ -1182,14 +1217,14 @@ class RobotExecutorNode(Node):
                 command_payload={
                     "pose_mm_deg": self._pose_to_dict(home_target),
                     "speed_percent": float(speed_percent),
-                    "timeout_s": 12.0,
+                    "timeout_s": float(self._plan_pose_timeout_s()),
                     "execution_strategy": strategy,
                 },
                 action=lambda: self._move_configured_pose(
                     name="home",
                     pose=home_target,
                     speed_percent=speed_percent,
-                    timeout_s=12.0,
+                    timeout_s=self._plan_pose_timeout_s(),
                 ),
             )
 
@@ -1201,6 +1236,11 @@ class RobotExecutorNode(Node):
             "top_down_rpy_deg": list(selected_rpy),
             "top_down_variant_attempts": variant_attempts,
             "top_down_speed_percent": float(speed_percent),
+            "top_down_final_descent_speed_percent": float(
+                min(speed_percent, self._safe_top_down_final_speed_percent())
+                if strategy == "safe_top_down"
+                else speed_percent
+            ),
             "pregrasp_executed": True,
             "move_home_after": bool(request.move_home_after),
             "release_performed": bool(request.move_home_after),
@@ -1417,13 +1457,13 @@ class RobotExecutorNode(Node):
                     command_payload={
                         "pose_mm_deg": self._pose_to_dict(handoff_target),
                         "speed_percent": float(speed_percent),
-                        "timeout_s": 12.0,
+                        "timeout_s": float(self._plan_pose_timeout_s()),
                     },
                     action=lambda: self._move_configured_pose(
                         name="handoff",
                         pose=handoff_target,
                         speed_percent=speed_percent,
-                        timeout_s=12.0,
+                        timeout_s=self._plan_pose_timeout_s(),
                     ),
                 )
                 self._run_traced_action(
@@ -1444,13 +1484,13 @@ class RobotExecutorNode(Node):
                     command_payload={
                         "pose_mm_deg": self._pose_to_dict(home_target),
                         "speed_percent": float(speed_percent),
-                        "timeout_s": 12.0,
+                        "timeout_s": float(self._plan_pose_timeout_s()),
                     },
                     action=lambda: self._move_configured_pose(
                         name="home",
                         pose=home_target,
                         speed_percent=speed_percent,
-                        timeout_s=12.0,
+                        timeout_s=self._plan_pose_timeout_s(),
                     ),
                 )
 

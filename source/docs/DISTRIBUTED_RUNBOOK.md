@@ -47,6 +47,14 @@
 - prompt 必须能匹配 YOLOv8 COCO 类别名，例如 `cup`、`bowl` 或 `bottle`
 - 首次运行时 Ultralytics 需要能找到 `yolov8n-seg.pt`；真机联调前建议先在本地准备好权重
 
+固定的红/黄/蓝 3D 打印物块是例外：
+
+- `red block`、`yellow block`、`blue block` 和中文“红/黄/蓝色物块”走 HSV 颜色实例分割
+- `物块` / `color block` 会同时寻找三种颜色
+- 颜色物块未命中时禁止使用全场景 GraspNet pseudo-instance 兜底，避免误抓桌面或其他物体
+- Dashboard 的物块快捷按钮会自动关闭瓶子专用的“中心水平抓取”
+- 首次真机验证只使用“规划后确认”，检查分割图和计划后再决定是否确认执行
+
 ## 2. 目录与产物约定
 
 当前有两类重要目录：

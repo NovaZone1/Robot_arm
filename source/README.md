@@ -14,6 +14,8 @@
 - 真机控制只能经过 `piper_ros` / ROS2，不能回退到 `piper_sdk`
 - 规划层继续使用 `mm/deg` 语义，ROS2 适配层负责 `mm/deg <-> m/rad`
 - 当前实例分割固定使用 `yolov8n-seg.pt`，prompt 按 COCO 类别名匹配
+- 固定红/黄/蓝 3D 打印物块可使用 `red block`、`yellow block`、`blue block`
+  或 `物块` prompt；该路径使用 HSV 颜色实例分割，不加载新的检测模型
 
 ## 当前结论
 
@@ -177,6 +179,10 @@ cd /home/ybw/piper_grasp_project/source
 打开 `http://127.0.0.1:8765`，可以先点“启动真机栈”拉起 Piper driver、MoveIt IK 和分布式抓取节点；这个启动动作不会自动触发抓取。等 pipeline / camera / vision / executor 状态变绿后，可以直接设置 prompt、速度、execute / confirm / precenter / pregrasp，并触发 `run`、`confirm`、`reject`、`stop`、`probe`。页面里的 `X/Y/Z 补偿 mm` 会在每次抓取前作为 base 坐标下的目标位姿微调下发，适合先验证 2-5mm 级系统偏差。页面也会显示最近 run 的分割图、GraspNet 投影、候选验证、规划路径、执行轨迹和节点日志。
 
 比赛瓶子真机默认执行策略是 `center_horizontal`：YOLOv8 分割得到瓶子几何中心，保留规划层 Z/人工补偿后，以已验证的水平夹爪姿态 `[180, 85, -90] deg` 执行“观察 -> 感知 -> 高位调平/横移 -> 分段垂直下降 -> 闭爪 -> 垂直抬升”。Dashboard 默认勾选“瓶子中心水平抓取”，点“直接抓取”即可一次触发；取消勾选时回退到兼容的 `safe_top_down` 路径。
+
+红黄蓝物块应使用 Dashboard 对应的“红色物块 / 黄色物块 / 蓝色物块”快捷按钮。
+快捷按钮会自动关闭瓶子专用的“中心水平抓取”。首次验证必须点击“规划后确认”检查
+分割掩膜与抓取落点；识别不到指定颜色时不会回退到全场景候选。
 
 偏置瓶位下的垂直下降默认按 `80 mm` 分段，典型路径约 3 段，避免在瓶口附近进行过多停顿和重复姿态调整；最终落点和 TCP 补偿不变。Dashboard Speed 会真实传递到 Piper 驱动，不再固定限制为 `5%`，但网页默认仍为安全的 `5%`，真机应逐步调速。
 

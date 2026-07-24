@@ -355,8 +355,17 @@ class ExternalInferenceEngine:
             f"scene_grasps={perception.scene_grasp_count} "
             f"scene_points={perception.scene_point_count}"
         ]
+        allow_scene_fallback = bool(perception.segmentation.get("allow_scene_fallback", True))
+        backend = str(perception.segmentation.get("backend", "unknown"))
+        lines.append(f"segmentation backend={backend}")
         if segmentation_count == 0 and instance_count == 0:
-            lines.append("segmentation produced 0 instances for the current prompt")
+            if allow_scene_fallback:
+                lines.append("segmentation produced 0 instances for the current prompt")
+            else:
+                lines.append(
+                    "segmentation produced 0 instances; scene grasp fallback is disabled "
+                    "for this strict prompt"
+                )
         elif segmentation_count == 0:
             lines.append("segmentation produced 0 instances; using scene grasp fallback pseudo-instance")
         return lines
@@ -495,7 +504,11 @@ class ExternalInferenceEngine:
             else:
                 object_cloud_paths.append(None)
 
-        if count == 0 and scene_grasp_count > 0:
+        if (
+            count == 0
+            and scene_grasp_count > 0
+            and bool(segmentation.get("allow_scene_fallback", True))
+        ):
             fallback_grasps = scene_grasp_group[: self.config.grasp_topk]
             grasp_groups.append(fallback_grasps)
             object_point_counts.append(int(len(scene_points)) if scene_points is not None else 0)

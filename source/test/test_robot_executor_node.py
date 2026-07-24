@@ -308,6 +308,57 @@ def test_center_horizontal_adaptive_yaw_preserves_contact_point(monkeypatch):
     assert reconstructed_contact == pytest.approx(contact)
 
 
+def test_safe_top_down_yaw_follows_offset_target_azimuth(monkeypatch):
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    parameters = {
+        "safe_top_down_follow_target_azimuth": True,
+        "safe_top_down_reference_azimuth_deg": 90.0,
+        "safe_top_down_max_yaw_adjust_deg": 45.0,
+    }
+    monkeypatch.setattr(node, "_execution_strategy", lambda: "safe_top_down")
+    monkeypatch.setattr(node, "_top_down_rpy_variants_deg", lambda: [(180.0, 85.0, -90.0)])
+    monkeypatch.setattr(node, "get_parameter", lambda name: SimpleNamespace(value=parameters[name]))
+    plan = SimpleNamespace(target_contact_point_base_m=(-0.1569, 0.3927, 0.196))
+
+    variants = RobotExecutorNode._safe_cartesian_rpy_variants(node, plan)
+
+    target_azimuth_deg = np.degrees(np.arctan2(0.3927, -0.1569))
+    assert len(variants) == 1
+    assert variants[0] == pytest.approx(
+        (180.0, 85.0, -90.0 + target_azimuth_deg - 90.0)
+    )
+
+
+def test_safe_top_down_uses_safe_cube_descent_step(monkeypatch):
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    monkeypatch.setattr(node, "_execution_strategy", lambda: "safe_top_down")
+    monkeypatch.setattr(
+        node,
+        "get_parameter",
+        lambda name: SimpleNamespace(
+            value={
+                "safe_top_down_vertical_step_mm": 80.0,
+                "top_down_vertical_step_mm": 80.0,
+            }[name]
+        ),
+    )
+
+    assert RobotExecutorNode._top_down_vertical_step_mm(node) == 80.0
+
+
+def test_safe_top_down_final_descent_uses_slow_contact_speed(monkeypatch):
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    monkeypatch.setattr(
+        node,
+        "get_parameter",
+        lambda name: SimpleNamespace(
+            value={"safe_top_down_final_speed_percent": 2.0}[name]
+        ),
+    )
+
+    assert RobotExecutorNode._safe_top_down_final_speed_percent(node) == 2.0
+
+
 def test_grasp_plan_message_preserves_tool_contact_geometry():
     candidate = GraspCandidate(
         instance_index=0,

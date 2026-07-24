@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+import pytest
 
 from robot_grasp_ros2.pipeline_orchestrator_node import PipelineOrchestratorNode
 from src.grasping.models import GraspCandidate, GraspPlan
@@ -180,3 +181,51 @@ def test_retarget_plan_rejects_unreliable_object_center(monkeypatch):
     assert retargeted.within_workspace is False
     assert "object center offset" in retargeted.workspace_violations[0]
     assert "exceeds" in retargeted.workspace_violations[0]
+
+
+def test_retarget_color_block_uses_known_table_relative_center_height(monkeypatch):
+    node = PipelineOrchestratorNode.__new__(PipelineOrchestratorNode)
+    parameters = {
+        "use_object_center_contact": True,
+        "object_center_contact_max_offset_m": 0.08,
+        "table_z_m": 0.161,
+        "min_gripper_table_clearance_m": 0.03,
+        "color_block_center_height_m": 0.045,
+        "manual_target_bias_z_mm": 0.0,
+    }
+    monkeypatch.setattr(node, "get_parameter", lambda name: type("P", (), {"value": parameters[name]})())
+    candidate = GraspCandidate(
+        instance_index=0,
+        score=0.9,
+        width_m=0.04,
+        depth_m=0.02,
+        translation_camera_m=(-0.06, -0.06, 0.536),
+        rotation_camera=np.eye(3),
+        object_center_camera_m=(-0.046, -0.016, 0.532),
+        center_offset_m=0.044,
+        raw_grasp=None,
+    )
+    plan = GraspPlan(
+        candidate=candidate,
+        target_base_m=(-0.1, 0.4, 0.2),
+        target_rpy_deg=(0.0, 0.0, 0.0),
+        pregrasp_base_m=(-0.1, 0.4, 0.3),
+        grasp_base_m=(-0.1, 0.4, 0.25),
+        retreat_base_m=(-0.1, 0.4, 0.35),
+        within_workspace=False,
+        workspace_violations=["depth drift put contact below table clearance"],
+        target_contact_point_base_m=(-0.1, 0.4, 0.17),
+        tool_contact_offset_tool_m=(0.0, 0.0, 0.105),
+    )
+
+    retargeted = PipelineOrchestratorNode._retarget_plan_to_object_center(
+        node,
+        plan=plan,
+        candidate=candidate,
+        base_to_camera=np.eye(4),
+        prompt="red block",
+    )
+
+    assert retargeted.target_contact_point_base_m[2] == pytest.approx(0.206)
+    assert retargeted.within_workspace is True
+    assert retargeted.workspace_violations == []

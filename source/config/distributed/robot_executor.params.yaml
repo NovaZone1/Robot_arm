@@ -27,6 +27,12 @@ robot_executor:
     center_horizontal_follow_target_azimuth: true
     center_horizontal_reference_azimuth_deg: 90.0
     center_horizontal_max_yaw_adjust_deg: 45.0
+    # For cube top-down grasps, align yaw with the base-to-target radial
+    # direction once at safe height so the wrist does not repeatedly correct
+    # above an offset object.
+    safe_top_down_follow_target_azimuth: true
+    safe_top_down_reference_azimuth_deg: 90.0
+    safe_top_down_max_yaw_adjust_deg: 45.0
     top_down_min_safe_z_mm: 350.0
     top_down_min_target_z_mm: 200.0
     top_down_approach_height_mm: 110.0
@@ -37,6 +43,11 @@ robot_executor:
     # resolving IK near the bottle.  A typical ~235 mm descent is now 3 steps
     # instead of about 10, while the final contact pose is unchanged.
     top_down_vertical_step_mm: 80.0
+    # Keep cube descent close to a vertical Cartesian path. Larger values caused
+    # unsafe joint-space arcs during real hardware testing.
+    safe_top_down_vertical_step_mm: 80.0
+    # Slow only the final cube contact segment to reduce collision force.
+    safe_top_down_final_speed_percent: 2.0
     # The dashboard speed is the real Piper MotionCtrl_2 percentage.  Keep the
     # configurable guard, but do not silently clamp every request to 5%.
     top_down_max_speed_percent: 100.0

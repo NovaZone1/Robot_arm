@@ -14,7 +14,7 @@ from urllib.parse import quote, unquote, urlparse
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BUNDLE_ROOT = PROJECT_ROOT.parent
 WORKSPACE_ROOT = BUNDLE_ROOT / "ros_ws"
-ARTIFACT_ROOT = BUNDLE_ROOT / "logs" / "distributed_runs"
+ARTIFACT_ROOT = BUNDLE_ROOT / "log" / "distributed_runs"
 VIZ_ROOT = WORKSPACE_ROOT / "viz"
 LOG_ROOT = WORKSPACE_ROOT / "log" / "distributed"
 DASHBOARD_STACK_LOG_ROOT = WORKSPACE_ROOT / "log" / "dashboard_stack"
@@ -116,7 +116,9 @@ def _component_status() -> dict[str, object]:
         name: any(pattern in line for line in lines)
         for name, pattern in expected_nodes.items()
     }
-    stack_ready = all(components[name] for name in ("camera", "vision", "executor", "pipeline"))
+    # This dashboard is a real-robot entry point. Do not enable grasp controls
+    # unless the motion planner and Piper driver are online as well.
+    stack_ready = all(components.values())
     return {
         "components": components,
         "stack_ready": stack_ready,
@@ -346,7 +348,7 @@ def _start_grasp_from_payload(payload: dict[str, object]) -> dict[str, object]:
         return {
             "ok": False,
             "stage": "stack_offline",
-            "error": "抓取栈未启动：请先启动 pipeline / camera / vision / executor 四个节点",
+            "error": "真机抓取栈未就绪：请确认 pipeline / camera / vision / executor / MoveIt / driver 全部在线",
             "system": status,
         }
 
@@ -354,6 +356,11 @@ def _start_grasp_from_payload(payload: dict[str, object]) -> dict[str, object]:
     speed = max(1.0, min(100.0, speed))
     pipeline_speed_text = str(int(round(speed)))
     executor_speed_text = str(speed)
+    requested_strategy = str(payload.get("execution_strategy") or "").strip()
+    if requested_strategy not in {"center_horizontal", "safe_top_down"}:
+        requested_strategy = (
+            "center_horizontal" if payload.get("use_object_center_contact", True) else "safe_top_down"
+        )
     commands = [
         _param_set("/grasp_pipeline", "prompt", prompt),
         _param_set("/grasp_pipeline", "execute", _bool_text(payload.get("execute", True))),
@@ -376,7 +383,7 @@ def _start_grasp_from_payload(payload: dict[str, object]) -> dict[str, object]:
         _param_set(
             "/robot_executor",
             "execution_strategy",
-            "center_horizontal" if payload.get("use_object_center_contact", True) else "safe_top_down",
+            requested_strategy,
         ),
     ]
     failed = [item for item in commands if not item.get("ok")]
@@ -658,12 +665,21 @@ INDEX_HTML = r"""<!doctype html>
         </label>
       </div>
       <div class="quick-prompts">
-        <button type="button" data-prompt="bottle">bottle</button>
-        <button type="button" data-prompt="cup">cup</button>
-        <button type="button" data-prompt="bowl">bowl</button>
+        <button type="button" data-prompt="bottle" data-center-contact="true" data-execution-strategy="center_horizontal">bottle</button>
+        <button type="button" data-prompt="cup" data-center-contact="true" data-execution-strategy="center_horizontal">cup</button>
+        <button type="button" data-prompt="bowl" data-center-contact="true" data-execution-strategy="center_horizontal">bowl</button>
+        <button type="button" data-prompt="red block" data-center-contact="true" data-execution-strategy="safe_top_down">红色物块</button>
+        <button type="button" data-prompt="yellow block" data-center-contact="true" data-execution-strategy="safe_top_down">黄色物块</button>
+        <button type="button" data-prompt="blue block" data-center-contact="true" data-execution-strategy="safe_top_down">蓝色物块</button>
       </div>
       <div class="toggles">
-        <label><input id="centerContactInput" type="checkbox" checked /> 瓶子中心水平抓取</label>
+        <label><input id="centerContactInput" type="checkbox" checked /> 使用分割物体中心作为落点</label>
+        <label>抓取方式
+          <select id="executionStrategyInput">
+            <option value="center_horizontal">侧向水平抓取（瓶/杯）</option>
+            <option value="safe_top_down">顶部抓取（方块）</option>
+          </select>
+        </label>
         <label><input id="precenterInput" type="checkbox" /> 预居中</label>
         <label><input id="pregraspInput" type="checkbox" /> 预抓取点</label>
         <label><input id="showPointcloudInput" type="checkbox" /> 点云窗口</label>
@@ -1023,6 +1039,14 @@ document.getElementById("refreshBtn").addEventListener("click", async () => {
 document.querySelectorAll("[data-prompt]").forEach(button => {
   button.addEventListener("click", () => {
     document.getElementById("promptInput").value = button.dataset.prompt || "";
+    if (button.dataset.centerContact) {
+      document.getElementById("centerContactInput").checked =
+        button.dataset.centerContact === "true";
+    }
+    if (button.dataset.executionStrategy) {
+      document.getElementById("executionStrategyInput").value =
+        button.dataset.executionStrategy;
+    }
   });
 });
 
@@ -1050,6 +1074,7 @@ function buildRunPayload({confirm}) {
     confirm,
     move_home_after: document.getElementById("moveHomeInput").checked,
     use_object_center_contact: document.getElementById("centerContactInput").checked,
+    execution_strategy: document.getElementById("executionStrategyInput").value,
     precenter: document.getElementById("precenterInput").checked,
     enable_pregrasp: document.getElementById("pregraspInput").checked,
     show_pointcloud: document.getElementById("showPointcloudInput").checked,
