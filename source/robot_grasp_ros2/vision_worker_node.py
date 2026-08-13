@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,8 +16,9 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
-from robot_grasp_msgs.srv import AnalyzeScene
+from robot_grasp_msgs.srv import AnalyzeScene, DetectTarget2D, MatchItemLabel
 from robot_grasp_ros2.distributed_utils import (
     camera_info_to_intrinsics,
     color_msg_to_bgr,
@@ -31,6 +33,11 @@ from robot_grasp_ros2.distributed_utils import (
 )
 from robot_grasp_ros2.rviz_visualization import PipelineRvizPublisher
 from src.grasping.models import GraspCandidate, GraspPlan, PerceptionResult
+from src.perception.item_catalog import (
+    ItemCatalog,
+    ReferenceLabelMatcher,
+    default_item_catalog_path,
+)
 
 
 class _ArrayPointCloud:
@@ -49,9 +56,9 @@ class ExternalVisionWorkerBridge:
         configured = str(self._node.get_parameter("worker_python_executable").value or "").strip()
         if configured:
             return configured
-        default_conda = Path("/home/ybw/miniforge3/envs/piper/bin/python")
-        if default_conda.exists():
-            return str(default_conda)
+        worker_python = str(os.environ.get("ROBOT_GRASP_CONDA_PYTHON") or "").strip()
+        if worker_python and Path(worker_python).exists():
+            return worker_python
         return sys.executable
 
     def _worker_script(self) -> str:
@@ -145,6 +152,61 @@ class ExternalVisionWorkerBridge:
             proc.wait(timeout=5.0)
         except Exception:
             proc.kill()
+
+    def warmup(self, options_json: str = "") -> None:
+        with self._daemon_lock:
+            payload = self._call_daemon(
+                {"type": "warmup", "options_json": str(options_json or "")}
+            )
+        if not bool(payload.get("success")):
+            raise RuntimeError(str(payload.get("message") or "vision warmup failed"))
+
+    def detect_target_2d(
+        self,
+        color_bgr: np.ndarray,
+        prompt: str,
+    ) -> dict[str, object]:
+        with tempfile.TemporaryDirectory(prefix="target_2d_worker_") as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            color_path = tmp_dir / "color.npy"
+            np.save(color_path, np.asarray(color_bgr))
+            request_payload = {
+                "type": "detect_target_2d",
+                "work_dir": str(tmp_dir),
+                "color_npy": color_path.name,
+                "prompt": str(prompt),
+            }
+            with self._daemon_lock:
+                payload = self._call_daemon(request_payload)
+        if not bool(payload.get("success")):
+            raise RuntimeError(str(payload.get("message") or "target detection failed"))
+        return dict(payload.get("result") or {})
+
+    def detect_label_bottles(
+        self,
+        color_bgr: np.ndarray,
+    ) -> tuple[dict[str, object], ...]:
+        """Run generic bottle-shape detection in the external ML runtime."""
+        with tempfile.TemporaryDirectory(prefix="label_bottle_worker_") as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            color_path = tmp_dir / "color.npy"
+            np.save(color_path, np.asarray(color_bgr))
+            request_payload = {
+                "type": "detect_label_bottles",
+                "work_dir": str(tmp_dir),
+                "color_npy": color_path.name,
+            }
+            with self._daemon_lock:
+                payload = self._call_daemon(request_payload)
+            if not bool(payload.get("success")):
+                raise RuntimeError(
+                    str(payload.get("message") or "label bottle detection failed")
+                )
+            result = dict(payload.get("result") or {})
+            return tuple(
+                dict(item)
+                for item in list(result.get("bottle_proposals") or [])
+            )
 
     @staticmethod
     def _candidate_from_dict(payload: dict[str, object]) -> GraspCandidate:
@@ -346,6 +408,7 @@ class VisionWorkerNode(Node):
         self.declare_parameter("worker_script", "")
         self.declare_parameter("worker_timeout_s", 300.0)
         self.declare_parameter("worker_mode", "daemon")
+        self.declare_parameter("item_catalog_path", "")
 
         text_qos = make_latched_qos(depth=10)
         self._status_pub = self.create_publisher(String, "~/status", text_qos)
@@ -353,7 +416,11 @@ class VisionWorkerNode(Node):
         self._result_pub = self.create_publisher(String, "~/result_json", text_qos)
         self._rviz_pub = PipelineRvizPublisher(self)
         self.create_service(AnalyzeScene, "~/analyze", self._handle_analyze)
+        self.create_service(DetectTarget2D, "~/detect_target_2d", self._handle_detect_target_2d)
+        self.create_service(MatchItemLabel, "~/match_item_label", self._handle_match_item_label)
+        self.create_service(Trigger, "~/warmup", self._handle_warmup)
         self._bridge = ExternalVisionWorkerBridge(self)
+        self._label_matcher: ReferenceLabelMatcher | None = None
         self._publish_status("idle")
 
     def destroy_node(self) -> None:
@@ -363,6 +430,280 @@ class VisionWorkerNode(Node):
     def _publish_status(self, text: str) -> None:
         self.get_logger().info(text)
         self._status_pub.publish(String(data=text))
+
+    def _get_label_matcher(self) -> ReferenceLabelMatcher:
+        if self._label_matcher is None:
+            configured = str(self.get_parameter("item_catalog_path").value or "").strip()
+            catalog_path = Path(configured).expanduser().resolve() if configured else default_item_catalog_path()
+            self._label_matcher = ReferenceLabelMatcher(ItemCatalog.load(catalog_path))
+        return self._label_matcher
+
+    def _handle_warmup(self, _request, response):
+        try:
+            self._publish_status("warming_up")
+            self._bridge.warmup(
+                json.dumps(
+                    {
+                        "graspnet_checkpoint": "checkpoint.tar",
+                        "hand_eye_config": str(
+                            Path(__file__).resolve().parents[1]
+                            / "config/hand_eye/verify_config_eyeinhand_cam2tcp.yaml"
+                        ),
+                    }
+                )
+            )
+            response.success = True
+            response.message = "vision models warmed up"
+            self._publish_status("idle")
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            self._publish_status(f"warmup failed: {exc}")
+        return response
+
+    def _handle_detect_target_2d(self, request, response):
+        run_id = request.run_id.strip() or "unknown"
+        try:
+            self._publish_status(f"detecting_target_2d: run_id={run_id}")
+            result = self._bridge.detect_target_2d(
+                color_msg_to_bgr(request.color_image),
+                request.prompt,
+            )
+            response.success = True
+            response.found = bool(result.get("found"))
+            response.center_u_norm = float(result.get("center_u_norm") or 0.0)
+            response.center_v_norm = float(result.get("center_v_norm") or 0.0)
+            response.confidence = float(result.get("confidence") or 0.0)
+            response.backend = str(result.get("backend") or "unknown")
+            response.message = (
+                f"target found at ({response.center_u_norm:.3f}, "
+                f"{response.center_v_norm:.3f})"
+                if response.found
+                else "target not found"
+            )
+            self._publish_status(
+                f"target_2d completed: run_id={run_id} found={response.found}"
+            )
+        except Exception as exc:
+            response.success = False
+            response.found = False
+            response.message = str(exc)
+            self._publish_status(f"target_2d failed: run_id={run_id} error={exc}")
+        return response
+
+    def _handle_match_item_label(
+        self,
+        request: MatchItemLabel.Request,
+        response: MatchItemLabel.Response,
+    ):
+        run_id = request.run_id.strip() or "unknown"
+        response.slot_index = -1
+        response.has_box_center = False
+        try:
+            options = parse_options_json(request.options_json)
+            raw_roi = options.get("label_search_roi_norm")
+            roi = (
+                tuple(float(value) for value in list(raw_roi))
+                if isinstance(raw_roi, list) and len(raw_roi) == 4
+                else None
+            )
+            threshold = options.get("label_match_threshold")
+            matcher = self._get_label_matcher()
+            color_bgr = color_msg_to_bgr(request.color_image)
+            try:
+                bottle_proposals = self._bridge.detect_label_bottles(color_bgr)
+            except Exception as exc:
+                bottle_proposals = None
+                self.get_logger().warning(
+                    f"YOLO label bottle proposals unavailable; using local fallback: {exc}"
+                )
+            match = matcher.match_expected(
+                color_bgr,
+                request.expected_item_id,
+                roi_norm=roi,
+                threshold=(float(threshold) if threshold is not None else None),
+                bottle_proposals=bottle_proposals,
+            )
+            partial_label_observations: list[dict[str, object]] = []
+            partial_projection_errors: list[str] = []
+            if match.detections:
+                depth_meters = depth_msg_to_meters(request.depth_image)
+                camera_k = tuple(float(value) for value in request.camera_info.k)
+                base_to_camera = transform_msg_to_matrix(request.base_to_camera)
+                table_z_m = float(options.get("table_z_m", 0.0))
+                minimum_label_z_m = table_z_m - 0.015
+                maximum_label_z_m = table_z_m + 0.35
+                raw_projections: list[
+                    tuple[object, tuple[float, float, float] | None]
+                ] = []
+                for detection in match.detections:
+                    try:
+                        point = matcher.project_label_centers(
+                            depth_meters=depth_meters,
+                            camera_k=camera_k,
+                            base_to_camera=base_to_camera,
+                            detections=(detection,),
+                        )[0]
+                        raw_projections.append((detection, point))
+                    except Exception as exc:
+                        raw_projections.append((detection, None))
+                        partial_projection_errors.append(
+                            f"{detection.item_id}: {exc}"
+                        )
+                camera_from_base = np.linalg.inv(base_to_camera)
+                valid_plane_depths: list[float] = []
+                for _, point in raw_projections:
+                    if (
+                        point is not None
+                        and minimum_label_z_m
+                        <= float(point[2])
+                        <= maximum_label_z_m
+                    ):
+                        camera_point = camera_from_base @ np.asarray(
+                            [point[0], point[1], point[2], 1.0],
+                            dtype=np.float64,
+                        )
+                        if 0.10 < float(camera_point[2]) < 3.0:
+                            valid_plane_depths.append(float(camera_point[2]))
+                row_plane_depth_m = (
+                    float(np.median(valid_plane_depths))
+                    if valid_plane_depths
+                    else None
+                )
+                for detection, raw_point in raw_projections:
+                    point = raw_point
+                    depth_source = "measured"
+                    if (
+                        point is None
+                        or not minimum_label_z_m
+                        <= float(point[2])
+                        <= maximum_label_z_m
+                    ):
+                        if row_plane_depth_m is None:
+                            partial_projection_errors.append(
+                                f"{detection.item_id}: no valid row-plane depth "
+                                "anchor in this view"
+                            )
+                            continue
+                        try:
+                            point = matcher.project_label_centers(
+                                depth_meters=depth_meters,
+                                camera_k=camera_k,
+                                base_to_camera=base_to_camera,
+                                detections=(detection,),
+                                depth_override_m=row_plane_depth_m,
+                            )[0]
+                            depth_source = "row_plane_fallback"
+                        except Exception as exc:
+                            partial_projection_errors.append(
+                                f"{detection.item_id}: row-plane fallback: {exc}"
+                            )
+                            continue
+                    partial_label_observations.append(
+                        {
+                            "item_id": detection.item_id,
+                            "confidence": detection.confidence,
+                            "method": detection.method,
+                            "depth_source": depth_source,
+                            "point_base_m": list(point),
+                        }
+                    )
+            localization = None
+            if match.accepted:
+                localization = matcher.localize_box_row(
+                    depth_meters=depth_msg_to_meters(request.depth_image),
+                    camera_k=tuple(float(value) for value in request.camera_info.k),
+                    base_to_camera=transform_msg_to_matrix(request.base_to_camera),
+                    detections=match.detections,
+                    target_item_id=match.expected_item_id,
+                    table_z_m=float(options.get("table_z_m", 0.0)),
+                )
+            response.success = bool(match.accepted and localization is not None)
+            response.message = (
+                f"label matched: {match.matched_item_id} slot={match.slot_index} "
+                f"confidence={match.confidence:.3f}"
+                if match.accepted
+                else f"complete six-label row not verified for {match.expected_item_id}: "
+                f"detected={len(match.detected_item_ids)} confidence={match.confidence:.3f}"
+            )
+            response.matched_item_id = str(match.matched_item_id or "")
+            response.confidence = float(match.confidence)
+            response.slot_index = int(match.slot_index if match.slot_index is not None else -1)
+            response.detected_label_count = len(match.detected_item_ids)
+            if localization is not None:
+                response.has_box_center = True
+                response.box_center_base_m.x = float(localization.box_center_base_m[0])
+                response.box_center_base_m.y = float(localization.box_center_base_m[1])
+                response.box_center_base_m.z = float(localization.box_center_base_m[2])
+            if match.bbox_xywh is not None:
+                response.bbox_x, response.bbox_y, response.bbox_width, response.bbox_height = match.bbox_xywh
+            response.diagnostics_json = json_dumps(
+                {
+                    "run_id": run_id,
+                    "scene_id": request.scene_id,
+                    "expected_item_id": match.expected_item_id,
+                    "matched_item_id": match.matched_item_id,
+                    "confidence": match.confidence,
+                    "accepted": match.accepted,
+                    "slot_index": match.slot_index,
+                    "detected_item_ids_left_to_right": list(match.detected_item_ids),
+                    "detections": [
+                        {
+                            "item_id": detection.item_id,
+                            "confidence": detection.confidence,
+                            "bbox_xywh": list(detection.bbox_xywh),
+                            "method": detection.method,
+                        }
+                        for detection in match.detections
+                    ],
+                    "bottle_proposal_count": (
+                        len(bottle_proposals)
+                        if bottle_proposals is not None
+                        else None
+                    ),
+                    "partial_label_observations_base_m": partial_label_observations,
+                    "partial_projection_errors": partial_projection_errors,
+                    "box_center_base_m": (
+                        list(localization.box_center_base_m)
+                        if localization is not None
+                        else None
+                    ),
+                    "box_centers_base_m": (
+                        [list(value) for value in localization.box_centers_base_m]
+                        if localization is not None
+                        else None
+                    ),
+                    "label_centers_base_m": (
+                        [list(value) for value in localization.label_centers_base_m]
+                        if localization is not None
+                        else None
+                    ),
+                    "adjacent_pitch_mm": (
+                        list(localization.adjacent_pitch_mm)
+                        if localization is not None
+                        else None
+                    ),
+                    "interior_direction_base": (
+                        list(localization.interior_direction_base)
+                        if localization is not None
+                        else None
+                    ),
+                    "bbox_xywh": list(match.bbox_xywh) if match.bbox_xywh else None,
+                    "search_roi_xywh": list(match.search_roi_xywh),
+                }
+            )
+            self._publish_status(
+                f"label_match {'ok' if match.accepted else 'failed'}: "
+                f"run_id={run_id} item={match.expected_item_id} slot={match.slot_index} "
+                f"detected={len(match.detected_item_ids)} confidence={match.confidence:.3f}"
+            )
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            response.diagnostics_json = json_dumps(
+                {"run_id": run_id, "error": str(exc), "traceback": traceback.format_exc()}
+            )
+        return response
 
     def _handle_analyze(self, request: AnalyzeScene.Request, response: AnalyzeScene.Response):
         run_id = request.run_id.strip() or "unknown"

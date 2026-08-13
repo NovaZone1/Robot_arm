@@ -38,5 +38,15 @@ def generate_launch_description():
                 output="screen",
                 parameters=[PathJoinSubstitution([distributed_config, "pipeline_orchestrator.params.yaml"])],
             ),
+            # This adapter is inert until its MoveBaseRelative service is
+            # explicitly called. The Scout driver itself remains a separately
+            # controlled process.
+            Node(
+                package="robot_grasp_ros2",
+                executable="scout_scan_controller_node",
+                name="base_scan_controller",
+                output="screen",
+                parameters=[PathJoinSubstitution([distributed_config, "scout_scan_controller.params.yaml"])],
+            ),
         ]
     )

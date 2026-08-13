@@ -1,0 +1,23 @@
+{
+  "prompt": "blue block",
+  "backend": "color_block",
+  "instance_count": 1,
+  "mask_center_uv": [
+    387.73307611364436,
+    297.1019525312756
+  ],
+  "mask_center_norm": [
+    0.6058329314275693,
+    0.6189624011068241
+  ],
+  "bbox_xyxy": [
+    346.0,
+    244.0,
+    431.0,
+    350.0
+  ],
+  "image_size": [
+    640,
+    480
+  ]
+}

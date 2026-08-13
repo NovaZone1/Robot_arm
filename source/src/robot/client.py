@@ -737,7 +737,11 @@ class Ros2PiperClient(RobotArmClient):
     def wait_for_gripper(self, target_mm: float, tol_mm: float, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if abs(self.get_gripper_status().angle_mm - target_mm) <= tol_mm:
+            # Opening farther than requested is safe and commonly happens when
+            # the physical gripper reaches its 80 mm travel limit. Requiring an
+            # exact symmetric match can falsely time out at 80 mm for a 70 mm
+            # request even though there is already sufficient grasp clearance.
+            if self.get_gripper_status().angle_mm >= target_mm - tol_mm:
                 return True
             time.sleep(self.config.poll_interval_s)
         return False

@@ -1,0 +1,20 @@
+red_flag_start_gate:
+  ros__parameters:
+    camera_capture_service: "/camera_server/capture"
+    timeout_s: 180.0
+    capture_timeout_s: 8.0
+    sample_interval_s: 0.08
+    # Calibrated from config/calibration/red_flag on 2026-08-11.
+    roi_norm: [0.10, 0.0, 1.0, 0.95]
+    saturation_min: 110
+    value_min: 90
+    component_min_area_ratio: 0.002
+    peak_area_ratio: 0.03
+    motion_window_s: 3.0
+    min_valid_detections: 4
+    min_axis_range_norm: 0.18
+    min_path_length_norm: 0.30
+    min_direction_step_norm: 0.025
+    min_direction_reversals: 1
+    artifact_dir: "/home/nvidia/auto/Robot_arm/source/config/calibration/red_flag/runtime"
+

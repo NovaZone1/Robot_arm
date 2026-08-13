@@ -34,6 +34,117 @@ def test_plan_pose_timeout_reads_configured_parameter(monkeypatch):
     assert RobotExecutorNode._plan_pose_timeout_s(node) == 27.5
 
 
+def test_pose_only_completion_requires_healthy_can_control():
+    healthy = SimpleNamespace(
+        err_code=0,
+        teach_status_code=0,
+        arm_status="NORMAL",
+        control_mode="CAN",
+        motion_status="NOT_ARRIVED",
+    )
+    assert RobotExecutorNode._pose_only_completion_is_safe(healthy) is True
+
+    unhealthy = SimpleNamespace(**{**healthy.__dict__, "err_code": 1})
+    assert RobotExecutorNode._pose_only_completion_is_safe(unhealthy) is False
+
+
+def _place_request(
+    *,
+    label_verified=True,
+    label_confidence=0.80,
+    slot_index=2,
+    box_size=(0.180, 0.132, 0.087),
+    approach=(300.0, 50.0, 380.0, 180.0, 0.0, 0.0),
+    release=(300.0, 50.0, 300.0, 180.0, 0.0, 0.0),
+    retreat=(300.0, 50.0, 400.0, 180.0, 0.0, 0.0),
+):
+    def pose(values):
+        return SimpleNamespace(
+            x_mm=values[0],
+            y_mm=values[1],
+            z_mm=values[2],
+            roll_deg=values[3],
+            pitch_deg=values[4],
+            yaw_deg=values[5],
+        )
+
+    return SimpleNamespace(
+        plan=SimpleNamespace(
+            item_id="red_block",
+            slot_index=slot_index,
+            label_verified=label_verified,
+            label_confidence=label_confidence,
+            box_outer_size_m=list(box_size),
+            approach_pose=pose(approach),
+            release_pose=pose(release),
+            retreat_pose=pose(retreat),
+        )
+    )
+
+
+def _place_validation_node(monkeypatch):
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    values = {
+        "placement_box_outer_size_m": [0.180, 0.132, 0.087],
+        "placement_slot_count": 6,
+        "placement_box_size_tolerance_m": 0.005,
+        "placement_min_label_confidence": 0.42,
+        "placement_min_vertical_clearance_mm": 50.0,
+    }
+    monkeypatch.setattr(node, "get_parameter", lambda name: SimpleNamespace(value=values[name]))
+    return node
+
+
+def test_place_plan_requires_verified_matching_label(monkeypatch):
+    node = _place_validation_node(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="label was not verified"):
+        RobotExecutorNode._validate_place_request(
+            node,
+            _place_request(label_verified=False),
+        )
+
+
+def test_place_plan_rejects_wrong_box_size(monkeypatch):
+    node = _place_validation_node(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="does not match configured size"):
+        RobotExecutorNode._validate_place_request(
+            node,
+            _place_request(box_size=(0.300, 0.132, 0.087)),
+        )
+
+
+def test_place_plan_rejects_invalid_slot(monkeypatch):
+    node = _place_validation_node(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="slot_index"):
+        RobotExecutorNode._validate_place_request(
+            node,
+            _place_request(slot_index=6),
+        )
+
+
+def test_place_plan_rejects_low_label_confidence(monkeypatch):
+    node = _place_validation_node(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="label confidence"):
+        RobotExecutorNode._validate_place_request(
+            node,
+            _place_request(label_confidence=0.20),
+        )
+
+
+def test_place_plan_requires_vertical_clearance(monkeypatch):
+    node = _place_validation_node(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="enough vertical clearance"):
+        RobotExecutorNode._validate_place_request(
+            node,
+            _place_request(approach=(300.0, 50.0, 330.0, 180.0, 0.0, 0.0)),
+        )
+
+
 def test_safe_top_down_recomputes_flange_position_for_final_orientation(monkeypatch):
     node = RobotExecutorNode.__new__(RobotExecutorNode)
     monkeypatch.setattr(node, "_top_down_rpy_deg", lambda: (180.0, 0.0, 0.0))
@@ -155,6 +266,43 @@ def test_center_horizontal_lifts_only_configured_distance(monkeypatch):
     assert lift_pose.z_mm == pytest.approx(309.0)
 
 
+def test_top_down_lowers_high_observation_before_lateral_motion(monkeypatch):
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    rpy = (180.0, 67.8, 90.0)
+    target = EndPoseMMDeg(-15.0, -355.0, 254.0, *rpy)
+    monkeypatch.setattr(node, "_top_down_rpy_deg", lambda: rpy)
+    monkeypatch.setattr(
+        node,
+        "_target_pose_from_plan_top_down",
+        lambda _plan, rpy_deg=None: target,
+    )
+    monkeypatch.setattr(node, "_top_down_approach_height_mm", lambda: 110.0)
+    monkeypatch.setattr(node, "_top_down_min_safe_z_mm", lambda: 350.0)
+    monkeypatch.setattr(node, "_top_down_lift_height_mm", lambda: 80.0)
+    monkeypatch.setattr(node, "_top_down_lift_to_safe_z", lambda: False)
+    monkeypatch.setattr(node, "_top_down_vertical_step_mm", lambda: 1000.0)
+    monkeypatch.setattr(node, "_top_down_lateral_step_mm", lambda: 1000.0)
+
+    current = EndPoseMMDeg(0.0, -35.5, 491.1, *rpy)
+    waypoints = RobotExecutorNode._build_safe_top_down_waypoints(
+        node,
+        plan=SimpleNamespace(),
+        current_pose=current,
+    )
+
+    transit = next(
+        pose for name, pose in waypoints if name.startswith("topdown_lift_clear")
+    )
+    lateral = next(
+        pose for name, pose in waypoints if name.startswith("topdown_lateral")
+    )
+    assert transit.x_mm == pytest.approx(current.x_mm)
+    assert transit.y_mm == pytest.approx(current.y_mm)
+    assert transit.z_mm == pytest.approx(364.0)
+    assert transit.z_mm < current.z_mm
+    assert lateral.z_mm == pytest.approx(364.0)
+
+
 def test_center_horizontal_coarse_vertical_steps_reduce_near_object_replanning(monkeypatch):
     node = RobotExecutorNode.__new__(RobotExecutorNode)
     rpy = (180.0, 85.0, -90.0)
@@ -176,7 +324,7 @@ def test_center_horizontal_coarse_vertical_steps_reduce_near_object_replanning(m
 
     descend = [pose for name, pose in waypoints if name.startswith("topdown_descend")]
     lift = [pose for name, pose in waypoints if name.startswith("topdown_lift_object")]
-    assert len(descend) == 3
+    assert len(descend) == 2
     assert descend[-1] == target
     assert len(lift) == 1
 

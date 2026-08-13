@@ -98,12 +98,7 @@ class PiperRosNode(Node):
                 while not (enable_flag):
                     elapsed_time = time.time() - start_time
                     self.get_logger().info("--------------------")
-                    enable_flag = self.piper.GetArmLowSpdInfoMsgs().motor_1.foc_status.driver_enable_status and \
-                        self.piper.GetArmLowSpdInfoMsgs().motor_2.foc_status.driver_enable_status and \
-                        self.piper.GetArmLowSpdInfoMsgs().motor_3.foc_status.driver_enable_status and \
-                        self.piper.GetArmLowSpdInfoMsgs().motor_4.foc_status.driver_enable_status and \
-                        self.piper.GetArmLowSpdInfoMsgs().motor_5.foc_status.driver_enable_status and \
-                        self.piper.GetArmLowSpdInfoMsgs().motor_6.foc_status.driver_enable_status
+                    enable_flag = all(self.piper.GetArmEnableStatus())
                     self.get_logger().info(f"Enable status:{enable_flag}")
                     self.piper.EnableArm(7)
                     self.piper.GripperCtrl(0, 1000, 0x01, 0)
@@ -377,16 +372,33 @@ class PiperRosNode(Node):
         timeout = 5
         # Record the time before entering the loop
         start_time = time.time()
+
+        # After a controller power cycle (especially after drag-teach mode),
+        # the motor feedback can be healthy while motion commands remain
+        # latched in standby.  Follow the Piper SDK reset sequence before the
+        # first enable attempt.  Do not repeat it for an already-enabled arm,
+        # because resetting the control mode would interrupt active motion.
+        if req.enable_request:
+            initial_enable_list = self.piper.GetArmEnableStatus()
+            controller_is_standby = (
+                int(self.piper.GetArmStatus().arm_status.ctrl_mode) == 0x00
+            )
+            if not all(initial_enable_list) or controller_is_standby:
+                self.get_logger().info(
+                    "Recovering from standby and restoring position/velocity mode"
+                )
+                self.piper.MotionCtrl_1(0x02, 0x00, 0x00)
+                self.piper.MotionCtrl_2(0x00, 0x00, 0, 0x00)
+                time.sleep(0.2)
+
         while not loop_flag:
             elapsed_time = time.time() - start_time
             self.get_logger().info(f"--------------------")
-            enable_list = []
-            enable_list.append(self.piper.GetArmLowSpdInfoMsgs().motor_1.foc_status.driver_enable_status)
-            enable_list.append(self.piper.GetArmLowSpdInfoMsgs().motor_2.foc_status.driver_enable_status)
-            enable_list.append(self.piper.GetArmLowSpdInfoMsgs().motor_3.foc_status.driver_enable_status)
-            enable_list.append(self.piper.GetArmLowSpdInfoMsgs().motor_4.foc_status.driver_enable_status)
-            enable_list.append(self.piper.GetArmLowSpdInfoMsgs().motor_5.foc_status.driver_enable_status)
-            enable_list.append(self.piper.GetArmLowSpdInfoMsgs().motor_6.foc_status.driver_enable_status)
+            # GetArmEnableStatus() is the SDK's authoritative aggregate of
+            # the six motor enable bits.  The low-speed message fields used
+            # here previously can retain stale values across a controller
+            # power cycle and falsely report a successful enable.
+            enable_list = self.piper.GetArmEnableStatus()
 
             if req.enable_request:
                 enable_flag = all(enable_list)

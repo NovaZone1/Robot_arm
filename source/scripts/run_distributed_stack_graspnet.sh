@@ -122,7 +122,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-existing_nodes="$(pgrep -af 'robot_grasp_ros2\.(camera_server_node|vision_worker_node|robot_executor_node|pipeline_orchestrator_node)' || true)"
+existing_nodes="$(pgrep -af 'robot_grasp_ros2\.(camera_server_node|vision_worker_node|robot_executor_node|pipeline_orchestrator_node|scout_scan_controller_node)' || true)"
 if [[ -n "${existing_nodes}" ]]; then
   cat >&2 <<EOF
 Existing distributed robot_grasp_ros2 nodes are already running.
@@ -148,6 +148,7 @@ camera_params="${project_root}/config/distributed/camera_server.params.yaml"
 vision_params="${project_root}/config/distributed/vision_worker.params.yaml"
 robot_params="${project_root}/config/distributed/robot_executor.params.yaml"
 orchestrator_params="${project_root}/config/distributed/pipeline_orchestrator.params.yaml"
+base_scan_params="${project_root}/config/distributed/scout_scan_controller.params.yaml"
 
 pids=()
 
@@ -292,6 +293,13 @@ orchestrator_cmd=(
   "${ros_python}" -m robot_grasp_ros2.pipeline_orchestrator_node
   --ros-args
   --params-file "${orchestrator_params}"
+  -p "hand_eye_config:=${project_root}/config/hand_eye/verify_config_eyeinhand_cam2tcp.yaml"
+)
+
+base_scan_cmd=(
+  "${ros_python}" -m robot_grasp_ros2.scout_scan_controller_node
+  --ros-args
+  --params-file "${base_scan_params}"
 )
 if [[ -n "${prompt}" ]]; then
   orchestrator_cmd+=(-p "prompt:=${prompt}" -p "auto_start:=true")
@@ -315,6 +323,7 @@ fi
 start_node "camera_server" "${camera_cmd[@]}"
 start_node "vision_worker" "${vision_cmd[@]}"
 start_node "robot_executor" "${robot_cmd[@]}"
+start_node "base_scan_controller" "${base_scan_cmd[@]}"
 start_node "grasp_pipeline" "${orchestrator_cmd[@]}"
 
 # ---------------------------------------------------------------------------
@@ -328,10 +337,10 @@ if [[ "${warmup_flag}" -eq 1 ]]; then
     "{run_id: 'warmup', depth_fusion_frames: 1, pointcloud_filter_mode: 'bilateral', pointcloud_backend: 'sdk'}" \
     >/dev/null 2>&1 || echo "[distributed] camera warmup skipped (service not ready yet)"
 
-  echo "[distributed] Warming up vision daemon (first analyze triggers YOLOv8-seg + GraspNet load, may take 30~60s)..."
+  echo "[distributed] Warming up vision daemon (loads YOLOv8-seg + GraspNet before navigation handoff)..."
   warmup_start="$(date +%s)"
-  "${project_root}/scripts/ros2_system.sh" service call /vision_worker/analyze robot_grasp_msgs/srv/AnalyzeScene \
-    "{run_id: 'warmup', scene_id: 'warmup', prompt: 'warmup'}" \
+  "${project_root}/scripts/ros2_system.sh" service call /vision_worker/warmup std_srvs/srv/Trigger \
+    "{}" \
     >/dev/null 2>&1 || echo "[distributed] vision warmup skipped (service not ready yet)"
   warmup_end="$(date +%s)"
   warmup_elapsed=$((warmup_end - warmup_start))

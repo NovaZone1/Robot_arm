@@ -1,0 +1,54 @@
+# Captured from live Piper feedback at the operator-taught red-flag view and
+# verified reachable under normal CAN control at 5% speed.
+red_flag_observation:
+  valid_for_replay: true
+  captured_from_live_feedback: true
+  captured_at: "2026-08-11"
+  verified_at: "2026-08-11"
+  pose_mm_deg:
+    x_mm: 44.300
+    y_mm: -3.710
+    z_mm: 596.805
+    roll_deg: 3.037
+    pitch_deg: 72.962
+    yaw_deg: 0.898
+  joint_positions_rad:
+    joint1: 0.005913516
+    joint2: 0.799737624
+    joint3: -1.669338468
+    joint4: -0.071084300
+    joint5: 0.660970604
+    joint6: 0.058995608
+    gripper: -0.000140000
+  joint_feedback_note: >-
+    Captured from /joint_states_feedback with one live Piper publisher; two
+    consecutive /end_pose samples were identical.
+  robot_state:
+    control_mode: "CAN(0x01)"
+    arm_status: "NORMAL(0x00)"
+    move_mode: "MOVE_J(0x01)"
+    teach_status: "0x00"
+    motion_status: "ARRIVED(0x00)"
+    error_code: "0x0000"
+  verification:
+    speed_percent: 5.0
+    actual_pose_mm_deg:
+      x_mm: 44.953
+      y_mm: -3.696
+      z_mm: 596.899
+      roll_deg: 3.168
+      pitch_deg: 73.048
+      yaw_deg: 1.011
+  camera:
+    frame_id: "camera_color_optical_frame"
+    width: 640
+    height: 480
+    fx: 603.28668213
+    fy: 602.93334961
+    ppx: 319.35128784
+    ppy: 246.57878113
+    reference_image: "observation_rgb.png"
+  scene_notes:
+    - "Wide view suitable for observing a referee and flag motion."
+    - "Several brown/red chairs are visible; static red detection alone is unsafe."
+    - "Require temporal flag motion and consecutive-frame confirmation."

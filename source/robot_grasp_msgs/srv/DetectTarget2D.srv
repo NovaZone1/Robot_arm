@@ -1,0 +1,11 @@
+string run_id
+string prompt
+sensor_msgs/Image color_image
+---
+bool success
+string message
+bool found
+float32 center_u_norm
+float32 center_v_norm
+float32 confidence
+string backend

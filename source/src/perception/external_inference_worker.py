@@ -260,6 +260,129 @@ class ExternalInferenceEngine:
         self._config = config
         self._runtime_key = runtime_key
 
+    def warmup(self, options: dict[str, object]) -> None:
+        """Load models and execute one synthetic pass before a real task."""
+        self._ensure_runtime(options)
+        if self._segmenter is None or self._graspnet is None:
+            raise RuntimeError("inference runtime did not initialize")
+
+        # Both Ultralytics and CUDA defer meaningful setup until the first
+        # forward pass.  Paying that cost while the dashboard stack starts
+        # keeps it out of the navigation-to-grasp handoff critical path.
+        dummy_image = np.zeros((320, 320, 3), dtype=np.uint8)
+        self._segmenter.segment_text(dummy_image, "bottle")
+        rng = np.random.default_rng(0)
+        dummy_points = rng.uniform(
+            low=(-0.10, -0.10, 0.35),
+            high=(0.10, 0.10, 0.65),
+            size=(max(64, int(self._graspnet.num_point)), 3),
+        ).astype(np.float32)
+        self._graspnet.predict(dummy_points, dummy_points)
+
+    def detect_target_2d(
+        self,
+        color_bgr: np.ndarray,
+        prompt: str,
+    ) -> dict[str, object]:
+        """Locate a target cheaply, without point-cloud or GraspNet inference."""
+        if self._segmenter is None:
+            from src.perception.yolo_segmenter import YOLOSegmenter
+
+            self._segmenter = YOLOSegmenter(
+                device=str(os.environ.get("ROBOT_GRASP_LABEL_DEVICE") or "cuda"),
+                model_name="yolov8n-seg.pt",
+            )
+        segmentation = self._segmenter.segment_text(np.asarray(color_bgr), prompt)
+        masks = segmentation.get("masks")
+        scores = segmentation.get("scores")
+        count = self._segmentation_count(segmentation)
+        if count <= 0:
+            return {
+                "found": False,
+                "center_u_norm": 0.0,
+                "center_v_norm": 0.0,
+                "confidence": 0.0,
+                "backend": str(segmentation.get("backend") or "unknown"),
+            }
+        score_values = [
+            float(value.detach().cpu().item()) if hasattr(value, "detach") else float(value)
+            for value in list(scores)[:count]
+        ]
+        selected_index = int(np.argmax(score_values))
+        mask = masks[selected_index].squeeze()
+        mask_np = (
+            mask.detach().cpu().numpy().astype(bool)
+            if hasattr(mask, "detach")
+            else np.asarray(mask).astype(bool)
+        )
+        center_uv = self._mask_centroid_uv(mask_np)
+        height, width = np.asarray(color_bgr).shape[:2]
+        if center_uv is None or width <= 0 or height <= 0:
+            return {
+                "found": False,
+                "center_u_norm": 0.0,
+                "center_v_norm": 0.0,
+                "confidence": 0.0,
+                "backend": str(segmentation.get("backend") or "unknown"),
+            }
+        return {
+            "found": True,
+            "center_u_norm": float(center_uv[0]) / float(width),
+            "center_v_norm": float(center_uv[1]) / float(height),
+            "confidence": float(score_values[selected_index]),
+            "backend": str(segmentation.get("backend") or "unknown"),
+        }
+
+    def detect_label_bottles(
+        self,
+        color_bgr: np.ndarray,
+    ) -> list[dict[str, object]]:
+        """Use the existing COCO YOLO model as a bottle-shape proposal stage."""
+        if self._segmenter is None:
+            from src.perception.yolo_segmenter import YOLOSegmenter
+
+            self._segmenter = YOLOSegmenter(
+                device=str(os.environ.get("ROBOT_GRASP_LABEL_DEVICE") or "cuda"),
+                model_name="yolov8n-seg.pt",
+                conf_threshold=0.20,
+            )
+        segmentation = self._segmenter.segment_text(
+            np.asarray(color_bgr),
+            "bottle",
+        )
+        boxes = segmentation.get("boxes")
+        scores = segmentation.get("scores")
+        if boxes is None or scores is None:
+            return []
+        count = min(len(boxes), len(scores))
+        proposals: list[dict[str, object]] = []
+        for index in range(count):
+            raw_box = boxes[index]
+            raw_score = scores[index]
+            box = (
+                raw_box.detach().cpu().numpy()
+                if hasattr(raw_box, "detach")
+                else np.asarray(raw_box)
+            )
+            score = (
+                float(raw_score.detach().cpu().item())
+                if hasattr(raw_score, "detach")
+                else float(raw_score)
+            )
+            x0, y0, x1, y1 = (float(value) for value in box.reshape(4))
+            proposals.append(
+                {
+                    "confidence": score,
+                    "bbox_xywh": [
+                        x0,
+                        y0,
+                        max(0.0, x1 - x0),
+                        max(0.0, y1 - y0),
+                    ],
+                }
+            )
+        return proposals
+
     @property
     def config(self):
         if self._config is None:
@@ -630,8 +753,22 @@ def _save_response(path: Path, payload: dict[str, object]) -> None:
 
 def _handle_one_request(engine: ExternalInferenceEngine, request: dict[str, object]) -> dict[str, object]:
     """Process a single inference request dict and return a response dict."""
+    if str(request.get("type") or "") == "warmup":
+        options = _parse_options_json(str(request.get("options_json", "")))
+        engine.warmup(options)
+        return {"success": True, "message": "inference runtime warmed up"}
     work_dir = Path(str(request["work_dir"])).expanduser().resolve()
     color_bgr = np.load(work_dir / str(request["color_npy"]))
+    if str(request.get("type") or "") == "detect_target_2d":
+        result = engine.detect_target_2d(color_bgr, str(request.get("prompt") or ""))
+        return {"success": True, "message": "target detection completed", "result": result}
+    if str(request.get("type") or "") == "detect_label_bottles":
+        proposals = engine.detect_label_bottles(color_bgr)
+        return {
+            "success": True,
+            "message": f"detected {len(proposals)} bottle proposals",
+            "result": {"bottle_proposals": proposals},
+        }
     depth_meters = np.load(work_dir / str(request["depth_npy"]))
     camera_info = dict(request["camera_info"])
     intrinsics = SimpleIntrinsics(

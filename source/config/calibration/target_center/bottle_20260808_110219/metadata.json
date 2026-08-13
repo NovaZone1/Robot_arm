@@ -1,0 +1,34 @@
+{
+  "kind": "bottle_center_standard",
+  "captured_at": "2026-08-08T11:02:26",
+  "scene_id": "bottle-center-standard-20260808_110219-scene",
+  "camera_frame": "camera_color_optical_frame",
+  "color_file": "color.png",
+  "depth_file": "depth_m.npy",
+  "depth_preview_file": "depth_preview.png",
+  "image_size": [
+    640,
+    480
+  ],
+  "camera_k": [
+    603.2866821289062,
+    0.0,
+    319.3512878417969,
+    0.0,
+    602.933349609375,
+    246.5787811279297,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "tcp_pose_mm_deg": {
+    "x_mm": -0.020999999999999998,
+    "y_mm": 35.132999999999996,
+    "z_mm": 491.276,
+    "roll_deg": 179.99999999999997,
+    "pitch_deg": 67.79900000000002,
+    "yaw_deg": -89.96500000000003
+  },
+  "arm_status": "control_mode=CAN(0x01), arm_status=NORMAL(0x00), move_mode=MOVE_J(0x01), teach_status=0x00, motion_status=ARRIVED(0x00), trajectory_index=0, err_code=0x0000",
+  "center_policy_status": "pending operator block standard frame and tolerance calibration"
+}

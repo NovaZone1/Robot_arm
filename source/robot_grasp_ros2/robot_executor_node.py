@@ -13,7 +13,13 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
-from robot_grasp_msgs.srv import ExecuteGraspPlan, ExecuteNamedPose, GetRobotState, StopRobot
+from robot_grasp_msgs.srv import (
+    ExecuteGraspPlan,
+    ExecuteNamedPose,
+    ExecutePlacePlan,
+    GetRobotState,
+    StopRobot,
+)
 from robot_grasp_ros2.distributed_utils import (
     grasp_plan_from_msg,
     json_dumps,
@@ -55,9 +61,11 @@ class RobotExecutorNode(Node):
         self.create_service(Trigger, "~/stop", self._handle_stop)
         self.create_service(Trigger, "~/cancel", self._handle_cancel)
         self.create_service(Trigger, "~/probe", self._handle_probe)
+        self.create_service(Trigger, "~/open_gripper", self._handle_open_gripper)
         self.create_service(GetRobotState, "~/get_state", self._handle_get_state)
         self.create_service(ExecuteNamedPose, "~/execute_named_pose", self._handle_execute_named_pose)
         self.create_service(ExecuteGraspPlan, "~/execute_grasp_plan", self._handle_execute_grasp_plan)
+        self.create_service(ExecutePlacePlan, "~/execute_place_plan", self._handle_execute_place_plan)
         self.create_service(StopRobot, "~/stop_robot", self._handle_stop_robot)
 
         self._lock = threading.Lock()
@@ -93,8 +101,15 @@ class RobotExecutorNode(Node):
         self.declare_parameter("moveit_base_frame", "base_link")
         self.declare_parameter("moveit_ik_timeout_s", 5.0)
         self.declare_parameter("pose_goal_hold_s", 0.8)
+        self.declare_parameter("motion_arrived_pose_fallback_enabled", True)
+        self.declare_parameter("motion_arrived_pose_fallback_pos_tolerance_mm", 2.0)
+        self.declare_parameter("motion_arrived_pose_fallback_rot_tolerance_deg", 2.0)
+        self.declare_parameter("motion_arrived_pose_fallback_hold_s", 0.6)
         self.declare_parameter("named_pose_timeout_s", 20.0)
         self.declare_parameter("plan_pose_timeout_s", 30.0)
+        self.declare_parameter("motion_progress_extends_timeout", False)
+        self.declare_parameter("motion_progress_position_epsilon_mm", 0.5)
+        self.declare_parameter("motion_progress_rotation_epsilon_deg", 0.25)
         self.declare_parameter("move_pos_tolerance_mm", 20.0)
         self.declare_parameter("move_rot_tolerance_deg", 10.0)
         self.declare_parameter("reject_degenerate_grasp_waypoints", True)
@@ -121,8 +136,20 @@ class RobotExecutorNode(Node):
         self.declare_parameter("safe_top_down_vertical_step_mm", 80.0)
         self.declare_parameter("safe_top_down_final_speed_percent", 2.0)
         self.declare_parameter("top_down_max_speed_percent", 10.0)
+        self.declare_parameter("placement_box_outer_size_m", [0.180, 0.132, 0.087])
+        self.declare_parameter("placement_slot_count", 6)
+        self.declare_parameter("placement_box_size_tolerance_m", 0.005)
+        self.declare_parameter("placement_min_label_confidence", 0.42)
+        self.declare_parameter("placement_min_vertical_clearance_mm", 50.0)
+        self.declare_parameter("placement_final_speed_percent", 2.0)
         self.declare_parameter("handoff_pose", [200.0, 20.0, 300.0, 10.0, 120.0, 0.0])
         self.declare_parameter("home_pose", [57.0, 0.0, 215.0, 0.0, 85.0, 0.0])
+        self.declare_parameter("move_to_post_grasp_pose", True)
+        self.declare_parameter("post_grasp_safe_lift_z_mm", 350.0)
+        self.declare_parameter(
+            "post_grasp_pose",
+            [256.885, 0.0, 400.0, 0.0, 84.939, 0.0],
+        )
         self.declare_parameter("plan_json", "")
 
     def _publish_status(self, text: str) -> None:
@@ -158,6 +185,20 @@ class RobotExecutorNode(Node):
 
     def _use_handoff_pose(self) -> bool:
         return bool(self.get_parameter("use_handoff_pose").value)
+
+    def _move_to_post_grasp_pose_enabled(self) -> bool:
+        try:
+            return bool(self.get_parameter("move_to_post_grasp_pose").value)
+        except Exception:
+            # Some offline/unit-test harnesses construct the executor without
+            # running Node.__init__. Real nodes always declare this parameter.
+            return False
+
+    def _post_grasp_safe_lift_z_mm(self) -> float:
+        return max(
+            self._top_down_min_target_z_mm(),
+            float(self.get_parameter("post_grasp_safe_lift_z_mm").value),
+        )
 
     def _execution_strategy(self) -> str:
         return str(self.get_parameter("execution_strategy").value or "planned_waypoints").strip().lower()
@@ -585,6 +626,42 @@ class RobotExecutorNode(Node):
             pose_error=robot.pose_error,
             get_motion_status=lambda: robot.get_arm_status_snapshot().motion_status,
             require_motion_arrived=require_motion_arrived,
+            pose_only_fallback_enabled=(
+                require_motion_arrived
+                and bool(self.get_parameter("motion_arrived_pose_fallback_enabled").value)
+            ),
+            pose_only_fallback_pos_tolerance_mm=float(
+                self.get_parameter("motion_arrived_pose_fallback_pos_tolerance_mm").value
+            ),
+            pose_only_fallback_rot_tolerance_deg=float(
+                self.get_parameter("motion_arrived_pose_fallback_rot_tolerance_deg").value
+            ),
+            pose_only_fallback_hold_s=float(
+                self.get_parameter("motion_arrived_pose_fallback_hold_s").value
+            ),
+            can_accept_pose_only=lambda: self._pose_only_completion_is_safe(
+                robot.get_arm_status_snapshot()
+            ),
+            progress_extends_timeout=bool(
+                self.get_parameter("motion_progress_extends_timeout").value
+            ),
+            progress_position_epsilon_mm=float(
+                self.get_parameter("motion_progress_position_epsilon_mm").value
+            ),
+            progress_rotation_epsilon_deg=float(
+                self.get_parameter("motion_progress_rotation_epsilon_deg").value
+            ),
+        )
+
+    @staticmethod
+    def _pose_only_completion_is_safe(snapshot) -> bool:
+        """Permit strict pose fallback only for a healthy, controlled Piper."""
+        return (
+            int(snapshot.err_code) == 0
+            and int(snapshot.teach_status_code) == 0
+            and str(snapshot.arm_status).strip().upper() == "NORMAL"
+            and str(snapshot.control_mode).strip().upper() == "CAN"
+            and str(snapshot.motion_status).strip().upper() == "NOT_ARRIVED"
         )
 
     def _execute_command(self, cmd, executed_commands: list[str]) -> None:
@@ -744,6 +821,61 @@ class RobotExecutorNode(Node):
             tighten_position_tolerance=False,
         )
 
+    def _move_to_post_grasp_pose_safely(
+        self,
+        *,
+        current_pose: EndPoseMMDeg,
+        speed_percent: float,
+        execution_trace: list[dict[str, object]],
+        execution_strategy: str | None = None,
+    ) -> tuple[EndPoseMMDeg | None, EndPoseMMDeg]:
+        """Lift vertically before any post-grasp lateral return motion."""
+        lift_pose = None
+        safe_z_mm = max(
+            float(current_pose.z_mm),
+            self._post_grasp_safe_lift_z_mm(),
+        )
+        if safe_z_mm - float(current_pose.z_mm) > 1.0:
+            lift_target = self._copy_pose_with(current_pose, z_mm=safe_z_mm)
+            lift_pose = self._run_traced_action(
+                execution_trace=execution_trace,
+                step_name="post_grasp_vertical_safe_lift",
+                command_type="move_pose",
+                command_payload={
+                    "pose_mm_deg": self._pose_to_dict(lift_target),
+                    "speed_percent": float(speed_percent),
+                    "timeout_s": float(self._plan_pose_timeout_s()),
+                    "execution_strategy": execution_strategy,
+                },
+                action=lambda: self._move_pose_sync(
+                    name="post_grasp_vertical_safe_lift",
+                    pose=lift_target,
+                    speed_percent=speed_percent,
+                    timeout_s=self._plan_pose_timeout_s(),
+                    tighten_position_tolerance=False,
+                ),
+            )
+
+        post_grasp_target = self._configured_pose("post_grasp_pose")
+        post_grasp_pose = self._run_traced_action(
+            execution_trace=execution_trace,
+            step_name="post_grasp_high_hold",
+            command_type="move_pose",
+            command_payload={
+                "pose_mm_deg": self._pose_to_dict(post_grasp_target),
+                "speed_percent": float(speed_percent),
+                "timeout_s": float(self._plan_pose_timeout_s()),
+                "execution_strategy": execution_strategy,
+            },
+            action=lambda: self._move_configured_pose(
+                name="post_grasp_high_hold",
+                pose=post_grasp_target,
+                speed_percent=speed_percent,
+                timeout_s=self._plan_pose_timeout_s(),
+            ),
+        )
+        return lift_pose, post_grasp_pose
+
     @staticmethod
     def _copy_pose_with(
         pose: EndPoseMMDeg,
@@ -837,8 +969,14 @@ class RobotExecutorNode(Node):
     ) -> list[tuple[str, EndPoseMMDeg]]:
         rpy = self._top_down_rpy_deg() if rpy_deg is None else tuple(float(value) for value in rpy_deg)
         target = self._target_pose_from_plan_top_down(plan, rpy_deg=rpy)
+        # Use the lowest transit plane that still clears the target and the
+        # configured global safety floor.  Keeping an unusually high camera
+        # observation Z here can make the subsequent lateral pose unreachable
+        # (notably after mirroring the work area to the arm's right side).
+        # The first vertical segment therefore lifts *or lowers* in place to a
+        # geometrically safe transit height before changing wrist orientation
+        # or moving laterally.
         safe_z_mm = max(
-            float(current_pose.z_mm),
             float(target.z_mm) + self._top_down_approach_height_mm(),
             self._top_down_min_safe_z_mm(),
         )
@@ -1089,6 +1227,8 @@ class RobotExecutorNode(Node):
         pregrasp_actual = None
         target_actual = None
         retreat_pose = None
+        post_grasp_safe_lift_pose = None
+        post_grasp_pose = None
         handoff_pose = None
         home_pose = None
 
@@ -1180,6 +1320,16 @@ class RobotExecutorNode(Node):
         if lift_steps <= 0:
             raise RuntimeError(f"{strategy} produced no lift-object waypoint")
 
+        if self._move_to_post_grasp_pose_enabled() and not bool(request.move_home_after):
+            post_grasp_safe_lift_pose, post_grasp_pose = (
+                self._move_to_post_grasp_pose_safely(
+                    current_pose=retreat_pose,
+                    speed_percent=speed_percent,
+                    execution_trace=execution_trace,
+                    execution_strategy=strategy,
+                )
+            )
+
         if bool(request.move_home_after):
             handoff_target = self._configured_pose("handoff_pose") if self._use_handoff_pose() else None
             handoff_pose = self._run_traced_action(
@@ -1248,9 +1398,15 @@ class RobotExecutorNode(Node):
             "grasp_pose_mm_deg": self._pose_to_dict(target_actual),
             "target_pose_mm_deg": self._pose_to_dict(target_actual),
             "retreat_pose_mm_deg": self._pose_to_dict(retreat_pose),
+            "post_grasp_safe_lift_pose_mm_deg": self._pose_to_dict(
+                post_grasp_safe_lift_pose
+            ),
+            "post_grasp_pose_mm_deg": self._pose_to_dict(post_grasp_pose),
             "handoff_pose_mm_deg": self._pose_to_dict(handoff_pose),
             "home_pose_mm_deg": self._pose_to_dict(home_pose),
-            "final_pose_mm_deg": self._pose_to_dict(home_pose or handoff_pose or retreat_pose),
+            "final_pose_mm_deg": self._pose_to_dict(
+                home_pose or handoff_pose or post_grasp_pose or retreat_pose
+            ),
             "execution_trace": execution_trace,
         }
 
@@ -1268,6 +1424,36 @@ class RobotExecutorNode(Node):
             response.arm_status = "unavailable"
         return response
 
+    def _handle_open_gripper(self, _request, response):
+        """Open the gripper without commanding any arm motion."""
+        try:
+            self._reset_interrupt_flags()
+            self._ensure_robot_ready()
+            self._set_gripper_open()
+            response.success = True
+            response.message = (
+                f"gripper opened to {self._default_gripper_open_mm():.1f} mm; "
+                "arm pose unchanged"
+            )
+            self._publish_service_result(
+                {
+                    "status": "ok",
+                    "kind": "open_gripper",
+                    "open_mm": float(self._default_gripper_open_mm()),
+                }
+            )
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            self._publish_service_result(
+                {
+                    "status": "failed",
+                    "kind": "open_gripper",
+                    "message": str(exc),
+                }
+            )
+        return response
+
     def _handle_execute_named_pose(self, request, response):
         try:
             self._reset_interrupt_flags()
@@ -1279,6 +1465,13 @@ class RobotExecutorNode(Node):
                 pose=pose6d_to_end_pose(request.pose),
                 speed_percent=float(request.speed_percent or self._default_speed()),
                 timeout_s=self._named_pose_timeout_s(),
+                # Named poses are coarse transit/observation poses.  When the
+                # arm is already very close to one, deriving the tolerance from
+                # the tiny remaining translation can shrink it to 0.5 mm and
+                # turn normal Piper endpoint jitter into a false timeout.
+                # Precision grasp/place waypoints retain their explicit
+                # tightening in the execution paths below.
+                tighten_position_tolerance=False,
             )
             response.success = True
             response.message = f"move completed: {request.name}"
@@ -1355,6 +1548,8 @@ class RobotExecutorNode(Node):
             grasp_actual = None
             target_actual = None
             retreat_pose = None
+            post_grasp_safe_lift_pose = None
+            post_grasp_pose = None
             handoff_pose = None
             home_pose = None
             speed_percent = self._default_speed()
@@ -1448,6 +1643,14 @@ class RobotExecutorNode(Node):
                     timeout_s=self._plan_pose_timeout_s(),
                 ),
             )
+            if self._move_to_post_grasp_pose_enabled() and not bool(request.move_home_after):
+                post_grasp_safe_lift_pose, post_grasp_pose = (
+                    self._move_to_post_grasp_pose_safely(
+                        current_pose=retreat_pose,
+                        speed_percent=speed_percent,
+                        execution_trace=execution_trace,
+                    )
+                )
             if bool(request.move_home_after):
                 handoff_target = self._configured_pose("handoff_pose") if self._use_handoff_pose() else None
                 handoff_pose = self._run_traced_action(
@@ -1505,9 +1708,15 @@ class RobotExecutorNode(Node):
                 "grasp_pose_mm_deg": self._pose_to_dict(grasp_actual),
                 "target_pose_mm_deg": self._pose_to_dict(target_actual),
                 "retreat_pose_mm_deg": self._pose_to_dict(retreat_pose),
+                "post_grasp_safe_lift_pose_mm_deg": self._pose_to_dict(
+                    post_grasp_safe_lift_pose
+                ),
+                "post_grasp_pose_mm_deg": self._pose_to_dict(post_grasp_pose),
                 "handoff_pose_mm_deg": self._pose_to_dict(handoff_pose),
                 "home_pose_mm_deg": self._pose_to_dict(home_pose),
-                "final_pose_mm_deg": self._pose_to_dict(home_pose or handoff_pose or retreat_pose),
+                "final_pose_mm_deg": self._pose_to_dict(
+                    home_pose or handoff_pose or post_grasp_pose or retreat_pose
+                ),
                 "execution_trace": execution_trace,
             }
             response.success = True
@@ -1518,6 +1727,233 @@ class RobotExecutorNode(Node):
             response.success = False
             response.message = str(exc)
             response.execution_json = json_dumps({"status": "failed", "run_id": run_id, "message": str(exc)})
+            self._publish_service_result(json.loads(response.execution_json))
+        return response
+
+    def _validate_place_request(self, request) -> tuple[EndPoseMMDeg, EndPoseMMDeg, EndPoseMMDeg]:
+        if not str(request.plan.item_id or "").strip():
+            raise RuntimeError("place plan item_id is empty")
+        slot_index = int(request.plan.slot_index)
+        slot_count = max(1, int(self.get_parameter("placement_slot_count").value or 6))
+        if not 0 <= slot_index < slot_count:
+            raise RuntimeError(
+                f"place plan slot_index {slot_index} is outside 0..{slot_count - 1}"
+            )
+        if not bool(request.plan.label_verified):
+            raise RuntimeError("place plan rejected: target box label was not verified")
+        minimum_label_confidence = max(
+            0.0,
+            float(self.get_parameter("placement_min_label_confidence").value or 0.42),
+        )
+        if float(request.plan.label_confidence) < minimum_label_confidence:
+            raise RuntimeError(
+                "place plan rejected: box label confidence "
+                f"{float(request.plan.label_confidence):.3f} is below "
+                f"{minimum_label_confidence:.3f}"
+            )
+        actual_size = [float(value) for value in list(request.plan.box_outer_size_m)]
+        expected_size = [
+            float(value)
+            for value in list(self.get_parameter("placement_box_outer_size_m").value or [])
+        ]
+        if len(actual_size) != 3 or len(expected_size) != 3:
+            raise RuntimeError("place plan box size must contain 3 values")
+        tolerance = max(
+            0.0,
+            float(self.get_parameter("placement_box_size_tolerance_m").value or 0.005),
+        )
+        if any(abs(actual - expected) > tolerance for actual, expected in zip(actual_size, expected_size)):
+            raise RuntimeError(
+                f"place plan box size {actual_size} does not match configured size {expected_size}"
+            )
+
+        approach = pose6d_to_end_pose(request.plan.approach_pose)
+        release = pose6d_to_end_pose(request.plan.release_pose)
+        retreat = pose6d_to_end_pose(request.plan.retreat_pose)
+        minimum_clearance = max(
+            1.0,
+            float(self.get_parameter("placement_min_vertical_clearance_mm").value or 50.0),
+        )
+        if float(approach.z_mm) - float(release.z_mm) < minimum_clearance:
+            raise RuntimeError("place approach does not provide enough vertical clearance")
+        if float(retreat.z_mm) - float(release.z_mm) < minimum_clearance:
+            raise RuntimeError("place retreat does not provide enough vertical clearance")
+        for name, pose in (("approach", approach), ("retreat", retreat)):
+            lateral_delta = math.hypot(
+                float(pose.x_mm) - float(release.x_mm),
+                float(pose.y_mm) - float(release.y_mm),
+            )
+            if lateral_delta > 15.0:
+                raise RuntimeError(
+                    f"place {name} must remain vertical over the release point; "
+                    f"lateral delta={lateral_delta:.1f}mm"
+                )
+        return approach, release, retreat
+
+    def _validate_place_kinematics(
+        self,
+        approach: EndPoseMMDeg,
+        release: EndPoseMMDeg,
+        retreat: EndPoseMMDeg,
+    ) -> list[dict[str, object]]:
+        results: list[dict[str, object]] = []
+        if self._pose_execution_mode() != "moveit_ik":
+            return [{"stage": name, "status": "ok"} for name in ("place_approach", "place_release", "place_retreat")]
+        self._ensure_moveit_pose_mode_ready()
+        compute_ik = self._moveit_ik_executor().compute_ik
+        for stage, pose in (
+            ("place_approach", approach),
+            ("place_release", release),
+            ("place_retreat", retreat),
+        ):
+            try:
+                compute_ik(pose)
+                results.append({"stage": stage, "status": "ok"})
+            except Exception as exc:
+                results.append(
+                    {
+                        "stage": stage,
+                        "status": "failed",
+                        "ik_error_type": type(exc).__name__,
+                        "ik_error_message": str(exc),
+                    }
+                )
+                break
+        return results
+
+    def _handle_execute_place_plan(self, request, response):
+        run_id = str(request.run_id or "")
+        try:
+            self._reset_interrupt_flags()
+            self._ensure_robot_ready()
+            approach, release, retreat = self._validate_place_request(request)
+            waypoint_results = self._validate_place_kinematics(approach, release, retreat)
+            failed = next((item for item in waypoint_results if item.get("status") == "failed"), None)
+            if failed is not None:
+                response.success = False
+                response.message = str(failed.get("ik_error_message") or "place plan rejected")
+                response.execution_json = json_dumps(
+                    {
+                        "status": "rejected",
+                        "run_id": run_id,
+                        "item_id": request.plan.item_id,
+                        "slot_index": int(request.plan.slot_index),
+                        "label_confidence": float(request.plan.label_confidence),
+                        "waypoint_results": waypoint_results,
+                    }
+                )
+                self._publish_service_result(json.loads(response.execution_json))
+                return response
+
+            if not bool(request.execute):
+                response.success = True
+                response.message = "dry-run only; place plan IK validated"
+                response.execution_json = json_dumps(
+                    {
+                        "status": "dry_run",
+                        "run_id": run_id,
+                        "item_id": request.plan.item_id,
+                        "slot_index": int(request.plan.slot_index),
+                        "label_confidence": float(request.plan.label_confidence),
+                        "waypoint_results": waypoint_results,
+                    }
+                )
+                self._publish_service_result(json.loads(response.execution_json))
+                return response
+
+            trace: list[dict[str, object]] = []
+            speed = self._default_speed()
+            final_speed = min(
+                speed,
+                max(1.0, float(self.get_parameter("placement_final_speed_percent").value or 2.0)),
+            )
+            for stage, pose, move_speed in (
+                ("place_approach", approach, speed),
+                ("place_release", release, final_speed),
+            ):
+                self._run_traced_action(
+                    execution_trace=trace,
+                    step_name=stage,
+                    command_type="move_pose",
+                    command_payload={
+                        "pose_mm_deg": self._pose_to_dict(pose),
+                        "speed_percent": float(move_speed),
+                        "timeout_s": float(self._plan_pose_timeout_s()),
+                    },
+                    action=lambda target=pose, name=stage, target_speed=move_speed: self._move_pose_sync(
+                        name=name,
+                        pose=target,
+                        speed_percent=target_speed,
+                        timeout_s=self._plan_pose_timeout_s(),
+                        tighten_position_tolerance=True,
+                    ),
+                )
+            self._run_traced_action(
+                execution_trace=trace,
+                step_name="place_release_gripper",
+                command_type="open_gripper",
+                command_payload={"open_mm": float(self._default_gripper_open_mm()), "effort_nm": None},
+                action=lambda: self._set_gripper_open(),
+            )
+            self._run_traced_action(
+                execution_trace=trace,
+                step_name="place_retreat",
+                command_type="move_pose",
+                command_payload={
+                    "pose_mm_deg": self._pose_to_dict(retreat),
+                    "speed_percent": float(speed),
+                    "timeout_s": float(self._plan_pose_timeout_s()),
+                },
+                action=lambda: self._move_pose_sync(
+                    name="place_retreat",
+                    pose=retreat,
+                    speed_percent=speed,
+                    timeout_s=self._plan_pose_timeout_s(),
+                    tighten_position_tolerance=True,
+                ),
+            )
+            home_pose = None
+            if bool(request.move_home_after):
+                home_target = self._configured_pose("home_pose")
+                home_pose = self._run_traced_action(
+                    execution_trace=trace,
+                    step_name="home",
+                    command_type="move_pose",
+                    command_payload={
+                        "pose_mm_deg": self._pose_to_dict(home_target),
+                        "speed_percent": float(speed),
+                        "timeout_s": float(self._plan_pose_timeout_s()),
+                    },
+                    action=lambda: self._move_configured_pose(
+                        name="home",
+                        pose=home_target,
+                        speed_percent=speed,
+                        timeout_s=self._plan_pose_timeout_s(),
+                    ),
+                )
+            payload = {
+                "status": "ok",
+                "run_id": run_id,
+                "item_id": request.plan.item_id,
+                "slot_index": int(request.plan.slot_index),
+                "label_confidence": float(request.plan.label_confidence),
+                "box_outer_size_m": [float(value) for value in list(request.plan.box_outer_size_m)],
+                "waypoint_results": waypoint_results,
+                "release_performed": True,
+                "move_home_after": bool(request.move_home_after),
+                "final_pose_mm_deg": self._pose_to_dict(home_pose or retreat),
+                "execution_trace": trace,
+            }
+            response.success = True
+            response.message = "place plan executed"
+            response.execution_json = json_dumps(payload)
+            self._publish_service_result(payload)
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            response.execution_json = json_dumps(
+                {"status": "failed", "run_id": run_id, "message": str(exc)}
+            )
             self._publish_service_result(json.loads(response.execution_json))
         return response
 

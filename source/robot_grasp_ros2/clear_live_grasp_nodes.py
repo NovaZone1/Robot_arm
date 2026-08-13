@@ -28,7 +28,7 @@ def build_cleanup_targets(project_root: Path) -> list[CleanupTarget]:
     return [
         CleanupTarget(
             "distributed_stack",
-            r"robot_grasp_ros2\.(camera_server_node|vision_worker_node|robot_executor_node|pipeline_orchestrator_node)",
+            r"robot_grasp_ros2\.(camera_server_node|vision_worker_node|robot_executor_node|pipeline_orchestrator_node|scout_scan_controller_node)",
         ),
         CleanupTarget("moveit_ik", r"move_group"),
         CleanupTarget("piper_driver", r"piper_single_ctrl"),

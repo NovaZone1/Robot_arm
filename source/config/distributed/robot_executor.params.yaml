@@ -12,18 +12,36 @@ robot_executor:
     pose_execution_mode: "direct"
     moveit_ik_timeout_s: 1.5
     pose_goal_hold_s: 0.0
+    # Keep Piper ARRIVED as the normal completion signal.  Some firmware runs
+    # leave it at NOT_ARRIVED after the endpoint has already settled; accept
+    # that case only after a healthy controller remains within a strict pose
+    # window continuously.  This prevents intermittent final-descent timeouts
+    # without weakening the normal 20 mm waypoint guard.
+    motion_arrived_pose_fallback_enabled: true
+    motion_arrived_pose_fallback_pos_tolerance_mm: 2.0
+    motion_arrived_pose_fallback_rot_tolerance_deg: 2.0
+    motion_arrived_pose_fallback_hold_s: 0.6
     named_pose_timeout_s: 30.0
     plan_pose_timeout_s: 45.0
+    # Treat the values above as no-progress watchdogs, not absolute motion
+    # deadlines. A healthy arm that is still converging may keep moving for as
+    # long as necessary; a stuck/disabled/disconnected arm still fails safely.
+    motion_progress_extends_timeout: true
+    motion_progress_position_epsilon_mm: 0.5
+    motion_progress_rotation_epsilon_deg: 0.25
     move_pos_tolerance_mm: 20.0
     move_rot_tolerance_deg: 10.0
     reject_degenerate_grasp_waypoints: true
     min_grasp_approach_offset_m: 0.005
     min_retreat_lift_m: 0.03
+    # Active work table is on the arm's left side. Keep the wrist heading on
+    # the verified left-side branch; the former right-side +90 deg profile is
+    # preserved under config/calibration/observation_poses/right_side.yaml.
     top_down_rpy_deg: [180.0, 85.0, -90.0]
     top_down_rpy_variants_deg: [180.0, 85.0, -90.0]
-    # Keep the wrist aligned with the arm-to-bottle radial direction.  At the
-    # verified straight-left work-area center (azimuth 90 deg), yaw remains
-    # -90 deg; offset bottles rotate base and tool yaw together.
+    # Keep the wrist aligned with the arm-to-target radial direction. At the
+    # verified straight-left work-area center (azimuth +90 deg), yaw remains
+    # -90 deg; offset targets rotate base and tool yaw together.
     center_horizontal_follow_target_azimuth: true
     center_horizontal_reference_azimuth_deg: 90.0
     center_horizontal_max_yaw_adjust_deg: 45.0
@@ -51,6 +69,18 @@ robot_executor:
     # The dashboard speed is the real Piper MotionCtrl_2 percentage.  Keep the
     # configurable guard, but do not silently clamp every request to 5%.
     top_down_max_speed_percent: 100.0
+    placement_box_outer_size_m: [0.180, 0.132, 0.087]
+    placement_slot_count: 6
+    placement_box_size_tolerance_m: 0.005
+    placement_min_label_confidence: 0.42
+    placement_min_vertical_clearance_mm: 50.0
+    placement_final_speed_percent: 2.0
     use_handoff_pose: true
     handoff_pose: [200.0, 20.0, 300.0, 10.0, 120.0, 0.0]
     home_pose: [57.0, 0.0, 215.0, 0.0, 85.0, 0.0]
+    # Elevated holding pose after a successful grasp. Keep the Home heading,
+    # extend about 200 mm along base +X, and keep the gripper closed. Before
+    # moving laterally, lift vertically to the safe clearance height below.
+    move_to_post_grasp_pose: true
+    post_grasp_safe_lift_z_mm: 350.0
+    post_grasp_pose: [256.885, 0.0, 400.0, 0.0, 84.939, 0.0]

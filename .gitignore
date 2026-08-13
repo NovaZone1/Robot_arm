@@ -9,6 +9,8 @@ install_msgs/
 log_msgs/
 
 # Python
+.venv/
+*.egg-info/
 __pycache__/
 *.pyc
 *.pyo

@@ -1,0 +1,9 @@
+float64 distance_m
+float64 speed_mps
+float64 timeout_s
+---
+bool success
+string message
+float64 traveled_m
+float64 lateral_error_m
+float64 yaw_error_deg

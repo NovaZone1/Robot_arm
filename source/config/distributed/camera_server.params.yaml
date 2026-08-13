@@ -1,7 +1,9 @@
 camera_server:
   ros__parameters:
-    worker_python_executable: "/home/ybw/miniforge3/envs/piper/bin/python"
-    worker_script: "/home/ybw/piper_grasp_project/source/src/perception/external_camera_capture_worker.py"
+    # Empty values resolve to the environment-selected worker Python and the
+    # worker script shipped in this package.
+    worker_python_executable: ""
+    worker_script: ""
     worker_timeout_s: 60.0
     worker_mode: "daemon"
     camera_width: 640

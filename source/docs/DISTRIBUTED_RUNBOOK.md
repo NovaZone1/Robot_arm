@@ -1,5 +1,29 @@
 # Distributed Runbook
 
+## 裁判红旗启动信号
+
+`run_indoor_recorded_route.sh` 在抓取栈 preflight 成功之后、发送 Nav2 目标之前调用
+`scripts/wait_for_red_flag_start.sh`。当前新示教位已经由实时 Piper 末端及关节反馈记录，
+并在正常 CAN 控制下以 5% 速度验证可达。脚本默认先自动移动到该观察位，然后运行
+`red_flag_start_gate`。检测器只调用
+`/camera_server/capture` 获取单帧 RGB，不直接打开 RealSense，也不控制底盘。
+
+默认标定值：
+
+- 观察位：`[44.300, -3.710, 596.805, 3.037, 72.962, 0.898] mm/deg`；已验证并默认自动重放。
+  若 Piper 偶发未消费第一次关节目标，启动门会重新确认使能并只重发一次相同目标；
+  第二次仍失败则中止，不会开始导航。
+- HSV 红色：`H=0..12/168..179, S>=110, V>=90`
+- 峰值红色面积：至少占全图 `3%`
+- 三秒窗口：至少 4 次有效检测
+- 单轴运动范围：至少 `0.18` 个画幅
+- 质心累计路径：至少 `0.30` 个归一化画幅
+- 方向反转：至少 1 次
+
+这些阈值来自 2026-08-11 现场采集的 `no_flag/static_flag/waving_flag` 三组样本。
+若等待超时，命令返回非零且导航不会启动。运行结果保存在
+`config/calibration/red_flag/runtime/latest.json` 和 `latest.png`。
+
 本文档描述 `robot_grasp_ros2` 当前推荐的分布式运行方式。
 
 适用范围：
@@ -54,6 +78,62 @@
 - 颜色物块未命中时禁止使用全场景 GraspNet pseudo-instance 兜底，避免误抓桌面或其他物体
 - Dashboard 的物块快捷按钮会自动关闭瓶子专用的“中心水平抓取”
 - 首次真机验证只使用“规划后确认”，检查分割图和计划后再决定是否确认执行
+
+### 1.4 六类物品与对应盒放置
+
+物品目录是 `config/item_catalog.yaml`，当前 ID：
+
+- `yellow_block`、`red_block`、`blue_block`
+- `orange_bottle`、`dark_bottle`、`green_bottle`
+
+盒外尺寸固定为 `0.180 x 0.132 x 0.087 m`。长边 `180 mm` 沿桌长，六盒紧密排列，
+整排约 `1080 mm`；标识贴在后侧竖直面，盒子顺序不固定。单视角可见完整六标时直接
+按画面从左到右生成槽位 `0..5`；视野不足时使用底盘多视角预扫描融合六个标签点。
+
+默认 `dynamic_box_localization=true`：使用纸质标识而不是透明盒壁的深度，恢复六个
+`base_link` 三维点，校验相邻中心为 `180±20 mm`。盒内方向取“垂直于盒列且朝相机”的
+水平向量，从后壁标识向盒内偏移短边的一半 `66 mm`，Z 使用桌面高度加盒高一半。
+
+启用真实放置前必须完成：
+
+1. 在 `config/distributed/pipeline_orchestrator.params.yaml` 标定
+   `placement_observe_pose`，保证夹持物体时路径可达且标签进入相机 ROI。
+2. 为物块/瓶子分别标定 `release_rpy_deg` 和相对动态盒中心的
+   `release_offset_mm`，通过空载 IK/轨迹后才将对应 `placement.enabled` 改为 `true`。
+3. 瓶子按实物横放/斜放标定；确认瓶长、盒内净尺寸和夹爪松开后均无碰撞。
+4. 如果显式关闭动态定位，可改用六个 `slot_centers_mm`，或标定画面最左/最右
+   `row_first_slot_center_mm`、`row_last_slot_center_mm` 后自动按 `180 mm` 插值。
+5. 重启完整 distributed 栈。新增消息和服务不能由旧进程热加载。
+
+首次验收使用 `5%` 速度、空盒和“规划后确认”，并保持急停可触达。运行顺序是：
+
+`目标解析 -> 桌面目标比对 -> 抓取并保持 -> 盒标观察 -> 六标识排他匹配 -> 放置 IK dry-run -> 放置 -> 可选 Home`
+
+任一情况都会拒绝松爪：未标定、盒尺寸不符、未完整识别六标识、目标槽位不明确、
+置信度不足、进退路点净空不足、MoveIt IK 不通过。标定前不要勾选 Dashboard 的
+“识别对应盒标并放置”。
+
+标定时先点击 Dashboard 的“扫描放置区”。该按钮不会移动机械臂，只会：
+
+- 读取当前 `mm/deg` 位姿
+- 采集对齐 RGB-D
+- 识别六个盒标并计算动态盒中心
+- 显示 RGB、深度、左到右顺序、五段间距和六个 base 坐标
+
+扫描结果写入 `ros_ws/viz/placement_scan/latest.json` 及同目录 PNG。必须先让相机在当前
+姿态看全六个纸质标识；不要为了生成画面触发抓取任务。
+
+若相机视野物理上无法覆盖整排，先单独启动 Scout Mini（`can0@500000`）：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/nvidia/auto/ROS2_FOR_SCOUT_MINI/third_party/scout_mini_ws/install/setup.bash
+ros2 launch scout_base scout_mini_base.launch.py port_name:=can0
+```
+
+确认 `/odom` 连续、没有其他 `/cmd_vel` 发布者、底盘前后各 `0.4 m` 无障碍并准备硬件
+急停，再在 Dashboard 勾选安全确认并点击“底盘多视角扫描”。机械臂保持面向桌子的
+观察姿态；底盘只前后移动，不转向。任务停止按钮同时向机械臂和底盘发送停止请求。
 
 ## 2. 目录与产物约定
 
@@ -243,7 +323,13 @@ cd /home/ybw/piper_grasp_project/source
 - `max_approach_angle` 默认放宽到 `180deg`，不再把 top-down 当作强过滤条件。
 - `min_grasp_score` 默认降到 `0.01`，`max_grasp_center_offset_m` 默认放宽到 `0.35m`。
 - `max_reachable_rotation_delta_deg` 默认放宽到 `180deg`，并默认允许 `180deg` 等价抓取姿态。
-- 若分割器返回 0 个实例但全场景 GraspNet 有结果，会使用全场景 grasp 作为 pseudo-instance 兜底，继续交给 planner / robot validation。
+- 通用 COCO prompt 若分割器返回 0 个实例但全场景 GraspNet 有结果，可使用全场景 grasp
+  作为 pseudo-instance 交给 planner / robot validation；六种目录目标（红黄蓝物块、
+  橙/深/绿瓶）禁止该回退。目录目标单向扫描还必须等待真实实例中心进入操作员标定的
+  二维范围：瓶子 `(0.598, 0.485)`、物块 `(0.606, 0.619)`，容差分别为水平 `±0.08`
+  和垂直 `±0.15`。目标出现后使用 7 cm 细步，不能仅凭任意场景抓取候选停车。通过该
+  扫描抓到瓶子或物块后，机械臂先闭爪并 retreat；机械臂移动到观察位与底盘连续前进
+  `1.5 m` 同时进行。放置松爪并退出盒体后，底盘再连续前进 `1.5 m`。
 - `execute=true` 时，同一个 candidate 会尝试多个 wrist-roll / 180deg 姿态变体，通过 robot validation 的第一个计划才会进入确认或执行。
 - 姿态变体会优先尝试机器人友好的 fallback RPY：当前 observation 姿态、`(0, 120, 0)`、`(180, 60, 180)`，再尝试 GraspNet 原始姿态变体。
 - fallback RPY 会重新计算该姿态下的工具接触补偿和所有执行 waypoint，避免姿态通过 IK 但 TCP 目标仍沿用旧补偿导致横向偏抓。
@@ -546,6 +632,25 @@ cd /home/ybw/piper_grasp_project/source
 - `/camera_server/latest/color`
 - `/camera_server/latest/depth`
 - `/camera_server/latest/camera_info`
+
+### 4.6 Nav2 到抓取点后的自动交接
+
+机械臂侧桥接入口：
+
+```bash
+./scripts/run_navigation_grasp_handoff.sh --preflight --target red_block
+./scripts/run_navigation_grasp_handoff.sh --target red_block
+```
+
+正常整车任务不需要手动调用第二条命令；导航仓库的
+`scout_navigation_bringup/scripts/run_indoor_recorded_route.sh` 会在两段
+`NavigateToPose` 都返回成功后调用它。桥接行为固定为：
+
+1. 导航前预检唯一 `/grasp_pipeline`、`probe`、底盘细扫服务及 `/odom`。
+2. 到达精确抓取点后设置目录目标、`execute=true`、`confirm=false`、
+   `base_grasp_scan_enabled=true` 和抓后观察位。
+3. 调用 `/grasp_pipeline/run`，并等待新 run 的 `final_result.json` 进入终态。
+4. 导航失败或抓取终态失败时返回非零，不允许后续路线继续。
 
 ## 5. RViz 可视化
 

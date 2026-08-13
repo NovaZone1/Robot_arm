@@ -204,6 +204,23 @@
   - `ANGLE_LIMIT` fallback
   - `result/summary`
 
+### 5.3 Target Identity And Placement Contract
+
+- 六类比赛物品的 ID、别名、参考图、物体尺寸和放置标定只能以
+  `config/item_catalog.yaml` 为 source of truth。
+- 抓取指定颜色物品时，未识别到目标不得回退到其他实例或全场景 grasp。
+- 盒标验证必须一次得到全部六个唯一标识，并按固定观察画面从左到右映射到
+  `slot_index=0..5`；只验证“目标模板超过阈值”不足以授权松爪。
+- 放置必须使用 `PlacePlan` 的 approach/release/retreat 三个位姿，并在执行前走同一条
+  dry-run IK 校验。
+- 动态定位必须从纸质标识取深度，不得依赖透明盒壁深度；六点必须满足盒长方向
+  `180 mm` 节距约束，并以已知盒深 `132 mm` 推导盒中心。
+- 动态定位失败时不得自动使用未经显式校准的静态槽位；静态模式下六个
+  `slot_centers_mm`（或首尾中心）未标定必须 fail closed。
+- `placement.enabled=false` 或物品缺少 `release_rpy_deg` 时必须 fail closed。
+- 盒标不匹配、尺寸不符、净空不足或 IK 失败时，executor 禁止打开夹爪。
+- 瓶子放置姿态不能从物块姿态推断，必须按实物和盒内净尺寸单独标定。
+
 ## 6. piper_ros Humble 真值接口
 
 以下接口已经从：

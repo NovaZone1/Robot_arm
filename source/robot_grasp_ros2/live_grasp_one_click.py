@@ -267,7 +267,7 @@ def detect_running_components(project_root: Path) -> RunningComponents:
     driver_lines = _process_lines("piper_single_ctrl")
     moveit_lines = _process_lines("move_group")
     distributed_lines = _process_lines(
-        "robot_grasp_ros2\\.(camera_server_node|vision_worker_node|robot_executor_node|pipeline_orchestrator_node)"
+        "robot_grasp_ros2\\.(camera_server_node|vision_worker_node|robot_executor_node|pipeline_orchestrator_node|scout_scan_controller_node)"
     )
     rviz_lines = _process_lines(f"rviz2 .*{rviz_config}")
 
@@ -277,6 +277,7 @@ def detect_running_components(project_root: Path) -> RunningComponents:
         "vision_worker_node",
         "robot_executor_node",
         "pipeline_orchestrator_node",
+        "scout_scan_controller_node",
     ):
         dotted = f"robot_grasp_ros2.{node_name}"
         if any(dotted in line for line in distributed_lines):
@@ -285,7 +286,7 @@ def detect_running_components(project_root: Path) -> RunningComponents:
     distributed_running = False
     distributed_partial_nodes: tuple[str, ...] = ()
     if distributed_node_names:
-        if len(distributed_node_names) == 4:
+        if len(distributed_node_names) == 5:
             distributed_running = True
         else:
             distributed_partial_nodes = tuple(distributed_node_names)

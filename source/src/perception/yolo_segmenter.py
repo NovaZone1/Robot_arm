@@ -7,6 +7,8 @@ import cv2
 import numpy as np
 import torch
 
+from src.perception.item_catalog import bottle_item_id_from_prompt, filter_bottle_instances
+
 _log = logging.getLogger(__name__)
 
 COCO_CLASS_ID: dict[str, int] = {
@@ -300,28 +302,41 @@ class YOLOSegmenter:
         if block_colors is not None:
             return _segment_color_blocks(color_bgr, block_colors, device=device)
 
+        bottle_item_id = bottle_item_id_from_prompt(text_prompt)
+
+        def empty_result() -> dict[str, Any]:
+            result = _build_empty_result(
+                device,
+                image_shape=tuple(color_bgr.shape[:2]),
+                backend=("yolo+bottle_identity" if bottle_item_id else "yolo"),
+                allow_scene_fallback=bottle_item_id is None,
+            )
+            if bottle_item_id is not None:
+                result["requested_item_id"] = bottle_item_id
+            return result
+
         target_ids = _match_class_ids(text_prompt)
         if not target_ids:
-            return _build_empty_result(device)
+            return empty_result()
 
         results = self.model(color_bgr, conf=self._conf_threshold, verbose=False)
         r = results[0]
 
         if r.boxes is None or r.masks is None:
-            return _build_empty_result(device, image_shape=tuple(color_bgr.shape[:2]))
+            return empty_result()
 
         boxes_xyxy = r.boxes.xyxy  # (M, 4) or None
         cls_ids = r.boxes.cls  # (M,)
         scores = r.boxes.conf  # (M,)
 
         if boxes_xyxy is None or cls_ids is None or scores is None:
-            return _build_empty_result(device, image_shape=tuple(color_bgr.shape[:2]))
+            return empty_result()
 
         # Filter by matched class IDs
         keep_mask = torch.isin(cls_ids.to(torch.int), torch.tensor(target_ids, device=cls_ids.device))
         indices = keep_mask.nonzero(as_tuple=False).squeeze(-1)
         if len(indices) == 0:
-            return _build_empty_result(device, image_shape=tuple(color_bgr.shape[:2]))
+            return empty_result()
 
         kept_boxes = boxes_xyxy[indices]
         kept_scores = scores[indices]
@@ -338,7 +353,7 @@ class YOLOSegmenter:
             ).squeeze(0)
 
         binary_masks = masks_tensor > 0.5  # (N, H, W) bool
-        return {
+        segmentation = {
             "masks": binary_masks.to(torch.bool),
             "scores": kept_scores.to(torch.float32),
             "boxes": kept_boxes.to(torch.float32),
@@ -346,3 +361,10 @@ class YOLOSegmenter:
             "backend": "yolo",
             "allow_scene_fallback": True,
         }
+        if bottle_item_id is not None:
+            segmentation = filter_bottle_instances(
+                segmentation,
+                np.asarray(color_bgr),
+                bottle_item_id,
+            )
+        return segmentation

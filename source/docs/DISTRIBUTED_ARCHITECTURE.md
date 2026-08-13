@@ -36,6 +36,9 @@
 - 负责最终抓取规划
 - 在 `precenter=true` 时驱动：
   - `capture -> analyze -> recenter move -> capture`
+- 在 `place_after_grasp=true` 时驱动：
+  - `grasp-and-hold -> placement observation -> capture label -> verify label`
+  - `place dry-run -> execute place`
 
 ### `camera_server_node`
 
@@ -50,6 +53,9 @@
 
 - 消费采集结果
 - 执行 YOLOv8-seg、点云重建、GraspNet、实例筛选
+- 对指定饮料瓶增加液体颜色身份过滤
+- 一次识别六个后侧竖直面盒标，并按画面从左到右输出动态槽位
+- 从纸质盒标深度恢复六个 base-frame 三维点，校验 180 mm 盒列节距并计算目标盒中心
 - 返回结构化分析结果
 - 发布分布式 RViz 可视化 topic
 
@@ -58,6 +64,7 @@
 - 管理 `fake` / `ros2` 执行后端
 - 对下只通过 `piper_ros` 与硬件交互
 - 对上提供读状态、命名位姿执行、抓取计划执行和急停能力
+- 对上提供经过盒尺寸、盒标、垂直净空和 IK 检查的放置计划执行
 - 当前执行闭环已经补齐到：
   - `optional pregrasp -> grasp -> retreat -> optional handoff -> release -> optional home`
 
@@ -108,6 +115,7 @@
 当前服务边界：
 
 - `/vision_worker/analyze`
+- `/vision_worker/match_item_label`
 
 输入核心语义：
 
@@ -135,6 +143,7 @@
 - `/robot_executor/get_state`
 - `/robot_executor/execute_named_pose`
 - `/robot_executor/execute_grasp_plan`
+- `/robot_executor/execute_place_plan`
 - `/robot_executor/stop_robot`
 
 语义要求：
@@ -145,6 +154,11 @@
 - `GraspPlan` 的 `target_pose` 表示规划姿态下的 `link6` 位姿；同时通过 `has_tool_contact_geometry`、`target_contact_point_base_m` 和 `tool_contact_offset_tool_m` 携带姿态无关的接触几何。
 - `safe_top_down` 改变最终姿态时必须以接触点为约束重新求 `link6` 平移，禁止只替换 RPY 后复用原 XYZ。
 - `safe_top_down` 的 RPY 变体必须逐个通过完整 waypoint IK；验证与执行使用同一选择逻辑，全部失败时拒绝执行。
+- `PlacePlan` 使用 `mm/deg`，包含动态 `slot_index`、approach/release/retreat、盒外
+  尺寸和盒标校验结果；
+  executor 必须在 `execute=false` 时先完成同一组安全与 IK 校验。
+- `label_verified=false`、槽位越界、盒尺寸不符、非垂直进退或任一路点不可达时禁止
+  打开夹爪。
 
 ## 4. 可视化与产物契约
 
@@ -195,6 +209,9 @@
 - `analyzing_scene`
 - `awaiting_confirmation`
 - `executing`
+- `moving_to_placement_observation`
+- `matching_box_label`
+- `placing_object`
 - `done`
 - `failed`
 - `cancelled`

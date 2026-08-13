@@ -1,0 +1,127 @@
+{
+  "label": "waving_red_flag",
+  "frame_count": 15,
+  "duration_s": 6.1523,
+  "frames": [
+    {
+      "index": 0,
+      "file": "frame_00.png",
+      "scene_id": "red-flag-waving-00-scene",
+      "stamp_sec": 1786449034,
+      "stamp_nanosec": 725237505,
+      "elapsed_s": 0.4578
+    },
+    {
+      "index": 1,
+      "file": "frame_01.png",
+      "scene_id": "red-flag-waving-01-scene",
+      "stamp_sec": 1786449035,
+      "stamp_nanosec": 185491122,
+      "elapsed_s": 0.9164
+    },
+    {
+      "index": 2,
+      "file": "frame_02.png",
+      "scene_id": "red-flag-waving-02-scene",
+      "stamp_sec": 1786449035,
+      "stamp_nanosec": 637798092,
+      "elapsed_s": 1.3562
+    },
+    {
+      "index": 3,
+      "file": "frame_03.png",
+      "scene_id": "red-flag-waving-03-scene",
+      "stamp_sec": 1786449036,
+      "stamp_nanosec": 95287655,
+      "elapsed_s": 1.788
+    },
+    {
+      "index": 4,
+      "file": "frame_04.png",
+      "scene_id": "red-flag-waving-04-scene",
+      "stamp_sec": 1786449036,
+      "stamp_nanosec": 511635433,
+      "elapsed_s": 2.1909
+    },
+    {
+      "index": 5,
+      "file": "frame_05.png",
+      "scene_id": "red-flag-waving-05-scene",
+      "stamp_sec": 1786449036,
+      "stamp_nanosec": 909561906,
+      "elapsed_s": 2.5854
+    },
+    {
+      "index": 6,
+      "file": "frame_06.png",
+      "scene_id": "red-flag-waving-06-scene",
+      "stamp_sec": 1786449037,
+      "stamp_nanosec": 305128018,
+      "elapsed_s": 2.9747
+    },
+    {
+      "index": 7,
+      "file": "frame_07.png",
+      "scene_id": "red-flag-waving-07-scene",
+      "stamp_sec": 1786449037,
+      "stamp_nanosec": 693130055,
+      "elapsed_s": 3.3619
+    },
+    {
+      "index": 8,
+      "file": "frame_08.png",
+      "scene_id": "red-flag-waving-08-scene",
+      "stamp_sec": 1786449038,
+      "stamp_nanosec": 83527814,
+      "elapsed_s": 3.7609
+    },
+    {
+      "index": 9,
+      "file": "frame_09.png",
+      "scene_id": "red-flag-waving-09-scene",
+      "stamp_sec": 1786449038,
+      "stamp_nanosec": 478190025,
+      "elapsed_s": 4.1537
+    },
+    {
+      "index": 10,
+      "file": "frame_10.png",
+      "scene_id": "red-flag-waving-10-scene",
+      "stamp_sec": 1786449038,
+      "stamp_nanosec": 878784834,
+      "elapsed_s": 4.5439
+    },
+    {
+      "index": 11,
+      "file": "frame_11.png",
+      "scene_id": "red-flag-waving-11-scene",
+      "stamp_sec": 1786449039,
+      "stamp_nanosec": 264181030,
+      "elapsed_s": 4.9373
+    },
+    {
+      "index": 12,
+      "file": "frame_12.png",
+      "scene_id": "red-flag-waving-12-scene",
+      "stamp_sec": 1786449039,
+      "stamp_nanosec": 651559654,
+      "elapsed_s": 5.3372
+    },
+    {
+      "index": 13,
+      "file": "frame_13.png",
+      "scene_id": "red-flag-waving-13-scene",
+      "stamp_sec": 1786449040,
+      "stamp_nanosec": 55361122,
+      "elapsed_s": 5.7225
+    },
+    {
+      "index": 14,
+      "file": "frame_14.png",
+      "scene_id": "red-flag-waving-14-scene",
+      "stamp_sec": 1786449040,
+      "stamp_nanosec": 435644678,
+      "elapsed_s": 6.133
+    }
+  ]
+}

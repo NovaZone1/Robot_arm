@@ -1,0 +1,144 @@
+schema_version: 1
+
+# All competition boxes have the same measured outer size. Labels are mounted
+# on the rear vertical wall. Box order changes between runs, so these six slots
+# are calibrated left-to-right as seen from placement_observe_pose; vision maps
+# each detected label to one slot dynamically.
+box:
+  outer_size_m: [0.180, 0.132, 0.087]
+  wall_clearance_m: 0.012
+  label_surface: rear_vertical_wall
+  label_match_threshold: 0.42
+  label_search_roi_norm: [0.0, 0.0, 1.0, 1.0]
+  slot_centers_mm:
+    - []
+    - []
+    - []
+    - []
+    - []
+    - []
+  # Optional static fallback for six tightly packed boxes. Both points are box
+  # centers for the first/last slot as seen left-to-right in the fixed placement
+  # observation image. Intermediate slots are linearly interpolated.
+  row_first_slot_center_mm: []
+  row_last_slot_center_mm: []
+  row_slot_pitch_mm: 180.0
+  row_slot_pitch_tolerance_mm: 20.0
+
+items:
+  yellow_block:
+    display_name: 黄色物块
+    aliases: [yellow block, 黄色物块, 黄块]
+    grasp_prompt: yellow block
+    kind: block
+    reference_image: ../assets/item_references/yellow_block.jpeg
+    object_size_m: [0.060, 0.060, 0.060]
+    placement:
+      enabled: false
+      # Base alignment puts every target box in the same arm-relative pose.
+      base_aligned_enabled: true
+      # Keep the forward extension above the box rim; descend only after alignment.
+      base_aligned_approach_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_release_pose_mm_deg: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
+      base_aligned_retreat_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      release_offset_mm: [0.0, 0.0, 0.0]
+      release_rpy_deg: []
+      approach_height_mm: 120.0
+      retreat_height_mm: 140.0
+
+  red_block:
+    display_name: 红色物块
+    aliases: [red block, 红色物块, 红块]
+    grasp_prompt: red block
+    kind: block
+    reference_image: ../assets/item_references/red_block.jpeg
+    object_size_m: [0.060, 0.060, 0.060]
+    placement:
+      enabled: false
+      base_aligned_enabled: true
+      base_aligned_approach_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_release_pose_mm_deg: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
+      base_aligned_retreat_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      release_offset_mm: [0.0, 0.0, 0.0]
+      release_rpy_deg: []
+      approach_height_mm: 120.0
+      retreat_height_mm: 140.0
+
+  blue_block:
+    display_name: 蓝色物块
+    aliases: [blue block, 蓝色物块, 蓝块]
+    grasp_prompt: blue block
+    kind: block
+    reference_image: ../assets/item_references/blue_block.jpeg
+    object_size_m: [0.060, 0.060, 0.060]
+    placement:
+      enabled: false
+      base_aligned_enabled: true
+      # Calibrated 2026-07-31. After Scout aligns any target label, every box
+      # shares this same arm-relative TCP path. It enters from Z=491.1 mm,
+      # above the box rim, then descends vertically to release. The generic
+      # depth-derived path remains independently locked.
+      base_aligned_approach_pose_mm_deg:
+        [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_release_pose_mm_deg:
+        [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
+      base_aligned_retreat_pose_mm_deg:
+        [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      release_offset_mm: [0.0, 0.0, 0.0]
+      release_rpy_deg: []
+      approach_height_mm: 120.0
+      retreat_height_mm: 140.0
+
+  orange_bottle:
+    display_name: 橙色饮料瓶
+    aliases: [orange bottle, 橙色饮料瓶, 橙色瓶]
+    grasp_prompt: orange bottle
+    kind: bottle
+    reference_image: ../assets/item_references/orange_bottle.jpeg
+    object_size_m: [0.060, 0.060, 0.190]
+    placement:
+      enabled: false
+      base_aligned_enabled: true
+      base_aligned_approach_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_release_pose_mm_deg: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
+      base_aligned_retreat_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      release_offset_mm: [0.0, 0.0, 0.0]
+      release_rpy_deg: []
+      approach_height_mm: 140.0
+      retreat_height_mm: 160.0
+
+  dark_bottle:
+    display_name: 深色饮料瓶
+    aliases: [dark bottle, black bottle, 深色饮料瓶, 黑色瓶]
+    grasp_prompt: dark bottle
+    kind: bottle
+    reference_image: ../assets/item_references/dark_bottle.jpeg
+    object_size_m: [0.060, 0.060, 0.190]
+    placement:
+      enabled: false
+      base_aligned_enabled: true
+      base_aligned_approach_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_release_pose_mm_deg: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
+      base_aligned_retreat_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      release_offset_mm: [0.0, 0.0, 0.0]
+      release_rpy_deg: []
+      approach_height_mm: 140.0
+      retreat_height_mm: 160.0
+
+  green_bottle:
+    display_name: 绿色饮料瓶
+    aliases: [green bottle, 绿色饮料瓶, 绿色瓶]
+    grasp_prompt: green bottle
+    kind: bottle
+    reference_image: ../assets/item_references/green_bottle.jpeg
+    object_size_m: [0.060, 0.060, 0.190]
+    placement:
+      enabled: false
+      base_aligned_enabled: true
+      base_aligned_approach_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_release_pose_mm_deg: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
+      base_aligned_retreat_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      release_offset_mm: [0.0, 0.0, 0.0]
+      release_rpy_deg: []
+      approach_height_mm: 140.0
+      retreat_height_mm: 160.0

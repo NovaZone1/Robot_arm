@@ -136,3 +136,98 @@ def test_wait_until_pose_goal_requires_stable_hold_after_arrival():
     )
 
     assert len(refresh_calls) == 4
+
+
+def test_wait_until_pose_goal_accepts_healthy_stable_pose_when_arrived_is_stuck():
+    target = EndPoseMMDeg(0.0, 0.0, 103.0, 0.0, 0.0, 0.0)
+    timeline = iter([0.0, 0.1, 0.2, 0.5, 0.8])
+    health_checks: list[str] = []
+
+    wait_until_pose_goal(
+        target=target,
+        timeout_s=2.0,
+        poll_interval_s=0.0,
+        pos_tolerance_mm=20.0,
+        rot_tolerance_deg=10.0,
+        check_interrupt=lambda: None,
+        refresh_command=None,
+        read_pose=lambda: EndPoseMMDeg(0.5, 0.0, 103.0, 0.0, 0.2, 0.0),
+        pose_error=lambda expected, actual: {
+            "dpos_mm": abs(actual.x_mm - expected.x_mm),
+            "drot_deg": abs(actual.pitch_deg - expected.pitch_deg),
+        },
+        get_motion_status=lambda: "NOT_ARRIVED",
+        require_motion_arrived=True,
+        pose_only_fallback_enabled=True,
+        pose_only_fallback_pos_tolerance_mm=2.0,
+        pose_only_fallback_rot_tolerance_deg=2.0,
+        pose_only_fallback_hold_s=0.6,
+        can_accept_pose_only=lambda: health_checks.append("checked") or True,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: next(timeline),
+    )
+
+    assert len(health_checks) == 2
+
+
+def test_wait_until_pose_goal_does_not_fallback_when_controller_is_unhealthy():
+    target = EndPoseMMDeg(0.0, 0.0, 103.0, 0.0, 0.0, 0.0)
+    timeline = iter([0.0, 0.1, 0.2, 1.1])
+
+    try:
+        wait_until_pose_goal(
+            target=target,
+            timeout_s=1.0,
+            poll_interval_s=0.0,
+            pos_tolerance_mm=20.0,
+            rot_tolerance_deg=10.0,
+            check_interrupt=lambda: None,
+            refresh_command=None,
+            read_pose=lambda: target,
+            pose_error=lambda _expected, _actual: {"dpos_mm": 0.0, "drot_deg": 0.0},
+            get_motion_status=lambda: "NOT_ARRIVED",
+            require_motion_arrived=True,
+            pose_only_fallback_enabled=True,
+            can_accept_pose_only=lambda: False,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(timeline),
+        )
+    except TimeoutError as exc:
+        assert "motion_status=NOT_ARRIVED" in str(exc)
+    else:
+        raise AssertionError("unhealthy controller must not use pose-only fallback")
+
+
+def test_wait_until_pose_goal_progress_removes_fixed_total_deadline():
+    target = EndPoseMMDeg(0.0, 0.0, 100.0, 0.0, 0.0, 0.0)
+    poses = iter(
+        [
+            EndPoseMMDeg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            EndPoseMMDeg(0.0, 0.0, 40.0, 0.0, 0.0, 0.0),
+            EndPoseMMDeg(0.0, 0.0, 80.0, 0.0, 0.0, 0.0),
+            target,
+        ]
+    )
+    # Completion occurs at t=2.0, beyond the original one-second total limit.
+    # New-best feedback at t=0.9 and t=1.2 refreshes the stall watchdog.
+    timeline = iter([0.0, 0.1, 0.9, 0.9, 1.2, 1.2, 2.0, 2.0])
+
+    wait_until_pose_goal(
+        target=target,
+        timeout_s=1.0,
+        poll_interval_s=0.0,
+        pos_tolerance_mm=0.5,
+        rot_tolerance_deg=1.0,
+        check_interrupt=lambda: None,
+        refresh_command=None,
+        read_pose=lambda: next(poses),
+        pose_error=lambda expected, actual: {
+            "dpos_mm": abs(actual.z_mm - expected.z_mm),
+            "drot_deg": 0.0,
+        },
+        get_motion_status=lambda: "ARRIVED",
+        require_motion_arrived=True,
+        progress_extends_timeout=True,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: next(timeline),
+    )

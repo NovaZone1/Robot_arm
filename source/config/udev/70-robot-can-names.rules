@@ -1,0 +1,7 @@
+# Persistent USB-CAN naming for this robot.
+# Verified 2026-08-07 by live CAN traffic: the adapter with serial 0026...
+# is wired to Piper, while 0031... is wired to Scout Mini.
+# Piper arm: bytewerk candleLight serial 002600355246570520323934 -> can1
+# Scout Mini base: bytewerk candleLight serial 003100494148570C20343133 -> can2
+ACTION=="add", SUBSYSTEM=="net", ATTRS{serial}=="002600355246570520323934", NAME="can1"
+ACTION=="add", SUBSYSTEM=="net", ATTRS{serial}=="003100494148570C20343133", NAME="can2"

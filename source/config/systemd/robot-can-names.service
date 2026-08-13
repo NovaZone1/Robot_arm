@@ -1,0 +1,11 @@
+[Unit]
+Description=Stabilize Piper and Scout USB-CAN interface names
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fix-robot-can-names
+
+[Install]
+WantedBy=multi-user.target

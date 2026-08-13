@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -72,3 +73,20 @@ def test_blue_block_ignores_smaller_same_hue_bottle_cap():
     assert y1 < 80
     assert x2 > 280
     assert y2 > 120
+
+
+def test_missing_catalog_bottle_disables_scene_fallback():
+    segmenter = YOLOSegmenter(device="cpu")
+    segmenter._model = lambda *_args, **_kwargs: [
+        SimpleNamespace(boxes=None, masks=None)
+    ]
+
+    result = segmenter.segment_text(
+        np.zeros((240, 320, 3), dtype=np.uint8),
+        "green bottle",
+    )
+
+    assert tuple(result["masks"].shape) == (0, 240, 320)
+    assert result["backend"] == "yolo+bottle_identity"
+    assert result["requested_item_id"] == "green_bottle"
+    assert result["allow_scene_fallback"] is False

@@ -1,0 +1,15 @@
+# Calibrated observation profile: work table on the Piper arm's left side.
+# Units: Cartesian poses are [x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg].
+profile: left_side
+active_from: "2026-08-12"
+grasp_observe_pose: [0.0, 35.5, 491.1, 180.0, 67.77, -89.97]
+placement_observe_pose: [0.0, 35.5, 491.1, 180.0, 67.77, -89.97]
+placement_observe_joint_positions_rad:
+  [1.571774176, 0.652510264, -1.397299288, 0.0, 1.218672728, 0.0]
+execution_orientation:
+  top_down_rpy_deg: [180.0, 85.0, -90.0]
+  center_horizontal_reference_azimuth_deg: 90.0
+  safe_top_down_reference_azimuth_deg: 90.0
+notes:
+  - "Active profile in config/distributed/pipeline_orchestrator.params.yaml."
+  - "The joint vector is diagnostic only; runtime observation moves are Cartesian."

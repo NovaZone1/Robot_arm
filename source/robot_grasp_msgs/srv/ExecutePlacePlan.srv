@@ -1,0 +1,8 @@
+string run_id
+bool execute
+bool move_home_after
+PlacePlan plan
+---
+bool success
+string message
+string execution_json

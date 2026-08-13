@@ -10,12 +10,12 @@ _robot_grasp_ros2_setup_env() {
   workspace_root="${ROBOT_GRASP_WORKSPACE_ROOT:-${bundle_root}/ros_ws}"
   # Use the colcon workspace as the project overlay root
   _colcon_ws="${workspace_root}"
-  env_root="/home/ybw/miniforge3/envs/piper"
+  env_root="${ROBOT_GRASP_PYTHON_ENV_ROOT:-${bundle_root}/.venv}"
   piper_overlay="${PIPER_ROS_ROOT:-${bundle_root}/piper_ros_ws}/install/setup.bash"
   project_overlay="${_colcon_ws}/install/setup.bash"
 
   if [[ ! -d "${env_root}" ]]; then
-    echo "piper conda env not found: ${env_root}" >&2
+    echo "perception Python environment not found: ${env_root}" >&2
     return 1
   fi
   if [[ ! -f "${piper_overlay}" ]]; then
@@ -28,7 +28,6 @@ _robot_grasp_ros2_setup_env() {
   export ROBOT_GRASP_OUTER_WORKSPACE_ROOT="${_colcon_ws}"
   export ROBOT_GRASP_SYSTEM_PYTHON="/usr/bin/python3"
   export ROBOT_GRASP_CONDA_PYTHON="${env_root}/bin/python"
-  export CONDA_PREFIX="${env_root}"
   export PATH="${env_root}/bin:${PATH}"
   export LD_LIBRARY_PATH="${env_root}/lib:${LD_LIBRARY_PATH:-}"
 

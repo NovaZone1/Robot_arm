@@ -2,27 +2,46 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import math
 from pathlib import Path
 import threading
 import time
 import traceback
 
+import cv2
 import numpy as np
 import rclpy
+from nav_msgs.msg import Odometry
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.exceptions import ParameterUninitializedException
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rcl_interfaces.srv import SetParameters
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import MarkerArray
 
-from robot_grasp_msgs.srv import AnalyzeScene, CaptureScene, ExecuteGraspPlan, ExecuteNamedPose, GetRobotState, StopRobot
+from robot_grasp_msgs.msg import PlacePlan
+from robot_grasp_msgs.srv import (
+    AnalyzeScene,
+    CaptureScene,
+    DetectTarget2D,
+    ExecuteGraspPlan,
+    ExecuteNamedPose,
+    ExecutePlacePlan,
+    GetRobotState,
+    MatchItemLabel,
+    MoveBaseRelative,
+    StopRobot,
+)
 from robot_grasp_ros2.distributed_utils import (
     base_to_camera_from_tcp_and_hand_eye,
     build_runtime_config,
     camera_info_to_intrinsics,
     candidate_debug_dict,
+    color_msg_to_bgr,
+    depth_msg_to_meters,
     grasp_candidate_from_msg,
     grasp_plan_to_msg,
     json_dumps,
@@ -35,6 +54,12 @@ from robot_grasp_ros2.distributed_utils import (
 )
 from robot_grasp_ros2.rviz_visualization import build_candidate_validation_marker_array
 from src.grasping.planning import PureGraspPlanner
+from src.perception.item_catalog import (
+    ItemCatalog,
+    LabelDetection,
+    ReferenceLabelMatcher,
+    default_item_catalog_path,
+)
 from src.robot.plan_validation import select_first_reachable_candidate
 
 
@@ -45,6 +70,8 @@ class PendingConfirmation:
     scene_id: str
     plan: object
     move_home_after: bool
+    target_item_id: str
+    hand_eye: np.ndarray
     request_payload: dict[str, object]
     cycle_records: list[dict[str, object]]
     result_payload: dict[str, object]
@@ -72,6 +99,31 @@ class PipelineOrchestratorNode(Node):
         self.create_subscription(String, "~/run_prompt", self._handle_run_prompt, 10)
         self.create_service(Trigger, "~/run", self._handle_run_service)
         self.create_service(Trigger, "~/probe", self._handle_probe_service)
+        self.create_service(
+            Trigger,
+            "~/scan_placement",
+            self._handle_scan_placement_service,
+        )
+        self.create_service(
+            Trigger,
+            "~/scan_placement_multi_view",
+            self._handle_scan_placement_multi_view_service,
+        )
+        self.create_service(
+            Trigger,
+            "~/align_placement_target",
+            self._handle_align_placement_target_service,
+        )
+        self.create_service(
+            Trigger,
+            "~/scan_and_align_placement_target",
+            self._handle_scan_and_align_placement_target_service,
+        )
+        self.create_service(
+            Trigger,
+            "~/execute_aligned_place",
+            self._handle_execute_aligned_place_service,
+        )
         self.create_service(Trigger, "~/stop", self._handle_stop_service)
         self.create_service(Trigger, "~/confirm", self._handle_confirm_service)
         self.create_service(Trigger, "~/reject", self._handle_reject_service)
@@ -85,6 +137,21 @@ class PipelineOrchestratorNode(Node):
         self._analyze_client = self.create_client(
             AnalyzeScene,
             self._service_name("vision_analyze_service"),
+            callback_group=self._rpc_callback_group,
+        )
+        self._detect_target_2d_client = self.create_client(
+            DetectTarget2D,
+            self._service_name("vision_detect_target_2d_service"),
+            callback_group=self._rpc_callback_group,
+        )
+        self._match_label_client = self.create_client(
+            MatchItemLabel,
+            self._service_name("vision_match_label_service"),
+            callback_group=self._rpc_callback_group,
+        )
+        self._executor_set_parameters_client = self.create_client(
+            SetParameters,
+            "/robot_executor/set_parameters",
             callback_group=self._rpc_callback_group,
         )
         self._get_state_client = self.create_client(
@@ -102,9 +169,31 @@ class PipelineOrchestratorNode(Node):
             self._service_name("robot_execute_plan_service"),
             callback_group=self._rpc_callback_group,
         )
+        self._execute_place_client = self.create_client(
+            ExecutePlacePlan,
+            self._service_name("robot_execute_place_service"),
+            callback_group=self._rpc_callback_group,
+        )
         self._stop_robot_client = self.create_client(
             StopRobot,
             self._service_name("robot_stop_service"),
+            callback_group=self._rpc_callback_group,
+        )
+        self._move_base_client = self.create_client(
+            MoveBaseRelative,
+            self._service_name("base_move_service"),
+            callback_group=self._rpc_callback_group,
+        )
+        self._stop_base_client = self.create_client(
+            Trigger,
+            self._service_name("base_stop_service"),
+            callback_group=self._rpc_callback_group,
+        )
+        self.create_subscription(
+            Odometry,
+            str(self.get_parameter("base_odom_topic").value),
+            self._handle_base_odometry,
+            20,
             callback_group=self._rpc_callback_group,
         )
 
@@ -112,7 +201,12 @@ class PipelineOrchestratorNode(Node):
         self._run_thread: threading.Thread | None = None
         self._run_id: str | None = None
         self._stop_requested = False
+        self._scan_active = False
         self._pending_confirmation: PendingConfirmation | None = None
+        self._item_catalog_cache: ItemCatalog | None = None
+        self._target_card_matcher_cache: ReferenceLabelMatcher | None = None
+        self._base_odom_lock = threading.Lock()
+        self._latest_base_odom: tuple[float, float, float, float] | None = None
 
         self._auto_start_armed = bool(self.get_parameter("auto_start").value)
         self._auto_start_timer = self.create_timer(0.5, self._maybe_auto_start)
@@ -120,7 +214,12 @@ class PipelineOrchestratorNode(Node):
 
     def _declare_parameters(self) -> None:
         self.declare_parameter("prompt", "")
+        self.declare_parameter("target_item_id", "")
+        self.declare_parameter("item_catalog_path", "")
         self.declare_parameter("execute", False)
+        self.declare_parameter("place_after_grasp", False)
+        self.declare_parameter("move_to_placement_observation_after_grasp", True)
+        self.declare_parameter("dynamic_box_localization", True)
         self.declare_parameter("move_home_after", True)
         self.declare_parameter("enable_pregrasp", False)
         self.declare_parameter("show_pointcloud", False)
@@ -130,6 +229,7 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("pointcloud_backend", "sdk")
         self.declare_parameter("depth_fusion_frames", 8)
         self.declare_parameter("speed", 40)
+        self.declare_parameter("observation_speed", 10)
         self.declare_parameter("graspnet_checkpoint", "checkpoint.tar")
         self.declare_parameter("hand_eye_config", "")
         self.declare_parameter("apply_npoint_tool_offset", False)
@@ -156,18 +256,99 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("extra_cli_args", [""])
         self.declare_parameter("auto_start", False)
         self.declare_parameter("skip_observation_move", False)
+        self.declare_parameter("auto_target_from_card", False)
+        self.declare_parameter("target_card_search_roi_norm", [0.0, 0.0, 1.0, 1.0])
+        self.declare_parameter("target_card_match_threshold", 0.50)
+        self.declare_parameter("target_card_min_confidence", 0.55)
+        self.declare_parameter("target_card_min_margin", 0.08)
+        self.declare_parameter("target_card_capture_frames", 3)
+        self.declare_parameter("target_card_consensus_frames", 2)
+        self.declare_parameter("target_card_capture_interval_s", 0.15)
         self.declare_parameter("observe_pose", [30.0, 0.0, 400.0, 0.0, 120.0, 0.0])
+        self.declare_parameter("placement_observe_pose", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter(
+            "placement_observe_joint_positions_rad",
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        self.declare_parameter("label_search_roi_norm", [0.0, 0.0, 1.0, 1.0])
+        self.declare_parameter("label_match_threshold", 0.42)
         self.declare_parameter("camera_capture_service", "/camera_server/capture")
         self.declare_parameter("vision_analyze_service", "/vision_worker/analyze")
+        self.declare_parameter(
+            "vision_detect_target_2d_service",
+            "/vision_worker/detect_target_2d",
+        )
+        self.declare_parameter("vision_match_label_service", "/vision_worker/match_item_label")
         self.declare_parameter("robot_state_service", "/robot_executor/get_state")
         self.declare_parameter("robot_named_pose_service", "/robot_executor/execute_named_pose")
         self.declare_parameter("robot_execute_plan_service", "/robot_executor/execute_grasp_plan")
+        self.declare_parameter("robot_execute_place_service", "/robot_executor/execute_place_plan")
         self.declare_parameter("robot_stop_service", "/robot_executor/stop_robot")
         self.declare_parameter("artifact_root", "")
+        self.declare_parameter("placement_scan_viz_dir", "")
+        self.declare_parameter("base_multiview_enabled", False)
+        self.declare_parameter("base_alignment_enabled", False)
+        self.declare_parameter("base_target_alignment_enabled", False)
+        self.declare_parameter("base_aligned_place_enabled", False)
+        self.declare_parameter("base_grasp_scan_enabled", False)
+        self.declare_parameter("base_multiview_offset_m", 0.15)
+        self.declare_parameter("base_multiview_max_travel_m", 1.50)
+        self.declare_parameter("base_multiview_max_views", 24)
+        self.declare_parameter("base_multiview_speed_mps", 0.04)
+        self.declare_parameter("base_multiview_move_timeout_s", 22.0)
+        self.declare_parameter("base_multiview_settle_s", 0.8)
+        self.declare_parameter("base_target_center_tolerance_norm", 0.18)
+        self.declare_parameter("base_grasp_bottle_center_norm", [0.598, 0.485])
+        self.declare_parameter("base_grasp_block_center_norm", [0.606, 0.619])
+        self.declare_parameter("base_grasp_center_tolerance_u_norm", 0.08)
+        self.declare_parameter("base_grasp_center_tolerance_v_norm", 0.12)
+        self.declare_parameter("base_target_fine_step_m", 0.07)
+        self.declare_parameter("post_grasp_base_advance_m", 1.50)
+        self.declare_parameter("post_grasp_base_advance_speed_mps", 0.10)
+        self.declare_parameter("post_grasp_base_advance_timeout_s", 50.0)
+        self.declare_parameter("post_place_base_advance_m", 1.50)
+        self.declare_parameter("post_place_base_advance_speed_mps", 0.10)
+        self.declare_parameter("post_place_base_advance_timeout_s", 50.0)
+        self.declare_parameter("post_place_home_pose", [57.0, 0.0, 215.0, 0.0, 85.0, 0.0])
+        self.declare_parameter("base_odom_topic", "/odom")
+        self.declare_parameter(
+            "base_move_service",
+            "/base_scan_controller/move_relative",
+        )
+        self.declare_parameter("base_stop_service", "/base_scan_controller/stop")
+        self.declare_parameter("use_cached_multiview_box_map", False)
+        self.declare_parameter("cached_box_map_max_age_s", 600.0)
+        self.declare_parameter("cached_box_map_position_tolerance_m", 0.025)
+        self.declare_parameter("cached_box_map_yaw_tolerance_deg", 2.0)
 
     def _publish_status(self, text: str) -> None:
         self.get_logger().info(text)
         self._status_pub.publish(String(data=text))
+
+    def _handle_base_odometry(self, message: Odometry) -> None:
+        position = message.pose.pose.position
+        q = message.pose.pose.orientation
+        yaw = math.atan2(
+            2.0 * ((q.w * q.z) + (q.x * q.y)),
+            1.0 - (2.0 * ((q.y * q.y) + (q.z * q.z))),
+        )
+        with self._base_odom_lock:
+            self._latest_base_odom = (
+                float(position.x),
+                float(position.y),
+                float(yaw),
+                time.monotonic(),
+            )
+
+    def _base_odom_snapshot(self) -> tuple[float, float, float]:
+        with self._base_odom_lock:
+            snapshot = self._latest_base_odom
+        if snapshot is None:
+            raise RuntimeError("Scout /odom has not been received")
+        x, y, yaw, received_at = snapshot
+        if time.monotonic() - received_at > 0.75:
+            raise RuntimeError("Scout /odom is stale")
+        return x, y, yaw
 
     def _publish_summary(self, text: str) -> None:
         self._summary_pub.publish(String(data=text))
@@ -221,6 +402,12 @@ class PipelineOrchestratorNode(Node):
 
     def _run_artifact_dir(self, run_id: str) -> Path:
         return self._artifact_root_dir() / run_id
+
+    def _placement_scan_viz_dir(self) -> Path:
+        configured = str(self.get_parameter("placement_scan_viz_dir").value or "").strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
+        return Path(__file__).resolve().parents[2] / "ros_ws" / "viz" / "placement_scan"
 
     @staticmethod
     def _pose_debug_dict(pose) -> dict[str, float]:
@@ -307,6 +494,22 @@ class PipelineOrchestratorNode(Node):
             raw_trace = execution_payload_for_file.pop("execution_trace", None)
             if isinstance(raw_trace, list):
                 execution_trace = list(raw_trace)
+            for phase_name in ("grasp", "placement"):
+                phase_payload = execution_payload_for_file.get(phase_name)
+                if not isinstance(phase_payload, dict):
+                    continue
+                phase_payload_for_file = dict(phase_payload)
+                if phase_name == "placement" and isinstance(phase_payload_for_file.get("execution"), dict):
+                    nested = dict(phase_payload_for_file["execution"])
+                    phase_trace = nested.pop("execution_trace", None)
+                    phase_payload_for_file["execution"] = nested
+                else:
+                    phase_trace = phase_payload_for_file.pop("execution_trace", None)
+                if isinstance(phase_trace, list):
+                    execution_trace.extend(
+                        [{"task_phase": phase_name, **dict(item)} for item in phase_trace]
+                    )
+                execution_payload_for_file[phase_name] = phase_payload_for_file
             result_payload_for_file["execution"] = execution_payload_for_file
         raw_candidate_validation = result_payload_for_file.pop("candidate_validation", None)
         if isinstance(raw_candidate_validation, list):
@@ -397,7 +600,21 @@ class PipelineOrchestratorNode(Node):
     def _options_payload(self) -> dict[str, object]:
         payload = {
             "prompt": str(self.get_parameter("prompt").value or ""),
+            "target_item_id": str(self.get_parameter("target_item_id").value or ""),
             "execute": bool(self.get_parameter("execute").value),
+            "place_after_grasp": bool(self.get_parameter("place_after_grasp").value),
+            "move_to_placement_observation_after_grasp": bool(
+                self.get_parameter(
+                    "move_to_placement_observation_after_grasp"
+                ).value
+            ),
+            "dynamic_box_localization": bool(
+                self.get_parameter("dynamic_box_localization").value
+            ),
+            "base_grasp_scan_enabled": bool(
+                self.get_parameter("base_grasp_scan_enabled").value
+            ),
+            "auto_target_from_card": self._auto_target_from_card_enabled(),
             "move_home_after": bool(self.get_parameter("move_home_after").value),
             "enable_pregrasp": bool(self.get_parameter("enable_pregrasp").value),
             "show_pointcloud": bool(self.get_parameter("show_pointcloud").value),
@@ -445,6 +662,296 @@ class PipelineOrchestratorNode(Node):
         if extra_cli_args:
             payload["extra_cli_args"] = extra_cli_args
         return payload
+
+    def _item_catalog(self) -> ItemCatalog:
+        if self._item_catalog_cache is None:
+            configured = str(self.get_parameter("item_catalog_path").value or "").strip()
+            path = Path(configured).expanduser().resolve() if configured else default_item_catalog_path()
+            self._item_catalog_cache = ItemCatalog.load(path)
+        return self._item_catalog_cache
+
+    def _resolve_target_item(self, prompt: str):
+        requested = str(self.get_parameter("target_item_id").value or "").strip()
+        item = self._item_catalog().resolve(requested or prompt)
+        if requested and item is None:
+            raise RuntimeError(f"unknown target_item_id: {requested}")
+        return item
+
+    def _target_card_matcher(self) -> ReferenceLabelMatcher:
+        if self._target_card_matcher_cache is None:
+            self._target_card_matcher_cache = ReferenceLabelMatcher(self._item_catalog())
+        return self._target_card_matcher_cache
+
+    def _auto_target_from_card_enabled(self) -> bool:
+        """Return the mode flag, retaining compatibility with partial test nodes."""
+        try:
+            return bool(self.get_parameter("auto_target_from_card").value)
+        except (KeyError, ParameterUninitializedException):
+            return False
+
+    @staticmethod
+    def _select_target_card_detection(
+        detections: tuple[LabelDetection, ...] | list[LabelDetection],
+        *,
+        minimum_confidence: float,
+        minimum_margin: float,
+    ) -> LabelDetection:
+        ranked = sorted(detections, key=lambda value: float(value.confidence), reverse=True)
+        if not ranked:
+            raise RuntimeError("target card not recognized: no catalog image detected")
+        best = ranked[0]
+        if float(best.confidence) < float(minimum_confidence):
+            raise RuntimeError(
+                "target card confidence too low: "
+                f"best={best.item_id} confidence={float(best.confidence):.3f} "
+                f"required={float(minimum_confidence):.3f}"
+            )
+        if len(ranked) > 1:
+            runner_up = ranked[1]
+            margin = float(best.confidence) - float(runner_up.confidence)
+            if margin < float(minimum_margin):
+                raise RuntimeError(
+                    "target card is ambiguous: "
+                    f"best={best.item_id}:{float(best.confidence):.3f} "
+                    f"second={runner_up.item_id}:{float(runner_up.confidence):.3f} "
+                    f"margin={margin:.3f} required={float(minimum_margin):.3f}"
+                )
+        return best
+
+    @classmethod
+    def _select_target_card_consensus(
+        cls,
+        frame_detections: list[tuple[LabelDetection, ...]],
+        *,
+        minimum_confidence: float,
+        minimum_margin: float,
+        minimum_votes: int,
+    ) -> tuple[LabelDetection, dict[str, object]]:
+        """Require the same unambiguous catalog winner in multiple frames."""
+        winners: list[LabelDetection] = []
+        rejected_frames: list[dict[str, object]] = []
+        for frame_index, detections in enumerate(frame_detections):
+            try:
+                winners.append(
+                    cls._select_target_card_detection(
+                        detections,
+                        minimum_confidence=minimum_confidence,
+                        minimum_margin=minimum_margin,
+                    )
+                )
+            except RuntimeError as error:
+                rejected_frames.append(
+                    {"frame_index": frame_index, "reason": str(error)}
+                )
+
+        votes: dict[str, list[LabelDetection]] = {}
+        for winner in winners:
+            votes.setdefault(winner.item_id, []).append(winner)
+        ranked_votes = sorted(
+            votes.items(),
+            key=lambda entry: (
+                len(entry[1]),
+                max(float(value.confidence) for value in entry[1]),
+            ),
+            reverse=True,
+        )
+        if not ranked_votes:
+            reasons = "; ".join(
+                str(value["reason"]) for value in rejected_frames
+            )
+            raise RuntimeError(
+                "target card not stable in any frame"
+                + (f": {reasons}" if reasons else "")
+            )
+        item_id, item_winners = ranked_votes[0]
+        vote_count = len(item_winners)
+        if vote_count < max(1, int(minimum_votes)):
+            vote_summary = ", ".join(
+                f"{candidate_id}={len(candidate_winners)}"
+                for candidate_id, candidate_winners in ranked_votes
+            )
+            raise RuntimeError(
+                "target card multi-frame consensus failed: "
+                f"best={item_id} votes={vote_count} "
+                f"required={max(1, int(minimum_votes))} all=[{vote_summary}]"
+            )
+        if len(ranked_votes) > 1 and len(ranked_votes[1][1]) == vote_count:
+            raise RuntimeError(
+                "target card multi-frame consensus tied: "
+                f"{item_id}={vote_count} {ranked_votes[1][0]}={vote_count}"
+            )
+        selected = max(item_winners, key=lambda value: float(value.confidence))
+        return selected, {
+            "winning_item_id": item_id,
+            "winning_votes": vote_count,
+            "required_votes": max(1, int(minimum_votes)),
+            "valid_frame_winners": [value.item_id for value in winners],
+            "rejected_frames": rejected_frames,
+        }
+
+    def _identify_target_card(self, *, run_id: str) -> tuple[object, dict[str, object]]:
+        self._publish_status(f"identifying_target_card: run_id={run_id}")
+        roi_values = tuple(
+            float(value)
+            for value in list(self.get_parameter("target_card_search_roi_norm").value or [])
+        )
+        if len(roi_values) != 4:
+            raise RuntimeError("target_card_search_roi_norm must contain 4 values")
+        capture_frames = max(
+            1, int(self.get_parameter("target_card_capture_frames").value)
+        )
+        consensus_frames = max(
+            1, int(self.get_parameter("target_card_consensus_frames").value)
+        )
+        if consensus_frames > capture_frames:
+            raise RuntimeError(
+                "target_card_consensus_frames cannot exceed target_card_capture_frames"
+            )
+        capture_interval_s = max(
+            0.0,
+            float(self.get_parameter("target_card_capture_interval_s").value),
+        )
+        artifact_dir = self._run_artifact_dir(run_id) / "target_card"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        frame_records: list[dict[str, object]] = []
+        frame_detections: list[tuple[LabelDetection, ...]] = []
+        frame_images: list[np.ndarray] = []
+        frame_overlays: list[np.ndarray] = []
+        search_roi: tuple[int, int, int, int] | None = None
+        for frame_index in range(capture_frames):
+            capture = self._capture_scene_once(
+                run_id=run_id,
+                phase_label=f"target_card_{frame_index:02d}",
+            )
+            image = color_msg_to_bgr(capture.color_image)
+            detections, current_search_roi = self._target_card_matcher().match_all(
+                image,
+                roi_norm=roi_values,
+                threshold=float(
+                    self.get_parameter("target_card_match_threshold").value
+                ),
+                # A target card contains a catalog photograph, unlike the six
+                # box labels where direct HSV marker detection is useful.
+                # Template-only matching prevents chair/box reflections and
+                # real objects from winning on color alone.
+                marker_detection_enabled=False,
+            )
+            search_roi = current_search_roi
+            overlay = image.copy()
+            roi_x, roi_y, roi_w, roi_h = current_search_roi
+            cv2.rectangle(
+                overlay,
+                (roi_x, roi_y),
+                (roi_x + roi_w, roi_y + roi_h),
+                (255, 255, 0),
+                2,
+            )
+            for detection in detections:
+                x, y, width, height = detection.bbox_xywh
+                color = (0, 165, 255)
+                cv2.rectangle(overlay, (x, y), (x + width, y + height), color, 2)
+                cv2.putText(
+                    overlay,
+                    f"{detection.item_id} {float(detection.confidence):.2f}",
+                    (x, max(18, y - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+            frame_color_path = artifact_dir / f"frame_{frame_index:02d}_color.png"
+            frame_overlay_path = artifact_dir / f"frame_{frame_index:02d}_overlay.png"
+            cv2.imwrite(str(frame_color_path), image)
+            cv2.imwrite(str(frame_overlay_path), overlay)
+            frame_images.append(image)
+            frame_overlays.append(overlay)
+            frame_detections.append(tuple(detections))
+            frame_records.append(
+                {
+                    "frame_index": frame_index,
+                    "scene_id": str(capture.scene_id),
+                    "detections": [
+                        {
+                            "item_id": detection.item_id,
+                            "confidence": float(detection.confidence),
+                            "bbox_xywh": list(detection.bbox_xywh),
+                            "method": detection.method,
+                        }
+                        for detection in sorted(
+                            detections,
+                            key=lambda value: float(value.confidence),
+                            reverse=True,
+                        )
+                    ],
+                    "color_path": str(frame_color_path),
+                    "overlay_path": str(frame_overlay_path),
+                }
+            )
+            if frame_index + 1 < capture_frames and capture_interval_s > 0.0:
+                time.sleep(capture_interval_s)
+
+        # Fail closed unless the same clear winner repeats in multiple frames.
+        selected, consensus = self._select_target_card_consensus(
+            frame_detections,
+            minimum_confidence=float(
+                self.get_parameter("target_card_min_confidence").value
+            ),
+            minimum_margin=float(self.get_parameter("target_card_min_margin").value),
+            minimum_votes=consensus_frames,
+        )
+        selected_frame_index = next(
+            index
+            for index, detections in enumerate(frame_detections)
+            if selected in detections
+        )
+        image = frame_images[selected_frame_index]
+        overlay = frame_overlays[selected_frame_index]
+        color_path = artifact_dir / "color.png"
+        overlay_path = artifact_dir / "overlay.png"
+        cv2.imwrite(str(color_path), image)
+        item = self._item_catalog().require(selected.item_id)
+        x, y, width, height = selected.bbox_xywh
+        cv2.rectangle(overlay, (x, y), (x + width, y + height), (0, 220, 0), 3)
+        cv2.imwrite(str(overlay_path), overlay)
+        payload = {
+            "success": True,
+            "scene_id": str(frame_records[selected_frame_index]["scene_id"]),
+            "matched_item_id": item.item_id,
+            "display_name": item.display_name,
+            "grasp_prompt": item.grasp_prompt,
+            "kind": item.kind,
+            "confidence": float(selected.confidence),
+            "bbox_xywh": list(selected.bbox_xywh),
+            "method": selected.method,
+            "search_roi_xywh": list(search_roi or (0, 0, 0, 0)),
+            "consensus": consensus,
+            "frames": frame_records,
+            "color_path": str(color_path),
+            "overlay_path": str(overlay_path),
+        }
+        self._publish_status(
+            f"target_card_identified: run_id={run_id} item={item.item_id} "
+            f"confidence={float(selected.confidence):.3f}"
+        )
+        return item, payload
+
+    def _set_executor_strategy_for_item(self, item) -> str:
+        strategy = "safe_top_down" if str(item.kind) == "block" else "center_horizontal"
+        request = SetParameters.Request()
+        request.parameters = [
+            Parameter("execution_strategy", value=strategy).to_parameter_msg()
+        ]
+        response = self._call_client(
+            self._executor_set_parameters_client,
+            request,
+            timeout_s=10.0,
+        )
+        results = list(response.results)
+        if len(results) != 1 or not bool(results[0].successful):
+            reason = str(results[0].reason) if results else "no parameter result"
+            raise RuntimeError(f"failed to select {strategy} grasp strategy: {reason}")
+        return strategy
 
     def _wait_for_client(self, client, *, timeout_s: float = 5.0) -> None:
         if client.wait_for_service(timeout_sec=timeout_s):
@@ -497,6 +1004,15 @@ class PipelineOrchestratorNode(Node):
             raise RuntimeError("observe_pose parameter must contain 6 values")
         return [float(value) for value in values]
 
+    def _placement_observe_pose_values(self) -> list[float]:
+        values = list(self.get_parameter("placement_observe_pose").value or [])
+        if len(values) != 6 or not any(abs(float(value)) > 1e-9 for value in values):
+            raise RuntimeError(
+                "placement_observe_pose is not calibrated; configure 6 mm/deg values "
+                "before enabling place_after_grasp"
+            )
+        return [float(value) for value in values]
+
     @staticmethod
     def _pose6d_msg_to_dataclass(pose_msg):
         return type(
@@ -520,7 +1036,7 @@ class PipelineOrchestratorNode(Node):
         rpy_deg: tuple[float, float, float],
         speed_percent: float,
         open_gripper_first: bool,
-        timeout_s: float = 20.0,
+        timeout_s: float = 45.0,
     ):
         request = ExecuteNamedPose.Request()
         request.name = name
@@ -568,6 +1084,550 @@ class PipelineOrchestratorNode(Node):
         if not capture_response.success:
             raise RuntimeError(capture_response.message)
         return capture_response
+
+    def _match_box_label_once(
+        self,
+        *,
+        run_id: str,
+        item_id: str,
+        capture_response,
+        base_to_camera: np.ndarray,
+        require_complete: bool = True,
+    ) -> dict[str, object]:
+        self._publish_status(f"matching_box_label: run_id={run_id} item={item_id}")
+        request = MatchItemLabel.Request()
+        request.run_id = run_id
+        request.scene_id = str(capture_response.scene_id)
+        request.expected_item_id = item_id
+        request.color_image = capture_response.color_image
+        request.depth_image = capture_response.depth_image
+        request.camera_info = capture_response.camera_info
+        request.base_to_camera = matrix_to_transform_msg(
+            base_to_camera,
+            parent_frame="base_link",
+            child_frame=str(capture_response.camera_frame or "camera_color_optical_frame"),
+            stamp=self.get_clock().now().to_msg(),
+        )
+        request.options_json = json_dumps(
+            {
+                "label_search_roi_norm": [
+                    float(value)
+                    for value in list(self.get_parameter("label_search_roi_norm").value or [])
+                ],
+                "label_match_threshold": float(self.get_parameter("label_match_threshold").value),
+                "table_z_m": float(self.get_parameter("table_z_m").value),
+            }
+        )
+        response = self._call_client(self._match_label_client, request, timeout_s=30.0)
+        payload = {
+            "success": bool(response.success),
+            "message": str(response.message),
+            "expected_item_id": item_id,
+            "matched_item_id": str(response.matched_item_id or ""),
+            "confidence": float(response.confidence),
+            "slot_index": int(response.slot_index),
+            "detected_label_count": int(response.detected_label_count),
+            "has_box_center": bool(response.has_box_center),
+            "box_center_base_m": [
+                float(response.box_center_base_m.x),
+                float(response.box_center_base_m.y),
+                float(response.box_center_base_m.z),
+            ],
+            "bbox_xywh": [
+                int(response.bbox_x),
+                int(response.bbox_y),
+                int(response.bbox_width),
+                int(response.bbox_height),
+            ],
+            "diagnostics": (
+                json.loads(response.diagnostics_json)
+                if str(response.diagnostics_json or "").strip()
+                else {}
+            ),
+        }
+        complete = not (
+            not response.success
+            or str(response.matched_item_id) != item_id
+            or int(response.slot_index) < 0
+            or int(response.detected_label_count) != 6
+            or not bool(response.has_box_center)
+        )
+        payload["complete"] = bool(complete)
+        if require_complete and not complete:
+            raise RuntimeError(
+                f"box label verification failed for {item_id}: {response.message}"
+            )
+        return payload
+
+    @staticmethod
+    def _pose6d_from_mm_deg(values: tuple[float, float, float, float, float, float]):
+        return pose6d_from_position_m_rpy_deg(
+            (values[0] / 1000.0, values[1] / 1000.0, values[2] / 1000.0),
+            (values[3], values[4], values[5]),
+        )
+
+    def _build_place_plan_message(
+        self,
+        *,
+        item_id: str,
+        label_confidence: float,
+        slot_index: int,
+        box_center_base_m: tuple[float, float, float],
+    ) -> PlacePlan:
+        catalog = self._item_catalog()
+        poses = catalog.build_place_poses_mm_deg(
+            item_id,
+            slot_index,
+            slot_center_mm=tuple(float(value) * 1000.0 for value in box_center_base_m),
+        )
+        message = PlacePlan()
+        message.item_id = item_id
+        message.slot_index = int(slot_index)
+        message.approach_pose = self._pose6d_from_mm_deg(poses["approach"])
+        message.release_pose = self._pose6d_from_mm_deg(poses["release"])
+        message.retreat_pose = self._pose6d_from_mm_deg(poses["retreat"])
+        message.box_outer_size_m = [float(value) for value in catalog.box.outer_size_m]
+        message.label_verified = True
+        message.label_confidence = float(label_confidence)
+        return message
+
+    def _build_base_aligned_place_plan_message(
+        self,
+        *,
+        item_id: str,
+        label_confidence: float,
+        slot_index: int,
+    ) -> PlacePlan:
+        catalog = self._item_catalog()
+        poses = catalog.build_base_aligned_place_poses_mm_deg(item_id)
+        message = PlacePlan()
+        message.item_id = item_id
+        message.slot_index = int(slot_index)
+        message.approach_pose = self._pose6d_from_mm_deg(poses["approach"])
+        message.release_pose = self._pose6d_from_mm_deg(poses["release"])
+        message.retreat_pose = self._pose6d_from_mm_deg(poses["retreat"])
+        message.box_outer_size_m = [
+            float(value) for value in catalog.box.outer_size_m
+        ]
+        message.label_verified = True
+        message.label_confidence = float(label_confidence)
+        return message
+
+    def _cached_multiview_label(
+        self,
+        item_id: str,
+    ) -> dict[str, object] | None:
+        if not bool(self.get_parameter("use_cached_multiview_box_map").value):
+            return None
+        path = self._placement_scan_viz_dir() / "latest.json"
+        if not path.is_file():
+            raise RuntimeError("multi-view box map is required but no scan exists")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not bool(payload.get("success"))
+            or str(payload.get("scan_mode") or "") != "base_multiview"
+            or not bool(payload.get("base_returned_to_start"))
+        ):
+            raise RuntimeError("latest placement scan is not a valid multi-view box map")
+        created_at = float(payload.get("created_at_unix_s") or 0.0)
+        max_age = float(self.get_parameter("cached_box_map_max_age_s").value)
+        if created_at <= 0.0 or time.time() - created_at > max_age:
+            raise RuntimeError("cached multi-view box map is stale; scan again")
+
+        origin = dict(payload.get("base_odom_origin") or {})
+        current = self._base_odom_snapshot()
+        position_error = math.hypot(
+            current[0] - float(origin["x_m"]),
+            current[1] - float(origin["y_m"]),
+        )
+        yaw_error = abs(
+            math.degrees(
+                math.atan2(
+                    math.sin(current[2] - float(origin["yaw_rad"])),
+                    math.cos(current[2] - float(origin["yaw_rad"])),
+                )
+            )
+        )
+        position_limit = float(
+            self.get_parameter("cached_box_map_position_tolerance_m").value
+        )
+        yaw_limit = float(
+            self.get_parameter("cached_box_map_yaw_tolerance_deg").value
+        )
+        if position_error > position_limit or yaw_error > yaw_limit:
+            raise RuntimeError(
+                "Scout moved since multi-view scan: "
+                f"position_error={position_error:.3f}m "
+                f"yaw_error={yaw_error:.2f}deg; scan again"
+            )
+
+        fused = dict(payload.get("fused_map") or {})
+        centers = dict(fused.get("item_to_box_center_base_m") or {})
+        slots = dict(fused.get("item_to_slot_index") or {})
+        confidences = dict(fused.get("item_to_confidence") or {})
+        if item_id not in centers or item_id not in slots:
+            raise RuntimeError(f"cached box map does not contain {item_id}")
+        return {
+            "success": True,
+            "complete": True,
+            "message": "using odometry-validated multi-view box map",
+            "expected_item_id": item_id,
+            "matched_item_id": item_id,
+            "confidence": float(confidences.get(item_id) or 0.0),
+            "slot_index": int(slots[item_id]),
+            "detected_label_count": 6,
+            "has_box_center": True,
+            "box_center_base_m": [
+                float(value) for value in list(centers[item_id])
+            ],
+            "diagnostics": fused,
+            "source_scan_id": str(payload.get("scan_id") or ""),
+        }
+
+    def _run_placement_stage(
+        self,
+        *,
+        run_id: str,
+        item_id: str,
+        move_home_after: bool,
+        hand_eye: np.ndarray,
+        advance_base_during_observation: bool = False,
+    ) -> dict[str, object]:
+        observe = self._placement_observe_pose_values()
+        observe_response, post_grasp_movement = (
+            self._move_to_placement_observation(
+                run_id=run_id,
+                observe=observe,
+                advance_base=advance_base_during_observation,
+                timeout_s=30.0,
+                target_item_id=item_id,
+            )
+        )
+        observe_pose = self._pose6d_msg_to_dataclass(observe_response.actual_pose)
+        base_to_camera = base_to_camera_from_tcp_and_hand_eye(observe_pose, hand_eye)
+        label = self._cached_multiview_label(item_id)
+        capture_response = None
+        if label is None:
+            capture_response = self._capture_scene_once(
+                run_id=run_id,
+                phase_label="placement_label",
+            )
+            label = self._match_box_label_once(
+                run_id=run_id,
+                item_id=item_id,
+                capture_response=capture_response,
+                base_to_camera=base_to_camera,
+            )
+        plan_msg = self._build_place_plan_message(
+            item_id=item_id,
+            label_confidence=float(label["confidence"]),
+            slot_index=int(label["slot_index"]),
+            box_center_base_m=tuple(float(value) for value in label["box_center_base_m"]),
+        )
+
+        validation_request = ExecutePlacePlan.Request()
+        validation_request.run_id = run_id
+        validation_request.execute = False
+        validation_request.move_home_after = bool(move_home_after)
+        validation_request.plan = plan_msg
+        validation_response = self._call_client(
+            self._execute_place_client,
+            validation_request,
+            timeout_s=45.0,
+        )
+        if not validation_response.success:
+            raise RuntimeError(f"place plan validation failed: {validation_response.message}")
+        validation = json.loads(validation_response.execution_json)
+
+        self._publish_status(f"placing_object: run_id={run_id} item={item_id}")
+        execute_request = ExecutePlacePlan.Request()
+        execute_request.run_id = run_id
+        execute_request.execute = True
+        execute_request.move_home_after = bool(move_home_after)
+        execute_request.plan = plan_msg
+        execute_response = self._call_client(
+            self._execute_place_client,
+            execute_request,
+            timeout_s=180.0,
+        )
+        if not execute_response.success:
+            raise RuntimeError(f"place execution failed: {execute_response.message}")
+        placement_payload = {
+            "item_id": item_id,
+            "slot_index": int(label["slot_index"]),
+            "placement_observe_actual_pose": self._pose_debug_dict(
+                self._pose6d_msg_to_dataclass(observe_response.actual_pose)
+            ),
+            "capture": (
+                self._capture_debug_dict(capture_response)
+                if capture_response is not None
+                else None
+            ),
+            "label_match": label,
+            "validation": validation,
+            "execution": json.loads(execute_response.execution_json),
+        }
+        if post_grasp_movement is not None:
+            placement_payload["post_grasp_base_advance"] = post_grasp_movement
+        placement_payload["post_place_base_advance"] = (
+            self._advance_base_after_place(run_id=run_id, item_id=item_id)
+        )
+        return placement_payload
+
+    def _post_grasp_base_advance(self, *, run_id: str, target_item_id: str) -> dict[str, object]:
+        distance_m = float(self.get_parameter("post_grasp_base_advance_m").value)
+        speed_mps = float(
+            self.get_parameter("post_grasp_base_advance_speed_mps").value
+        )
+        timeout_s = float(
+            self.get_parameter("post_grasp_base_advance_timeout_s").value
+        )
+        if distance_m <= 0.01:
+            raise RuntimeError("post_grasp_base_advance_m must be greater than 0.01")
+        self._publish_status(
+            f"advancing_base_after_grasp: run_id={run_id} distance={distance_m:.3f}m"
+        )
+        movement = self._move_base_for_scan(
+            distance_m,
+            timeout_s=timeout_s,
+            speed_mps=speed_mps,
+        )
+        return {
+            **movement,
+            "phase": "during_placement_observation_after_grasp_retreat",
+            "target_item_id": target_item_id,
+        }
+
+    def _advance_base_after_place(self, *, run_id: str, item_id: str) -> dict[str, object]:
+        distance_m = float(self.get_parameter("post_place_base_advance_m").value)
+        speed_mps = float(
+            self.get_parameter("post_place_base_advance_speed_mps").value
+        )
+        timeout_s = float(
+            self.get_parameter("post_place_base_advance_timeout_s").value
+        )
+        if distance_m <= 0.01:
+            raise RuntimeError("post_place_base_advance_m must be greater than 0.01")
+        self._publish_status(
+            f"advancing_base_after_place: run_id={run_id} distance={distance_m:.3f}m"
+        )
+        movement = self._move_base_for_scan(
+            distance_m,
+            timeout_s=timeout_s,
+            speed_mps=speed_mps,
+        )
+        return {
+            **movement,
+            "phase": "after_place_release_and_retreat",
+            "target_item_id": item_id,
+        }
+
+    def _return_home_and_advance_base_after_place(
+        self,
+        *,
+        run_id: str,
+        item_id: str,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Fold the arm and advance Scout concurrently after a safe retreat."""
+        home_values = [
+            float(value)
+            for value in list(self.get_parameter("post_place_home_pose").value or [])
+        ]
+        if len(home_values) != 6:
+            raise RuntimeError("post_place_home_pose must contain 6 mm/deg values")
+
+        base_result: dict[str, object] | None = None
+        base_errors: list[BaseException] = []
+
+        def base_worker() -> None:
+            nonlocal base_result
+            try:
+                base_result = self._advance_base_after_place(
+                    run_id=run_id,
+                    item_id=item_id,
+                )
+            except BaseException as exc:
+                base_errors.append(exc)
+
+        self._publish_status(
+            f"returning_home_and_advancing_base_after_place: run_id={run_id}"
+        )
+        base_thread = threading.Thread(
+            target=base_worker,
+            daemon=True,
+            name=f"post-place-base-advance-{run_id}",
+        )
+        base_thread.start()
+        try:
+            home_response = self._execute_named_pose(
+                name="home_after_place",
+                position_m=(
+                    home_values[0] / 1000.0,
+                    home_values[1] / 1000.0,
+                    home_values[2] / 1000.0,
+                ),
+                rpy_deg=(home_values[3], home_values[4], home_values[5]),
+                speed_percent=float(self.get_parameter("speed").value),
+                open_gripper_first=False,
+                timeout_s=60.0,
+            )
+        except BaseException:
+            if base_thread.is_alive():
+                self._request_base_scan_stop()
+            base_thread.join()
+            raise
+        base_thread.join()
+        if base_errors:
+            raise RuntimeError(str(base_errors[0])) from base_errors[0]
+        if base_result is None:
+            raise RuntimeError("post-place base advance returned no result")
+        home_result = {
+            "success": True,
+            "requested_pose_mm_deg": {
+                "x_mm": home_values[0],
+                "y_mm": home_values[1],
+                "z_mm": home_values[2],
+                "roll_deg": home_values[3],
+                "pitch_deg": home_values[4],
+                "yaw_deg": home_values[5],
+            },
+            "actual_pose_mm_deg": self._pose_debug_dict(
+                self._pose6d_msg_to_dataclass(home_response.actual_pose)
+            ),
+        }
+        return home_result, base_result
+
+    def _move_to_placement_observation(
+        self,
+        *,
+        run_id: str,
+        observe: tuple[float, float, float, float, float, float],
+        advance_base: bool,
+        timeout_s: float,
+        target_item_id: str = "",
+    ):
+        base_result: dict[str, object] | None = None
+        base_error: list[BaseException] = []
+
+        def advance_base_worker() -> None:
+            nonlocal base_result
+            try:
+                base_result = self._post_grasp_base_advance(
+                    run_id=run_id,
+                    target_item_id=target_item_id,
+                )
+            except BaseException as exc:  # Preserve the worker failure for the caller.
+                base_error.append(exc)
+
+        base_thread = None
+        if advance_base:
+            base_thread = threading.Thread(
+                target=advance_base_worker,
+                daemon=True,
+                name=f"post-grasp-base-advance-{run_id}",
+            )
+            base_thread.start()
+
+        self._publish_status(f"moving_to_placement_observation: run_id={run_id}")
+        try:
+            observe_response = self._execute_named_pose(
+                name="placement_observation",
+                position_m=(observe[0] / 1000.0, observe[1] / 1000.0, observe[2] / 1000.0),
+                rpy_deg=(observe[3], observe[4], observe[5]),
+                speed_percent=float(self.get_parameter("observation_speed").value),
+                open_gripper_first=False,
+                timeout_s=timeout_s,
+            )
+        except BaseException:
+            if base_thread is not None and base_thread.is_alive():
+                self._request_base_scan_stop()
+                base_thread.join()
+            raise
+        if base_thread is not None:
+            base_thread.join()
+        if base_error:
+            raise RuntimeError(str(base_error[0])) from base_error[0]
+        return observe_response, base_result
+
+    def _execute_grasp_and_optional_place(
+        self,
+        *,
+        run_id: str,
+        plan,
+        move_home_after: bool,
+        target_item_id: str,
+        hand_eye: np.ndarray,
+        advance_base_after_grasp: bool = False,
+    ) -> dict[str, object]:
+        place_enabled = bool(self.get_parameter("place_after_grasp").value)
+        execute_req = ExecuteGraspPlan.Request()
+        execute_req.run_id = run_id
+        execute_req.execute = True
+        execute_req.move_home_after = bool(move_home_after and not place_enabled)
+        execute_req.plan = grasp_plan_to_msg(plan)
+        execute_response = self._call_client(self._execute_plan_client, execute_req, timeout_s=180.0)
+        if not execute_response.success:
+            raise RuntimeError(execute_response.message)
+        grasp_payload = json.loads(execute_response.execution_json)
+        if not place_enabled:
+            move_to_observation = bool(
+                self.get_parameter(
+                    "move_to_placement_observation_after_grasp"
+                ).value
+            )
+            if move_to_observation and not bool(move_home_after):
+                observe = self._placement_observe_pose_values()
+                observe_response, movement = self._move_to_placement_observation(
+                    run_id=run_id,
+                    observe=observe,
+                    advance_base=advance_base_after_grasp,
+                    timeout_s=45.0,
+                    target_item_id=target_item_id,
+                )
+                if movement is not None:
+                    grasp_payload["post_grasp_base_advance"] = movement
+                grasp_payload["placement_observation_after_grasp"] = {
+                    "requested_pose_mm_deg": {
+                        "x_mm": observe[0],
+                        "y_mm": observe[1],
+                        "z_mm": observe[2],
+                        "roll_deg": observe[3],
+                        "pitch_deg": observe[4],
+                        "yaw_deg": observe[5],
+                    },
+                    "actual_pose_mm_deg": self._pose_debug_dict(
+                        self._pose6d_msg_to_dataclass(
+                            observe_response.actual_pose
+                        )
+                    ),
+                    "gripper_opened": False,
+                }
+            elif advance_base_after_grasp:
+                grasp_payload["post_grasp_base_advance"] = (
+                    self._post_grasp_base_advance(
+                        run_id=run_id,
+                        target_item_id=target_item_id,
+                    )
+                )
+            return grasp_payload
+        if not target_item_id:
+            raise RuntimeError("place_after_grasp requires a resolved target_item_id")
+        placement_payload = self._run_placement_stage(
+            run_id=run_id,
+            item_id=target_item_id,
+            move_home_after=move_home_after,
+            hand_eye=hand_eye,
+            advance_base_during_observation=advance_base_after_grasp,
+        )
+        return {
+            "status": "ok",
+            "run_id": run_id,
+            "target_item_id": target_item_id,
+            "grasp": grasp_payload,
+            "placement": placement_payload,
+            "release_performed": True,
+            "move_home_after": bool(move_home_after),
+        }
 
     def _analyze_scene_once(
         self,
@@ -651,6 +1711,99 @@ class PipelineOrchestratorNode(Node):
                 "capture": self._capture_debug_dict(capture_response),
                 "analyze": self._analyze_debug_dict(analyze_response),
                 "base_to_camera": np.asarray(state_snapshot["base_to_camera"], dtype=np.float64).tolist(),
+            },
+        }
+
+    def _capture_detect_target_2d(
+        self,
+        *,
+        run_id: str,
+        prompt: str,
+        hand_eye: np.ndarray,
+        phase_label: str,
+    ) -> dict[str, object]:
+        """Capture one scan view and run only inexpensive 2-D target detection."""
+        self._publish_status(
+            f"reading_robot_state: run_id={run_id} phase={phase_label}"
+        )
+        state_snapshot = self._read_robot_state_snapshot(hand_eye=hand_eye)
+        capture_response = self._capture_scene_once(
+            run_id=run_id,
+            phase_label=phase_label,
+        )
+        request = DetectTarget2D.Request()
+        request.run_id = run_id
+        request.prompt = prompt
+        request.color_image = capture_response.color_image
+        response = self._call_client(
+            self._detect_target_2d_client,
+            request,
+            timeout_s=30.0,
+        )
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {
+            "state_snapshot": state_snapshot,
+            "capture_response": capture_response,
+            "detection_response": response,
+        }
+
+    def _analyze_captured_cycle(
+        self,
+        *,
+        run_id: str,
+        prompt: str,
+        options: dict[str, object],
+        phase_label: str,
+        captured: dict[str, object],
+    ) -> dict[str, object]:
+        """Run full GraspNet once on an already captured, centered scan view."""
+        state_snapshot = dict(captured["state_snapshot"])
+        capture_response = captured["capture_response"]
+        analyze_response = self._analyze_scene_once(
+            run_id=run_id,
+            phase_label=phase_label,
+            prompt=prompt,
+            options=options,
+            capture_response=capture_response,
+            tcp_pose=state_snapshot["tcp_pose"],
+            base_to_camera=state_snapshot["base_to_camera"],
+        )
+        candidate = (
+            grasp_candidate_from_msg(analyze_response.selected_candidate)
+            if analyze_response.has_selected_candidate
+            else None
+        )
+        candidate_pool = [
+            grasp_candidate_from_msg(item)
+            for item in list(analyze_response.candidate_pool)
+        ]
+        diagnostics = json.loads(analyze_response.diagnostics_json).get(
+            "diagnostics", []
+        )
+        return {
+            "capture_response": capture_response,
+            "analyze_response": analyze_response,
+            "current_pose": state_snapshot["current_pose"],
+            "robot_state": state_snapshot["robot_state"],
+            "base_to_camera": state_snapshot["base_to_camera"],
+            "candidate": candidate,
+            "candidate_pool": candidate_pool,
+            "diagnostics": diagnostics,
+            "debug": {
+                "phase": phase_label,
+                "robot_state": {
+                    "success": bool(state_snapshot["robot_state"].success),
+                    "message": str(state_snapshot["robot_state"].message),
+                    "current_pose": self._pose_debug_dict(
+                        state_snapshot["current_pose"]
+                    ),
+                },
+                "capture": self._capture_debug_dict(capture_response),
+                "analyze": self._analyze_debug_dict(analyze_response),
+                "base_to_camera": np.asarray(
+                    state_snapshot["base_to_camera"], dtype=np.float64
+                ).tolist(),
             },
         }
 
@@ -936,10 +2089,10 @@ class PipelineOrchestratorNode(Node):
             return
         self._auto_start_armed = False
         prompt = str(self.get_parameter("prompt").value or "").strip()
-        if not prompt:
+        if not prompt and not self._auto_target_from_card_enabled():
             self._publish_status("auto_start skipped: empty prompt")
             return
-        accepted, message = self._start_background_run(prompt_override=prompt)
+        accepted, message = self._start_background_run(prompt_override=prompt or None)
         if not accepted:
             self._publish_status(f"auto_start rejected: {message}")
 
@@ -961,9 +2114,13 @@ class PipelineOrchestratorNode(Node):
             for client in (
                 self._capture_client,
                 self._analyze_client,
+                self._detect_target_2d_client,
+                self._match_label_client,
+                self._executor_set_parameters_client,
                 self._get_state_client,
                 self._named_pose_client,
                 self._execute_plan_client,
+                self._execute_place_client,
                 self._stop_robot_client,
             ):
                 self._wait_for_client(client, timeout_s=2.0)
@@ -977,7 +2134,1701 @@ class PipelineOrchestratorNode(Node):
             response.message = str(exc)
         return response
 
+    @staticmethod
+    def _depth_preview(depth_meters: np.ndarray) -> np.ndarray:
+        depth = np.asarray(depth_meters, dtype=np.float32)
+        valid = np.isfinite(depth) & (depth > 0.10) & (depth < 3.0)
+        preview = np.zeros(depth.shape, dtype=np.uint8)
+        if np.count_nonzero(valid) > 20:
+            low, high = np.percentile(depth[valid], [2.0, 98.0])
+            if float(high) > float(low):
+                scaled = np.clip((depth - low) / (high - low), 0.0, 1.0)
+                preview[valid] = np.asarray(scaled[valid] * 255.0, dtype=np.uint8)
+        colored = cv2.applyColorMap(preview, cv2.COLORMAP_TURBO)
+        colored[~valid] = 0
+        return colored
+
+    def _move_base_for_scan(
+        self,
+        distance_m: float,
+        *,
+        timeout_s: float | None = None,
+        speed_mps: float | None = None,
+    ) -> dict[str, object]:
+        request = MoveBaseRelative.Request()
+        request.distance_m = float(distance_m)
+        request.speed_mps = float(
+            speed_mps
+            if speed_mps is not None
+            else self.get_parameter("base_multiview_speed_mps").value
+        )
+        request.timeout_s = float(
+            timeout_s
+            if timeout_s is not None
+            else self.get_parameter("base_multiview_move_timeout_s").value
+        )
+        response = self._call_client(
+            self._move_base_client,
+            request,
+            timeout_s=float(request.timeout_s) + 5.0,
+        )
+        payload = {
+            "success": bool(response.success),
+            "message": str(response.message),
+            "requested_distance_m": float(distance_m),
+            "traveled_m": float(response.traveled_m),
+            "lateral_error_m": float(response.lateral_error_m),
+            "yaw_error_deg": float(response.yaw_error_deg),
+        }
+        if not response.success:
+            raise RuntimeError(f"Scout scan move failed: {response.message}")
+        return payload
+
+    def _request_base_scan_stop(self) -> None:
+        try:
+            self._call_client(
+                self._stop_base_client,
+                Trigger.Request(),
+                timeout_s=3.0,
+            )
+        except Exception:
+            return
+
+    @staticmethod
+    def _grasp_scan_target_center_norm(
+        cycle: dict[str, object],
+    ) -> tuple[float, float] | None:
+        """Return the segmented target center in normalized image coordinates.
+
+        A catalog-target scan must use an actual segmented object center.  The
+        grasp translation is deliberately not accepted as a substitute: scene
+        fallback grasps do not prove that the requested object was detected.
+        """
+        candidate = cycle.get("candidate")
+        if candidate is None:
+            pool = list(cycle.get("candidate_pool") or [])
+            candidate = pool[0] if pool else None
+        center = getattr(candidate, "object_center_camera_m", None)
+        if center is None or len(center) != 3:
+            return None
+        x_m, y_m, z_m = (float(value) for value in center)
+        if not math.isfinite(z_m) or z_m <= 1e-6:
+            return None
+
+        capture = cycle.get("capture_response")
+        camera_info = getattr(capture, "camera_info", None)
+        width = float(getattr(camera_info, "width", 0.0) or 0.0)
+        height = float(getattr(camera_info, "height", 0.0) or 0.0)
+        raw_k = getattr(camera_info, "k", None)
+        k = list(raw_k) if raw_k is not None else []
+        if width <= 1.0 or height <= 1.0 or len(k) != 9:
+            return None
+        fx = float(k[0])
+        cx = float(k[2])
+        fy = float(k[4])
+        cy = float(k[5])
+        if (
+            not math.isfinite(fx)
+            or not math.isfinite(fy)
+            or abs(fx) <= 1e-9
+            or abs(fy) <= 1e-9
+        ):
+            return None
+        center_u = (x_m * fx / z_m) + cx
+        center_v = (y_m * fy / z_m) + cy
+        return (center_u / width, center_v / height)
+
+    def _run_base_grasp_target_scan(
+        self,
+        *,
+        run_id: str,
+        prompt: str,
+        target_item_id: str,
+        options: dict[str, object],
+        hand_eye: np.ndarray,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Scan forward until the requested item has a valid grasp candidate.
+
+        The Scout deliberately remains at the successful view: that is the
+        base pose in which the following grasp plan is expressed.
+        """
+        if not target_item_id:
+            raise RuntimeError(
+                "base grasp scan requires one selected catalog target item"
+            )
+        self._base_odom_snapshot()
+        step_m = abs(float(self.get_parameter("base_multiview_offset_m").value))
+        max_travel_m = abs(
+            float(self.get_parameter("base_multiview_max_travel_m").value)
+        )
+        max_views = max(
+            1, int(self.get_parameter("base_multiview_max_views").value)
+        )
+        target_item = self._item_catalog().resolve(target_item_id)
+        if target_item is None:
+            raise RuntimeError(f"unknown grasp scan target: {target_item_id}")
+        reference_parameter = (
+            "base_grasp_bottle_center_norm"
+            if str(target_item.kind) == "bottle"
+            else "base_grasp_block_center_norm"
+        )
+        center_reference = [
+            float(value)
+            for value in list(self.get_parameter(reference_parameter).value or [])
+        ]
+        if len(center_reference) != 2:
+            raise RuntimeError(f"{reference_parameter} must contain [u_norm, v_norm]")
+        center_tolerance_u = max(
+            0.02,
+            min(
+                0.30,
+                float(
+                    self.get_parameter(
+                        "base_grasp_center_tolerance_u_norm"
+                    ).value
+                ),
+            ),
+        )
+        center_tolerance_v = max(
+            0.02,
+            min(
+                0.30,
+                float(
+                    self.get_parameter(
+                        "base_grasp_center_tolerance_v_norm"
+                    ).value
+                ),
+            ),
+        )
+        fine_step_m = abs(
+            float(self.get_parameter("base_target_fine_step_m").value)
+        )
+        if step_m <= 0.01:
+            raise RuntimeError("base_multiview_offset_m must be greater than 0.01")
+        if fine_step_m <= 0.01:
+            raise RuntimeError("base_target_fine_step_m must be greater than 0.01")
+
+        scan_id = f"grasp-single-pass-{int(time.time() * 1000)}"
+        views: list[dict[str, object]] = []
+        movements: list[dict[str, object]] = []
+        current_offset = 0.0
+        selected_cycle: dict[str, object] | None = None
+        last_cycle: dict[str, object] | None = None
+        last_captured: dict[str, object] | None = None
+        last_phase_label = "grasp_scan_start"
+        self._publish_status(
+            f"scanning_grasp_target: run_id={run_id} item={target_item_id}"
+        )
+        try:
+            while len(views) < max_views:
+                view_name = "start" if not views else f"forward_{len(views):02d}"
+                phase_label = f"grasp_scan_{view_name}"
+                captured = self._capture_detect_target_2d(
+                    run_id=run_id,
+                    prompt=prompt,
+                    hand_eye=hand_eye,
+                    phase_label=phase_label,
+                )
+                last_captured = captured
+                last_phase_label = phase_label
+                detection = captured["detection_response"]
+                center_norm = (
+                    (
+                        float(detection.center_u_norm),
+                        float(detection.center_v_norm),
+                    )
+                    if bool(detection.found)
+                    else None
+                )
+                center_error_u = (
+                    abs(center_norm[0] - center_reference[0])
+                    if center_norm is not None
+                    else None
+                )
+                center_error_v = (
+                    abs(center_norm[1] - center_reference[1])
+                    if center_norm is not None
+                    else None
+                )
+                detection_centered = bool(
+                    bool(detection.found)
+                    and center_error_u is not None
+                    and center_error_v is not None
+                    and math.isfinite(center_error_u)
+                    and math.isfinite(center_error_v)
+                    and center_error_u <= center_tolerance_u
+                    and center_error_v <= center_tolerance_v
+                )
+                cycle = None
+                candidates: list[object] = []
+                target_centered = False
+                if detection_centered:
+                    cycle = self._analyze_captured_cycle(
+                        run_id=run_id,
+                        prompt=prompt,
+                        options=options,
+                        phase_label=phase_label,
+                        captured=captured,
+                    )
+                    last_cycle = cycle
+                    candidates = list(cycle.get("candidate_pool") or [])
+                    if not candidates and cycle.get("candidate") is not None:
+                        candidates = [cycle["candidate"]]
+                    # A scene-level GraspNet fallback is not evidence that the
+                    # requested item is graspable.  Keep only candidates tied
+                    # to the detected instance; otherwise a centered label can
+                    # accidentally authorize a grasp on a neighbouring object.
+                    candidates = [
+                        candidate
+                        for candidate in candidates
+                        if getattr(candidate, "object_center_camera_m", None)
+                        is not None
+                    ]
+                    if candidates:
+                        cycle = dict(cycle)
+                        cycle["candidate_pool"] = candidates
+                        if getattr(
+                            cycle.get("candidate"),
+                            "object_center_camera_m",
+                            None,
+                        ) is None:
+                            cycle["candidate"] = candidates[0]
+                        last_cycle = cycle
+                    target_centered = bool(candidates)
+                views.append(
+                    {
+                        "view_name": view_name,
+                        "offset_from_start_m": float(current_offset),
+                        "scene_id": str(captured["capture_response"].scene_id),
+                        "capture": self._capture_debug_dict(
+                            captured["capture_response"]
+                        ),
+                        "target_detection_2d": {
+                            "found": bool(detection.found),
+                            "center_norm": list(center_norm) if center_norm else None,
+                            "confidence": float(detection.confidence),
+                            "backend": str(detection.backend),
+                            "centered_for_full_analysis": detection_centered,
+                        },
+                        "vision": (
+                            self._analyze_debug_dict(cycle["analyze_response"])
+                            if cycle is not None
+                            else None
+                        ),
+                        "candidate_count": len(candidates),
+                        "target_center_norm": list(center_norm) if center_norm else None,
+                        "target_center_reference_norm": list(center_reference),
+                        "target_center_error_u_norm": center_error_u,
+                        "target_center_error_v_norm": center_error_v,
+                        "target_centered": target_centered,
+                    }
+                )
+                if target_centered:
+                    selected_cycle = cycle
+                    break
+
+                remaining = max_travel_m - current_offset
+                if remaining <= 0.01:
+                    break
+                target_seen = bool(
+                    bool(detection.found)
+                    and center_norm is not None
+                )
+                next_step_m = fine_step_m if target_seen else step_m
+                movement = self._move_base_for_scan(min(next_step_m, remaining))
+                current_offset += float(movement["traveled_m"])
+                movement["offset_after_move_m"] = float(current_offset)
+                movements.append(movement)
+                time.sleep(
+                    max(
+                        0.0,
+                        float(
+                            self.get_parameter("base_multiview_settle_s").value
+                        ),
+                    )
+                )
+        finally:
+            self._request_base_scan_stop()
+
+        scan_payload = {
+            "scan_id": scan_id,
+            "scan_mode": "base_single_pass_grasp",
+            "target_item_id": target_item_id,
+            "success": selected_cycle is not None,
+            "center_reference_norm": list(center_reference),
+            "center_tolerance_u_norm": center_tolerance_u,
+            "center_tolerance_v_norm": center_tolerance_v,
+            "final_offset_from_start_m": float(current_offset),
+            "views": views,
+            "movements": movements,
+            "base_returned_to_start": False,
+            "motion_command_sent": bool(movements),
+            "gripper_command_sent": False,
+        }
+        if selected_cycle is not None:
+            return selected_cycle, scan_payload
+        if last_cycle is None and last_captured is not None:
+            # Preserve the old failure diagnostics while avoiding GraspNet on
+            # every search frame: analyze only the final view if no centered
+            # target ever triggered a full analysis.
+            last_cycle = self._analyze_captured_cycle(
+                run_id=run_id,
+                prompt=prompt,
+                options=options,
+                phase_label=last_phase_label,
+                captured=last_captured,
+            )
+        if last_cycle is None:
+            raise RuntimeError("grasp scan ended before capturing a camera view")
+        return last_cycle, scan_payload
+
+    @staticmethod
+    def _label_overlay(
+        color_bgr: np.ndarray,
+        label: dict[str, object],
+    ) -> np.ndarray:
+        overlay = np.asarray(color_bgr).copy()
+        detections = list(
+            dict(label.get("diagnostics") or {}).get("detections") or []
+        )
+        for detection in detections:
+            bbox = list(dict(detection).get("bbox_xywh") or [])
+            if len(bbox) != 4:
+                continue
+            x, y, width, height = (int(value) for value in bbox)
+            cv2.rectangle(
+                overlay,
+                (x, y),
+                (x + width, y + height),
+                (0, 255, 0),
+                2,
+            )
+            method = str(dict(detection).get("method") or "")
+            cv2.putText(
+                overlay,
+                f"{dict(detection).get('item_id') or ''} [{method}]",
+                (x, max(18, y - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 80, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        return overlay
+
+    def _capture_placement_scan_view(
+        self,
+        *,
+        scan_id: str,
+        view_name: str,
+        offset_from_start_m: float,
+        item_id: str,
+        base_to_camera: np.ndarray,
+        output_dir: Path,
+    ) -> dict[str, object]:
+        capture = self._capture_scene_once(
+            run_id=f"{scan_id}-{view_name}",
+            phase_label=f"placement_scan_{view_name}",
+        )
+        label = self._match_box_label_once(
+            run_id=f"{scan_id}-{view_name}",
+            item_id=item_id,
+            capture_response=capture,
+            base_to_camera=base_to_camera,
+            require_complete=False,
+        )
+        color = color_msg_to_bgr(capture.color_image)
+        depth = depth_msg_to_meters(capture.depth_image)
+        image_names = {
+            "color": f"{view_name}_color.png",
+            "overlay": f"{view_name}_overlay.png",
+            "depth": f"{view_name}_depth.png",
+        }
+        for name, image in (
+            ("color", color),
+            ("overlay", self._label_overlay(color, label)),
+            ("depth", self._depth_preview(depth)),
+        ):
+            path = output_dir / image_names[name]
+            if not cv2.imwrite(str(path), image):
+                raise RuntimeError(f"failed to write placement scan image: {path}")
+        return {
+            "view_name": view_name,
+            "offset_from_start_m": float(offset_from_start_m),
+            "capture": self._capture_debug_dict(capture),
+            "label_match": label,
+            "images": image_names,
+        }
+
+    def _fuse_single_pass_label_map(
+        self,
+        *,
+        views: list[dict[str, object]],
+        item_id: str,
+    ) -> dict[str, object]:
+        """Fuse overlapping 2-D label orders without using transparent-box depth."""
+        expected_ids = set(self._item_catalog().items)
+        observations: dict[str, list[dict[str, object]]] = {
+            key: [] for key in expected_ids
+        }
+        precedence: dict[str, set[str]] = {key: set() for key in expected_ids}
+        directional_weights: dict[tuple[str, str], float] = {}
+        view_orders: list[dict[str, object]] = []
+        rejected_observations: list[dict[str, object]] = []
+
+        for view in views:
+            diagnostics = dict(
+                dict(view.get("label_match") or {}).get("diagnostics") or {}
+            )
+            best_by_item: dict[str, dict[str, object]] = {}
+            for raw in list(diagnostics.get("detections") or []):
+                detection = dict(raw)
+                detected_id = str(detection.get("item_id") or "")
+                bbox = list(detection.get("bbox_xywh") or [])
+                if detected_id not in expected_ids or len(bbox) != 4:
+                    continue
+                method = str(detection.get("method") or "")
+                capture = dict(view.get("capture") or {})
+                image_width = int(capture.get("color_width") or 0)
+                x, _y, width, _height = (float(value) for value in bbox)
+                rejection_reason = ""
+                if "partial" in method:
+                    rejection_reason = "partial label detection"
+                elif x <= 2.0 or (
+                    image_width > 0 and x + width >= image_width - 2.0
+                ):
+                    rejection_reason = "label detection touches image boundary"
+                if rejection_reason:
+                    rejected_observations.append(
+                        {
+                            **detection,
+                            "view_name": str(view["view_name"]),
+                            "reason": rejection_reason,
+                        }
+                    )
+                    continue
+                previous = best_by_item.get(detected_id)
+                if previous is None or float(
+                    detection.get("confidence") or 0.0
+                ) > float(previous.get("confidence") or 0.0):
+                    best_by_item[detected_id] = detection
+
+            ordered = sorted(
+                best_by_item.items(),
+                key=lambda value: float(value[1]["bbox_xywh"][0])
+                + 0.5 * float(value[1]["bbox_xywh"][2]),
+            )
+            ordered_ids = [value[0] for value in ordered]
+            view_orders.append(
+                {
+                    "view_name": str(view["view_name"]),
+                    "offset_from_start_m": float(view["offset_from_start_m"]),
+                    "detected_item_ids_left_to_right": ordered_ids,
+                }
+            )
+            for detected_id, detection in ordered:
+                bbox = [float(value) for value in detection["bbox_xywh"]]
+                observations[detected_id].append(
+                    {
+                        "view_name": str(view["view_name"]),
+                        "offset_from_start_m": float(view["offset_from_start_m"]),
+                        "confidence": float(detection.get("confidence") or 0.0),
+                        "bbox_xywh": bbox,
+                        "bbox_center_x_px": bbox[0] + 0.5 * bbox[2],
+                        "method": str(detection.get("method") or ""),
+                    }
+                )
+            for left_index, (left_id, left_detection) in enumerate(ordered):
+                for right_id, right_detection in ordered[left_index + 1 :]:
+                    # A pairwise relation is only as reliable as its weaker
+                    # detection. Accumulate repeated overlapping observations
+                    # instead of allowing one weak false positive to create a
+                    # hard graph cycle.
+                    weight = min(
+                        float(left_detection.get("confidence") or 0.0),
+                        float(right_detection.get("confidence") or 0.0),
+                    )
+                    key = (left_id, right_id)
+                    directional_weights[key] = (
+                        directional_weights.get(key, 0.0) + weight
+                    )
+
+        missing = sorted(
+            detected_id
+            for detected_id, item_observations in observations.items()
+            if not item_observations
+        )
+        if missing:
+            raise RuntimeError(
+                "single-pass scan still missing labels: " + ", ".join(missing)
+            )
+
+        pairwise_evidence: list[dict[str, object]] = []
+        sorted_ids = sorted(expected_ids)
+        for left_index, first_id in enumerate(sorted_ids):
+            for second_id in sorted_ids[left_index + 1 :]:
+                first_before = directional_weights.get(
+                    (first_id, second_id), 0.0
+                )
+                second_before = directional_weights.get(
+                    (second_id, first_id), 0.0
+                )
+                total = first_before + second_before
+                margin = abs(first_before - second_before)
+                normalized_margin = margin / total if total > 1e-9 else 0.0
+                winner = ""
+                loser = ""
+                # Keep fail-closed semantics when evidence is weak or nearly
+                # tied. One clear high-confidence observation is sufficient;
+                # contradictory observations need a meaningful weighted lead.
+                if margin >= 0.15 and normalized_margin >= 0.20:
+                    if first_before > second_before:
+                        winner, loser = first_id, second_id
+                    else:
+                        winner, loser = second_id, first_id
+                    precedence[winner].add(loser)
+                pairwise_evidence.append(
+                    {
+                        "first_item_id": first_id,
+                        "second_item_id": second_id,
+                        "first_before_weight": first_before,
+                        "second_before_weight": second_before,
+                        "normalized_margin": normalized_margin,
+                        "accepted_order": (
+                            [winner, loser] if winner and loser else []
+                        ),
+                    }
+                )
+
+        remaining = set(expected_ids)
+        ordered_item_ids: list[str] = []
+        while remaining:
+            candidates = sorted(
+                node
+                for node in remaining
+                if not any(node in precedence[source] for source in remaining)
+            )
+            if len(candidates) != 1:
+                detail = ", ".join(candidates) if candidates else "cycle"
+                raise RuntimeError(
+                    "label order is ambiguous; increase scan overlap "
+                    f"(next candidates: {detail})"
+                )
+            selected = candidates[0]
+            ordered_item_ids.append(selected)
+            remaining.remove(selected)
+
+        item_to_slot = {
+            detected_id: index
+            for index, detected_id in enumerate(ordered_item_ids)
+        }
+        item_to_confidence = {
+            detected_id: max(
+                float(value.get("confidence") or 0.0)
+                for value in item_observations
+            )
+            for detected_id, item_observations in observations.items()
+        }
+        return {
+            "detected_item_ids_left_to_right": ordered_item_ids,
+            "item_to_slot_index": item_to_slot,
+            "item_to_confidence": item_to_confidence,
+            "item_observations": observations,
+            "view_orders": view_orders,
+            "pairwise_evidence": pairwise_evidence,
+            "rejected_observations": rejected_observations,
+            "target_item_id": item_id,
+            "target_slot_index": int(item_to_slot[item_id]),
+            "localization_source": "2d_weighted_label_order",
+            "transparent_depth_used": False,
+        }
+
+    def _fuse_multiview_box_map(
+        self,
+        *,
+        views: list[dict[str, object]],
+        item_id: str,
+        base_to_camera_at_start: np.ndarray,
+    ) -> dict[str, object]:
+        catalog = self._item_catalog()
+        observations_by_item: dict[str, list[dict[str, object]]] = {
+            key: [] for key in catalog.items
+        }
+        rejected_observations: list[dict[str, object]] = []
+        table_z_m = float(self.get_parameter("table_z_m").value)
+        minimum_label_z_m = table_z_m - 0.015
+        maximum_label_z_m = table_z_m + 0.35
+        for view in views:
+            offset = float(view["offset_from_start_m"])
+            diagnostics = dict(
+                dict(view.get("label_match") or {}).get("diagnostics") or {}
+            )
+            for raw in list(
+                diagnostics.get("partial_label_observations_base_m") or []
+            ):
+                observation = dict(raw)
+                detected_id = str(observation.get("item_id") or "")
+                point = list(observation.get("point_base_m") or [])
+                if detected_id not in observations_by_item or len(point) != 3:
+                    continue
+                method = str(observation.get("method") or "")
+                depth_source = str(
+                    observation.get("depth_source") or "measured"
+                )
+                if "partial" in method or depth_source != "measured":
+                    rejected_observations.append(
+                        {
+                            **observation,
+                            "view_name": str(view["view_name"]),
+                            "reason": (
+                                "partial label detection"
+                                if "partial" in method
+                                else f"non-measured depth source: {depth_source}"
+                            ),
+                        }
+                    )
+                    continue
+                # The arm base axes are fixed to the Scout chassis and the scan
+                # is straight along chassis +X/-X. Convert each current-base
+                # point into the base frame at the scan start.
+                point_at_start = [
+                    float(point[0]) + offset,
+                    float(point[1]),
+                    float(point[2]),
+                ]
+                if (
+                    not all(math.isfinite(value) for value in point_at_start)
+                    or not minimum_label_z_m
+                    <= point_at_start[2]
+                    <= maximum_label_z_m
+                ):
+                    rejected_observations.append(
+                        {
+                            **observation,
+                            "view_name": str(view["view_name"]),
+                            "point_start_base_m": point_at_start,
+                            "reason": (
+                                "projected label height outside placement row "
+                                f"[{minimum_label_z_m:.3f},"
+                                f"{maximum_label_z_m:.3f}]m"
+                            ),
+                        }
+                    )
+                    continue
+                observations_by_item[detected_id].append(
+                    {
+                        **observation,
+                        "view_name": str(view["view_name"]),
+                        "point_start_base_m": point_at_start,
+                    }
+                )
+
+        missing = [
+            key for key, observations in observations_by_item.items()
+            if not observations
+        ]
+        if missing:
+            raise RuntimeError(
+                "multi-view scan still missing labels: " + ", ".join(missing)
+            )
+
+        fused_points: list[tuple[float, float, float]] = []
+        fused_detections: list[LabelDetection] = []
+        fusion_diagnostics: dict[str, object] = {}
+        for detected_id, observations in observations_by_item.items():
+            ranked = sorted(
+                observations,
+                key=lambda value: float(value.get("confidence") or 0.0),
+                reverse=True,
+            )
+            anchor = np.asarray(
+                ranked[0]["point_start_base_m"],
+                dtype=np.float64,
+            )
+            compatible = [
+                value
+                for value in ranked
+                if float(
+                    np.linalg.norm(
+                        np.asarray(value["point_start_base_m"], dtype=np.float64)
+                        - anchor
+                    )
+                )
+                <= 0.09
+            ]
+            weights = np.asarray(
+                [
+                    max(0.05, float(value.get("confidence") or 0.0))
+                    for value in compatible
+                ],
+                dtype=np.float64,
+            )
+            points = np.asarray(
+                [value["point_start_base_m"] for value in compatible],
+                dtype=np.float64,
+            )
+            fused = np.average(points, axis=0, weights=weights)
+            confidence = float(max(weights))
+            fused_points.append(tuple(float(value) for value in fused))
+            fused_detections.append(
+                LabelDetection(
+                    item_id=detected_id,
+                    confidence=confidence,
+                    bbox_xywh=(0, 0, 1, 1),
+                    method="multi_view_fusion",
+                )
+            )
+            fusion_diagnostics[detected_id] = {
+                "observation_count": len(observations),
+                "compatible_count": len(compatible),
+                "observations": observations,
+                "fused_point_start_base_m": list(fused),
+            }
+
+        transform = np.asarray(
+            base_to_camera_at_start,
+            dtype=np.float64,
+        ).reshape(4, 4)
+        image_right_xy = tuple(float(value) for value in transform[:2, 0])
+        matcher = ReferenceLabelMatcher(catalog)
+        localization = matcher.localize_box_row_from_points(
+            detections=tuple(fused_detections),
+            label_centers_base_m=tuple(fused_points),
+            target_item_id=item_id,
+            table_z_m=table_z_m,
+            camera_xy_base=tuple(float(value) for value in transform[:2, 3]),
+            image_right_direction_base_xy=image_right_xy,
+        )
+
+        row_direction = np.asarray(image_right_xy, dtype=np.float64)
+        row_direction /= max(1e-9, float(np.linalg.norm(row_direction)))
+        order = np.argsort(
+            np.asarray(fused_points, dtype=np.float64)[:, :2] @ row_direction
+        )
+        ordered_item_ids = [
+            fused_detections[int(index)].item_id for index in order
+        ]
+        item_to_slot = {
+            detected_id: index
+            for index, detected_id in enumerate(ordered_item_ids)
+        }
+        item_to_center = {
+            detected_id: list(localization.box_centers_base_m[index])
+            for index, detected_id in enumerate(ordered_item_ids)
+        }
+        item_to_confidence = {
+            detection.item_id: float(detection.confidence)
+            for detection in fused_detections
+        }
+        return {
+            "detected_item_ids_left_to_right": ordered_item_ids,
+            "item_to_slot_index": item_to_slot,
+            "item_to_box_center_base_m": item_to_center,
+            "item_to_confidence": item_to_confidence,
+            "box_centers_base_m": [
+                list(value) for value in localization.box_centers_base_m
+            ],
+            "label_centers_base_m": [
+                list(value) for value in localization.label_centers_base_m
+            ],
+            "adjacent_pitch_mm": list(localization.adjacent_pitch_mm),
+            "raw_adjacent_pitch_mm": list(
+                localization.raw_adjacent_pitch_mm
+            ),
+            "row_fit_residual_mm": list(localization.fit_residual_mm),
+            "interior_direction_base": list(
+                localization.interior_direction_base
+            ),
+            "fusion_diagnostics": fusion_diagnostics,
+            "rejected_observations": rejected_observations,
+        }
+
+    def _handle_scan_placement_service(self, _request, response):
+        with self._run_lock:
+            if self._scan_active:
+                response.success = False
+                response.message = "placement scan is already running"
+                return response
+            if self._run_thread is not None and self._run_thread.is_alive():
+                response.success = False
+                response.message = "cannot scan placement area while pipeline is running"
+                return response
+            if self._pending_confirmation is not None:
+                response.success = False
+                response.message = "cannot scan while grasp confirmation is pending"
+                return response
+            self._scan_active = True
+
+        scan_id = f"placement-scan-{int(time.time() * 1000)}"
+        try:
+            self._publish_status(f"scanning_placement_area: scan_id={scan_id}")
+            _, _, hand_eye, _ = self._build_runtime()
+            state = self._read_robot_state_snapshot(hand_eye=hand_eye)
+            capture = self._capture_scene_once(run_id=scan_id, phase_label="placement_scan")
+            requested = str(self.get_parameter("target_item_id").value or "").strip()
+            item = self._item_catalog().resolve(requested)
+            if item is None:
+                item = self._item_catalog().items["yellow_block"]
+            label = self._match_box_label_once(
+                run_id=scan_id,
+                item_id=item.item_id,
+                capture_response=capture,
+                base_to_camera=state["base_to_camera"],
+                require_complete=False,
+            )
+
+            output_dir = self._placement_scan_viz_dir()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            color = color_msg_to_bgr(capture.color_image)
+            overlay = color.copy()
+            detections = list(label.get("diagnostics", {}).get("detections") or [])
+            for detection in detections:
+                bbox = list(detection.get("bbox_xywh") or [])
+                if len(bbox) != 4:
+                    continue
+                x, y, width, height = (int(value) for value in bbox)
+                cv2.rectangle(overlay, (x, y), (x + width, y + height), (0, 255, 0), 2)
+                cv2.putText(
+                    overlay,
+                    str(detection.get("item_id") or ""),
+                    (x, max(18, y - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 80, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            depth = depth_msg_to_meters(capture.depth_image)
+            color_path = output_dir / "color.png"
+            overlay_path = output_dir / "overlay.png"
+            depth_path = output_dir / "depth.png"
+            if not cv2.imwrite(str(color_path), color):
+                raise RuntimeError(f"failed to write placement scan image: {color_path}")
+            if not cv2.imwrite(str(overlay_path), overlay):
+                raise RuntimeError(f"failed to write placement scan overlay: {overlay_path}")
+            if not cv2.imwrite(str(depth_path), self._depth_preview(depth)):
+                raise RuntimeError(f"failed to write placement depth preview: {depth_path}")
+
+            payload = {
+                "success": bool(label.get("complete")),
+                "validation_message": str(label.get("message") or ""),
+                "scan_id": scan_id,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "robot_pose_mm_deg": self._pose_debug_dict(state["current_pose"]),
+                "capture": self._capture_debug_dict(capture),
+                "label_match": label,
+                "images": {
+                    "color": "color.png",
+                    "overlay": "overlay.png",
+                    "depth": "depth.png",
+                },
+                "motion_command_sent": False,
+                "gripper_command_sent": False,
+            }
+            self._write_json_file(output_dir / "latest.json", payload)
+            self._result_pub.publish(String(data=json_dumps(payload)))
+            response.success = True
+            response.message = (
+                (
+                    f"placement scan ok: scan_id={scan_id} "
+                    f"labels={label['detected_label_count']} slot={label['slot_index']}"
+                )
+                if bool(label.get("complete"))
+                else (
+                    f"placement scan captured but validation failed: scan_id={scan_id} "
+                    f"labels={label['detected_label_count']}/6; {label['message']}"
+                )
+            )
+            self._publish_status(
+                f"idle: placement scan captured scan_id={scan_id} "
+                f"complete={bool(label.get('complete'))}"
+            )
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            self._publish_status(f"placement scan failed: {exc}")
+        finally:
+            with self._run_lock:
+                self._scan_active = False
+        return response
+
+    def _handle_scan_placement_multi_view_service(self, _request, response):
+        if not bool(self.get_parameter("base_multiview_enabled").value):
+            response.success = False
+            response.message = (
+                "base single-pass scan is disabled; clear the forward scan lane "
+                "and enable base_multiview_enabled"
+            )
+            return response
+        with self._run_lock:
+            if self._scan_active:
+                response.success = False
+                response.message = "placement scan is already running"
+                return response
+            if self._run_thread is not None and self._run_thread.is_alive():
+                response.success = False
+                response.message = "cannot scan placement area while pipeline is running"
+                return response
+            if self._pending_confirmation is not None:
+                response.success = False
+                response.message = "cannot scan while grasp confirmation is pending"
+                return response
+            self._scan_active = True
+            self._stop_requested = False
+
+        scan_id = f"placement-multiview-{int(time.time() * 1000)}"
+        output_dir = self._placement_scan_viz_dir()
+        views: list[dict[str, object]] = []
+        movements: list[dict[str, object]] = []
+        current_offset = 0.0
+        start_odom: tuple[float, float, float] | None = None
+        base_returned = False
+        try:
+            self._publish_status(f"scanning_placement_multiview: scan_id={scan_id}")
+            start_odom = self._base_odom_snapshot()
+            _, _, hand_eye, _ = self._build_runtime()
+            state = self._read_robot_state_snapshot(hand_eye=hand_eye)
+            requested = str(self.get_parameter("target_item_id").value or "").strip()
+            item = self._item_catalog().resolve(requested)
+            if item is None:
+                item = self._item_catalog().items["yellow_block"]
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            def capture(view_name: str) -> None:
+                views.append(
+                    self._capture_placement_scan_view(
+                        scan_id=scan_id,
+                        view_name=view_name,
+                        offset_from_start_m=current_offset,
+                        item_id=item.item_id,
+                        base_to_camera=state["base_to_camera"],
+                        output_dir=output_dir,
+                    )
+                )
+
+            def detected_ids() -> set[str]:
+                found: set[str] = set()
+                for view in views:
+                    diagnostics = dict(
+                        dict(view.get("label_match") or {}).get("diagnostics") or {}
+                    )
+                    found.update(
+                        str(value)
+                        for value in list(
+                            diagnostics.get("detected_item_ids_left_to_right") or []
+                        )
+                    )
+                return found
+
+            def order_is_complete() -> bool:
+                try:
+                    self._fuse_single_pass_label_map(
+                        views=views,
+                        item_id=item.item_id,
+                    )
+                    return True
+                except RuntimeError:
+                    return False
+
+            def move(distance_m: float) -> None:
+                nonlocal current_offset
+                movement = self._move_base_for_scan(distance_m)
+                current_offset += float(movement["traveled_m"])
+                movement["offset_after_move_m"] = float(current_offset)
+                movements.append(movement)
+                time.sleep(
+                    max(
+                        0.0,
+                        float(self.get_parameter("base_multiview_settle_s").value),
+                    )
+                )
+
+            capture("start")
+            step_m = abs(
+                float(self.get_parameter("base_multiview_offset_m").value)
+            )
+            max_travel_m = abs(
+                float(self.get_parameter("base_multiview_max_travel_m").value)
+            )
+            max_views = max(
+                1, int(self.get_parameter("base_multiview_max_views").value)
+            )
+            if step_m <= 0.01:
+                raise RuntimeError("base_multiview_offset_m must be greater than 0.01")
+            while not order_is_complete() and len(views) < max_views:
+                remaining_travel = max_travel_m - current_offset
+                if remaining_travel <= 0.01:
+                    break
+                move(min(step_m, remaining_travel))
+                capture(f"forward_{len(views):02d}")
+
+            end_odom = self._base_odom_snapshot()
+            base_returned = False
+
+            validation_message = ""
+            fused_map: dict[str, object] = {}
+            try:
+                fused_map = self._fuse_single_pass_label_map(
+                    views=views,
+                    item_id=item.item_id,
+                )
+                validation_ok = True
+            except Exception as exc:
+                validation_ok = False
+                validation_message = str(exc)
+
+            target_slot = (
+                int(dict(fused_map.get("item_to_slot_index") or {})[item.item_id])
+                if validation_ok
+                else -1
+            )
+            target_confidence = (
+                float(
+                    dict(fused_map.get("item_to_confidence") or {})[
+                        item.item_id
+                    ]
+                )
+                if validation_ok
+                else 0.0
+            )
+            payload = {
+                "success": validation_ok,
+                "validation_message": validation_message,
+                "scan_mode": "base_single_pass",
+                "scan_id": scan_id,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at_unix_s": time.time(),
+                "robot_pose_mm_deg": self._pose_debug_dict(
+                    state["current_pose"]
+                ),
+                "base_odom_origin": {
+                    "x_m": end_odom[0],
+                    "y_m": end_odom[1],
+                    "yaw_rad": end_odom[2],
+                },
+                "base_odom_scan_start": {
+                    "x_m": start_odom[0],
+                    "y_m": start_odom[1],
+                    "yaw_rad": start_odom[2],
+                },
+                "base_returned_to_start": base_returned,
+                "views": views,
+                "movements": movements,
+                "fused_map": fused_map,
+                "label_match": {
+                    "success": validation_ok,
+                    "complete": validation_ok,
+                    "message": (
+                        "multi-view six-label map verified"
+                        if validation_ok
+                        else validation_message
+                    ),
+                    "expected_item_id": item.item_id,
+                    "matched_item_id": item.item_id if validation_ok else "",
+                    "confidence": target_confidence,
+                    "slot_index": target_slot,
+                    "detected_label_count": (
+                        len(
+                            list(
+                                fused_map.get(
+                                    "detected_item_ids_left_to_right"
+                                )
+                                or []
+                            )
+                        )
+                        if validation_ok
+                        else len(detected_ids())
+                    ),
+                    "has_box_center": False,
+                    "box_center_base_m": [0.0, 0.0, 0.0],
+                    "diagnostics": fused_map,
+                },
+                "images": (
+                    dict(views[0]["images"])
+                    if views
+                    else {}
+                ),
+                "motion_command_sent": bool(movements),
+                "gripper_command_sent": False,
+            }
+            self._write_json_file(output_dir / "latest.json", payload)
+            self._result_pub.publish(String(data=json_dumps(payload)))
+            response.success = True
+            response.message = (
+                (
+                    f"multi-view placement scan ok: scan_id={scan_id}; "
+                    "six labels ordered without transparent-box depth"
+                )
+                if validation_ok
+                else (
+                    f"multi-view images captured but validation failed: "
+                    f"{validation_message}"
+                )
+            )
+            self._publish_status(
+                f"idle: multi-view placement scan captured scan_id={scan_id} "
+                f"complete={validation_ok}"
+            )
+        except Exception as exc:
+            self._request_base_scan_stop()
+            response.success = False
+            response.message = str(exc)
+            self._publish_status(
+                f"single-pass placement scan stopped at current position: {exc}"
+            )
+        finally:
+            self._request_base_scan_stop()
+            with self._run_lock:
+                self._scan_active = False
+        return response
+
+    def _handle_scan_and_align_placement_target_service(self, _request, response):
+        """Scan forward only until the selected box label is arm-aligned."""
+        if not bool(self.get_parameter("base_target_alignment_enabled").value):
+            response.success = False
+            response.message = (
+                "target-box scan is disabled; clear the forward scan lane and "
+                "enable base_target_alignment_enabled"
+            )
+            return response
+        with self._run_lock:
+            if self._scan_active:
+                response.success = False
+                response.message = "placement scan or alignment is already running"
+                return response
+            if self._run_thread is not None and self._run_thread.is_alive():
+                response.success = False
+                response.message = "cannot align target box while pipeline is running"
+                return response
+            self._scan_active = True
+            self._stop_requested = False
+
+        scan_id = f"placement-target-{int(time.time() * 1000)}"
+        output_dir = self._placement_scan_viz_dir()
+        views: list[dict[str, object]] = []
+        movements: list[dict[str, object]] = []
+        current_offset = 0.0
+        try:
+            requested = str(self.get_parameter("target_item_id").value or "").strip()
+            item = self._item_catalog().resolve(requested)
+            if item is None:
+                raise RuntimeError("select one of the six target items first")
+            start_odom = self._base_odom_snapshot()
+            _, _, hand_eye, _ = self._build_runtime()
+            state = self._read_robot_state_snapshot(hand_eye=hand_eye)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            step_m = abs(float(self.get_parameter("base_multiview_offset_m").value))
+            fine_step_m = abs(
+                float(self.get_parameter("base_target_fine_step_m").value)
+            )
+            max_travel_m = abs(
+                float(self.get_parameter("base_multiview_max_travel_m").value)
+            )
+            max_views = max(
+                1, int(self.get_parameter("base_multiview_max_views").value)
+            )
+            center_limit = max(
+                0.02,
+                min(
+                    0.45,
+                    float(
+                        self.get_parameter(
+                            "base_target_center_tolerance_norm"
+                        ).value
+                    ),
+                ),
+            )
+            if step_m <= 0.01 or fine_step_m <= 0.01:
+                raise RuntimeError("base_multiview_offset_m must be greater than 0.01")
+
+            selected_view: dict[str, object] | None = None
+            for view_index in range(max_views):
+                view_name = "start" if view_index == 0 else f"forward_{view_index:02d}"
+                view = self._capture_placement_scan_view(
+                    scan_id=scan_id,
+                    view_name=view_name,
+                    offset_from_start_m=current_offset,
+                    item_id=item.item_id,
+                    base_to_camera=state["base_to_camera"],
+                    output_dir=output_dir,
+                )
+                label = dict(view.get("label_match") or {})
+                capture = dict(view.get("capture") or {})
+                bbox = list(label.get("bbox_xywh") or [])
+                width = float(capture.get("color_width") or 0.0)
+                center_error_norm = float("inf")
+                if len(bbox) == 4 and width > 1.0:
+                    center_error_norm = abs(
+                        (float(bbox[0]) + (0.5 * float(bbox[2]))) / width
+                        - 0.5
+                    )
+                label["center_error_norm"] = center_error_norm
+                label["centered"] = bool(
+                    str(label.get("matched_item_id") or "") == item.item_id
+                    and float(label.get("confidence") or 0.0)
+                    >= float(self.get_parameter("label_match_threshold").value)
+                    and math.isfinite(center_error_norm)
+                    and center_error_norm <= center_limit
+                )
+                view["label_match"] = label
+                views.append(view)
+                if bool(label["centered"]):
+                    selected_view = view
+                    break
+                remaining = max_travel_m - current_offset
+                if remaining <= 0.01:
+                    break
+                target_seen = bool(
+                    str(label.get("matched_item_id") or "") == item.item_id
+                    and float(label.get("confidence") or 0.0)
+                    >= float(self.get_parameter("label_match_threshold").value)
+                    and math.isfinite(center_error_norm)
+                )
+                next_step_m = fine_step_m if target_seen else step_m
+                movement = self._move_base_for_scan(min(next_step_m, remaining))
+                current_offset += float(movement["traveled_m"])
+                movement["offset_after_move_m"] = float(current_offset)
+                movements.append(movement)
+                time.sleep(
+                    max(
+                        0.0,
+                        float(self.get_parameter("base_multiview_settle_s").value),
+                    )
+                )
+
+            aligned_odom = self._base_odom_snapshot()
+            selected_label = dict(selected_view.get("label_match") or {}) if selected_view else {}
+            validation_ok = selected_view is not None
+            alignment = {
+                "success": validation_ok,
+                "item_id": item.item_id,
+                # Slot order is no longer used for the common fixed TCP path;
+                # keep a valid index for the executor's plan contract.
+                "slot_index": 0,
+                "selected_view_name": str(selected_view.get("view_name") or "") if selected_view else "",
+                "selected_view_offset_m": float(selected_view.get("offset_from_start_m") or 0.0) if selected_view else 0.0,
+                "selected_confidence": float(selected_label.get("confidence") or 0.0),
+                "selected_center_error_norm": float(selected_label.get("center_error_norm") or 0.0),
+                "center_tolerance_norm": center_limit,
+                "aligned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            payload = {
+                "success": validation_ok,
+                "validation_message": (
+                    "target label centered and base stopped"
+                    if validation_ok
+                    else (
+                        f"target label {item.item_id} was not centered within "
+                        f"{len(views)} views / {current_offset:.3f}m"
+                    )
+                ),
+                "scan_mode": "base_target_single_pass",
+                "scan_id": scan_id,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at_unix_s": time.time(),
+                "robot_pose_mm_deg": self._pose_debug_dict(state["current_pose"]),
+                "base_odom_scan_start": {
+                    "x_m": start_odom[0], "y_m": start_odom[1], "yaw_rad": start_odom[2],
+                },
+                "base_odom_origin": {
+                    "x_m": aligned_odom[0], "y_m": aligned_odom[1], "yaw_rad": aligned_odom[2],
+                },
+                "base_returned_to_start": False,
+                "views": views,
+                "movements": movements,
+                "target_alignment": alignment,
+                "label_match": selected_label,
+                "images": dict(selected_view.get("images") or {}) if selected_view else (dict(views[-1].get("images") or {}) if views else {}),
+                "motion_command_sent": bool(movements),
+                "gripper_command_sent": False,
+            }
+            self._write_json_file(output_dir / "latest.json", payload)
+            self._result_pub.publish(String(data=json_dumps(payload)))
+            response.success = validation_ok
+            response.message = (
+                f"Scout stopped aligned to {item.item_id}; "
+                f"center_error={float(selected_label.get('center_error_norm') or 0.0):.3f}"
+                if validation_ok
+                else payload["validation_message"]
+            )
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+        finally:
+            self._request_base_scan_stop()
+            with self._run_lock:
+                self._scan_active = False
+        return response
+
+    def _handle_align_placement_target_service(self, _request, response):
+        if not bool(self.get_parameter("base_alignment_enabled").value):
+            response.success = False
+            response.message = (
+                "base target alignment is disabled; confirm the reverse path "
+                "is clear and enable base_alignment_enabled"
+            )
+            return response
+        with self._run_lock:
+            if self._scan_active:
+                response.success = False
+                response.message = "placement scan or alignment is already running"
+                return response
+            if self._run_thread is not None and self._run_thread.is_alive():
+                response.success = False
+                response.message = "cannot align base while pipeline is running"
+                return response
+            self._scan_active = True
+            self._stop_requested = False
+
+        try:
+            path = self._placement_scan_viz_dir() / "latest.json"
+            if not path.is_file():
+                raise RuntimeError("no placement scan exists")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not bool(payload.get("success"))
+                or str(payload.get("scan_mode") or "") != "base_single_pass"
+            ):
+                raise RuntimeError("latest single-pass placement scan is not valid")
+            created_at = float(payload.get("created_at_unix_s") or 0.0)
+            max_age = float(self.get_parameter("cached_box_map_max_age_s").value)
+            if created_at <= 0.0 or time.time() - created_at > max_age:
+                raise RuntimeError("latest placement scan is stale; scan again")
+
+            expected_odom = dict(payload.get("base_odom_origin") or {})
+            current_odom = self._base_odom_snapshot()
+            position_error = math.hypot(
+                current_odom[0] - float(expected_odom["x_m"]),
+                current_odom[1] - float(expected_odom["y_m"]),
+            )
+            yaw_error_deg = abs(
+                math.degrees(
+                    math.atan2(
+                        math.sin(
+                            current_odom[2] - float(expected_odom["yaw_rad"])
+                        ),
+                        math.cos(
+                            current_odom[2] - float(expected_odom["yaw_rad"])
+                        ),
+                    )
+                )
+            )
+            if (
+                position_error
+                > float(
+                    self.get_parameter(
+                        "cached_box_map_position_tolerance_m"
+                    ).value
+                )
+                or yaw_error_deg
+                > float(
+                    self.get_parameter(
+                        "cached_box_map_yaw_tolerance_deg"
+                    ).value
+                )
+            ):
+                raise RuntimeError(
+                    "Scout moved since placement scan: "
+                    f"position_error={position_error:.3f}m "
+                    f"yaw_error={yaw_error_deg:.2f}deg; scan again"
+                )
+
+            requested = str(
+                self.get_parameter("target_item_id").value or ""
+            ).strip()
+            item = self._item_catalog().resolve(requested)
+            if item is None:
+                raise RuntimeError("select one of the six target items first")
+            fused = dict(payload.get("fused_map") or {})
+            item_observations = dict(
+                fused.get("item_observations") or {}
+            )
+            observations = [
+                dict(value)
+                for value in list(item_observations.get(item.item_id) or [])
+            ]
+            if not observations:
+                raise RuntimeError(
+                    f"placement scan has no observation for {item.item_id}"
+                )
+
+            views_by_name = {
+                str(dict(view).get("view_name") or ""): dict(view)
+                for view in list(payload.get("views") or [])
+            }
+            ranked: list[tuple[float, float, dict[str, object]]] = []
+            for observation in observations:
+                view = views_by_name.get(
+                    str(observation.get("view_name") or ""), {}
+                )
+                width = float(
+                    dict(view.get("capture") or {}).get("color_width") or 0.0
+                )
+                if width <= 0.0:
+                    continue
+                center_error = abs(
+                    float(observation.get("bbox_center_x_px") or 0.0)
+                    - (0.5 * width)
+                )
+                confidence = float(observation.get("confidence") or 0.0)
+                ranked.append((center_error / width, -confidence, observation))
+            if not ranked:
+                raise RuntimeError("target observations have no valid image width")
+            selected = min(ranked, key=lambda value: (value[0], value[1]))[2]
+            target_offset = float(selected["offset_from_start_m"])
+            view_offsets = [
+                float(dict(view).get("offset_from_start_m") or 0.0)
+                for view in list(payload.get("views") or [])
+            ]
+            current_offset = max(view_offsets) if view_offsets else 0.0
+            requested_delta = target_offset - current_offset
+            movements: list[dict[str, object]] = []
+            while abs(target_offset - current_offset) > 0.012:
+                remaining = target_offset - current_offset
+                segment = math.copysign(min(0.40, abs(remaining)), remaining)
+                movement = self._move_base_for_scan(segment)
+                current_offset += float(movement["traveled_m"])
+                movement["offset_after_move_m"] = float(current_offset)
+                movement["target_alignment_segment"] = True
+                movements.append(movement)
+                time.sleep(
+                    max(
+                        0.0,
+                        float(
+                            self.get_parameter(
+                                "base_multiview_settle_s"
+                            ).value
+                        ),
+                    )
+                )
+
+            aligned_odom = self._base_odom_snapshot()
+            alignment = {
+                "success": True,
+                "item_id": item.item_id,
+                "slot_index": int(
+                    dict(fused.get("item_to_slot_index") or {})[item.item_id]
+                ),
+                "selected_view_name": str(selected.get("view_name") or ""),
+                "selected_view_offset_m": target_offset,
+                "requested_delta_m": requested_delta,
+                "final_offset_from_scan_start_m": current_offset,
+                "selected_bbox_center_x_px": float(
+                    selected.get("bbox_center_x_px") or 0.0
+                ),
+                "selected_confidence": float(
+                    selected.get("confidence") or 0.0
+                ),
+                "movements": movements,
+                "aligned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            payload["target_alignment"] = alignment
+            # Future operations validate against the new, aligned base pose.
+            payload["base_odom_origin"] = {
+                "x_m": aligned_odom[0],
+                "y_m": aligned_odom[1],
+                "yaw_rad": aligned_odom[2],
+            }
+            self._write_json_file(path, payload)
+            self._result_pub.publish(String(data=json_dumps(payload)))
+            response.success = True
+            response.message = (
+                f"Scout aligned to {item.item_id} slot "
+                f"{alignment['slot_index']} using "
+                f"{alignment['selected_view_name']}; fixed placement requires "
+                "a separate one-shot release confirmation"
+            )
+        except Exception as exc:
+            self._request_base_scan_stop()
+            response.success = False
+            response.message = str(exc)
+        finally:
+            self._request_base_scan_stop()
+            with self._run_lock:
+                self._scan_active = False
+        return response
+
+    def _validated_aligned_place_context(
+        self,
+        item_id: str,
+    ) -> tuple[dict[str, object], int, float]:
+        path = self._placement_scan_viz_dir() / "latest.json"
+        if not path.is_file():
+            raise RuntimeError("no placement scan exists")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        scan_mode = str(payload.get("scan_mode") or "")
+        if not bool(payload.get("success")) or scan_mode not in {
+            "base_single_pass",
+            "base_target_single_pass",
+        }:
+            raise RuntimeError("latest target-aligned placement scan is not valid")
+        created_at = float(payload.get("created_at_unix_s") or 0.0)
+        max_age = float(self.get_parameter("cached_box_map_max_age_s").value)
+        if created_at <= 0.0 or time.time() - created_at > max_age:
+            raise RuntimeError("latest placement scan is stale; scan and align again")
+
+        alignment = dict(payload.get("target_alignment") or {})
+        if not bool(alignment.get("success")):
+            raise RuntimeError("target box has not been aligned")
+        aligned_item_id = str(alignment.get("item_id") or "")
+        if aligned_item_id != item_id:
+            raise RuntimeError(
+                f"base is aligned to {aligned_item_id or 'unknown'}, not {item_id}"
+            )
+
+        if scan_mode == "base_single_pass":
+            fused = dict(payload.get("fused_map") or {})
+            slots = dict(fused.get("item_to_slot_index") or {})
+            if item_id not in slots:
+                raise RuntimeError(f"placement scan has no slot for {item_id}")
+            slot_index = int(slots[item_id])
+            if slot_index != int(alignment.get("slot_index", -1)):
+                raise RuntimeError("aligned slot does not match the verified label map")
+        else:
+            slot_index = int(alignment.get("slot_index", -1))
+            if not 0 <= slot_index < 6:
+                raise RuntimeError("target alignment has an invalid place-plan slot")
+
+        expected_odom = dict(payload.get("base_odom_origin") or {})
+        current_odom = self._base_odom_snapshot()
+        position_error = math.hypot(
+            current_odom[0] - float(expected_odom["x_m"]),
+            current_odom[1] - float(expected_odom["y_m"]),
+        )
+        yaw_error_deg = abs(
+            math.degrees(
+                math.atan2(
+                    math.sin(
+                        current_odom[2] - float(expected_odom["yaw_rad"])
+                    ),
+                    math.cos(
+                        current_odom[2] - float(expected_odom["yaw_rad"])
+                    ),
+                )
+            )
+        )
+        position_limit = float(
+            self.get_parameter("cached_box_map_position_tolerance_m").value
+        )
+        yaw_limit = float(
+            self.get_parameter("cached_box_map_yaw_tolerance_deg").value
+        )
+        if position_error > position_limit or yaw_error_deg > yaw_limit:
+            raise RuntimeError(
+                "Scout moved after target alignment: "
+                f"position_error={position_error:.3f}m "
+                f"yaw_error={yaw_error_deg:.2f}deg; align again"
+            )
+        confidence = float(alignment.get("selected_confidence") or 0.0)
+        return payload, slot_index, confidence
+
+    def _handle_execute_aligned_place_service(self, _request, response):
+        if not bool(self.get_parameter("base_aligned_place_enabled").value):
+            response.success = False
+            response.message = (
+                "fixed base-aligned placement is disabled; acknowledge release "
+                "safety and enable base_aligned_place_enabled"
+            )
+            return response
+        with self._run_lock:
+            if self._scan_active:
+                response.success = False
+                response.message = "placement scan/alignment is already running"
+                return response
+            if self._run_thread is not None and self._run_thread.is_alive():
+                response.success = False
+                response.message = "cannot place while pipeline is running"
+                return response
+            self._scan_active = True
+            self._stop_requested = False
+
+        try:
+            requested = str(
+                self.get_parameter("target_item_id").value or ""
+            ).strip()
+            item = self._item_catalog().resolve(requested)
+            if item is None:
+                raise RuntimeError("select one of the six target items first")
+            scan_payload, slot_index, confidence = (
+                self._validated_aligned_place_context(item.item_id)
+            )
+            plan = self._build_base_aligned_place_plan_message(
+                item_id=item.item_id,
+                label_confidence=confidence,
+                slot_index=slot_index,
+            )
+            run_id = new_run_id("aligned-place")
+
+            validate_request = ExecutePlacePlan.Request()
+            validate_request.run_id = run_id
+            validate_request.execute = False
+            validate_request.move_home_after = False
+            validate_request.plan = plan
+            validation_response = self._call_client(
+                self._execute_place_client,
+                validate_request,
+                timeout_s=45.0,
+            )
+            if not validation_response.success:
+                raise RuntimeError(
+                    "fixed place validation failed: "
+                    f"{validation_response.message}"
+                )
+
+            execute_request = ExecutePlacePlan.Request()
+            execute_request.run_id = run_id
+            execute_request.execute = True
+            execute_request.move_home_after = False
+            execute_request.plan = plan
+            execute_response = self._call_client(
+                self._execute_place_client,
+                execute_request,
+                timeout_s=180.0,
+            )
+            if not execute_response.success:
+                raise RuntimeError(
+                    f"fixed place execution failed: {execute_response.message}"
+                )
+            execution = json.loads(execute_response.execution_json)
+            post_place_home, post_place_base_advance = (
+                self._return_home_and_advance_base_after_place(
+                    run_id=run_id,
+                    item_id=item.item_id,
+                )
+            )
+            record = {
+                "success": True,
+                "run_id": run_id,
+                "item_id": item.item_id,
+                "slot_index": slot_index,
+                "label_confidence": confidence,
+                "executed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "localization_source": "base_aligned_fixed_tcp_calibration",
+                "execution": execution,
+                "post_place_home": post_place_home,
+                "post_place_base_advance": post_place_base_advance,
+            }
+            scan_payload["aligned_place_execution"] = record
+            path = self._placement_scan_viz_dir() / "latest.json"
+            self._write_json_file(path, scan_payload)
+            self._result_pub.publish(String(data=json_dumps(scan_payload)))
+            response.success = True
+            response.message = (
+                f"fixed aligned placement completed: {item.item_id} "
+                f"slot={slot_index} run_id={run_id}"
+            )
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+        finally:
+            with self._run_lock:
+                self._scan_active = False
+        return response
+
     def _handle_stop_service(self, _request, response):
+        # Stop both actuators. The base adapter continuously publishes several
+        # zero-velocity commands, so this also covers an active multi-view scan.
+        self._request_base_scan_stop()
         pending = self._peek_pending_confirmation()
         if pending is not None:
             self._set_pending_confirmation(None)
@@ -1013,6 +3864,8 @@ class PipelineOrchestratorNode(Node):
 
     def _start_background_run(self, prompt_override: str | None) -> tuple[bool, str]:
         with self._run_lock:
+            if self._scan_active:
+                return False, "placement scan is already running"
             if self._run_thread is not None and self._run_thread.is_alive():
                 return False, "pipeline is already running"
             if self._pending_confirmation is not None:
@@ -1022,8 +3875,11 @@ class PipelineOrchestratorNode(Node):
                     "call /grasp_pipeline/confirm or /grasp_pipeline/reject first",
                 )
             prompt = prompt_override if prompt_override is not None else str(self.get_parameter("prompt").value or "").strip()
-            if not prompt:
+            auto_target = self._auto_target_from_card_enabled()
+            if not prompt and not auto_target:
                 return False, "prompt is empty; set parameter 'prompt' or publish to ~/run_prompt"
+            if auto_target:
+                prompt = "auto target card"
             worker = threading.Thread(
                 target=self._run_pipeline_thread,
                 args=(prompt,),
@@ -1034,7 +3890,11 @@ class PipelineOrchestratorNode(Node):
             self._run_id = new_run_id("grasp")
             self._stop_requested = False
             worker.start()
-            return True, f"run accepted for prompt={prompt}"
+            return True, (
+                "run accepted for automatic target-card identification"
+                if auto_target
+                else f"run accepted for prompt={prompt}"
+            )
 
     def _handle_confirm_service(self, _request, response):
         with self._run_lock:
@@ -1096,19 +3956,22 @@ class PipelineOrchestratorNode(Node):
         result_payload = dict(pending.result_payload)
         try:
             self._publish_status(f"executing_plan: run_id={pending.run_id} confirmed=true")
-            execute_req = ExecuteGraspPlan.Request()
-            execute_req.run_id = pending.run_id
-            execute_req.execute = True
-            execute_req.move_home_after = bool(pending.move_home_after)
-            execute_req.plan = grasp_plan_to_msg(pending.plan)
-            execute_response = self._call_client(self._execute_plan_client, execute_req, timeout_s=120.0)
-            if not execute_response.success:
-                raise RuntimeError(execute_response.message)
-            execution_payload = json.loads(execute_response.execution_json)
+            execution_payload = self._execute_grasp_and_optional_place(
+                run_id=pending.run_id,
+                plan=pending.plan,
+                move_home_after=bool(pending.move_home_after),
+                target_item_id=pending.target_item_id,
+                hand_eye=pending.hand_eye,
+                advance_base_after_grasp=bool(
+                    dict(pending.request_payload.get("options") or {}).get(
+                        "base_grasp_scan_enabled"
+                    )
+                ),
+            )
             result_payload["execution"] = execution_payload
             result_payload["confirmed"] = True
             result_payload["status"] = "ok"
-            result_payload["execution_message"] = str(execute_response.message)
+            result_payload["execution_message"] = "confirmed task execution completed"
             summary = self._append_summary_line(summary, "execution confirmed and completed")
         except Exception as exc:
             with self._run_lock:
@@ -1148,23 +4011,17 @@ class PipelineOrchestratorNode(Node):
             "started_at_unix_s": time.time(),
         }
         result_payload: dict[str, object] = {"run_id": run_id, "prompt": prompt}
+        grasp_scan_payload: dict[str, object] | None = None
+        auto_target_from_card = self._auto_target_from_card_enabled()
+        base_grasp_scan_requested = auto_target_from_card or bool(
+            self.get_parameter("base_grasp_scan_enabled").value
+        )
         try:
             self._publish_candidate_validation_markers(
                 validation_records=[],
                 camera_frame="camera_color_optical_frame",
             )
             self._publish_status(f"preflight: run_id={run_id}")
-            options, config, hand_eye, planner = self._build_runtime()
-            request_payload.update(
-                {
-                    "options": options,
-                    "observe_pose": self._observe_pose_values(),
-                    "artifact_root": str(self._artifact_root_dir()),
-                }
-            )
-            request_payload["confirm"] = bool(self.get_parameter("confirm").value)
-            request_payload["execute"] = bool(self.get_parameter("execute").value)
-
             self._publish_status(f"moving_to_observation: run_id={run_id}")
             observe_pose = self._observe_pose_values()
             if bool(self.get_parameter("skip_observation_move").value):
@@ -1174,12 +4031,104 @@ class PipelineOrchestratorNode(Node):
                     name="observation",
                     position_m=(observe_pose[0] / 1000.0, observe_pose[1] / 1000.0, observe_pose[2] / 1000.0),
                     rpy_deg=(observe_pose[3], observe_pose[4], observe_pose[5]),
-                    speed_percent=float(self.get_parameter("speed").value),
+                    speed_percent=float(self.get_parameter("observation_speed").value),
                     open_gripper_first=True,
-                    timeout_s=20.0,
+                    timeout_s=45.0,
                 )
 
-            if bool(self.get_parameter("precenter").value):
+            target_card_payload: dict[str, object] | None = None
+            if auto_target_from_card:
+                target_item, target_card_payload = self._identify_target_card(
+                    run_id=run_id
+                )
+                # Publish the resolved identity for dashboards and external
+                # observers, but every automatic run still performs a fresh
+                # card capture and never trusts these retained values.
+                self.set_parameters(
+                    [
+                        Parameter("target_item_id", value=target_item.item_id),
+                        Parameter("prompt", value=target_item.grasp_prompt),
+                    ]
+                )
+            else:
+                target_item = self._resolve_target_item(prompt)
+
+            target_item_id = target_item.item_id if target_item is not None else ""
+            if target_item is not None:
+                prompt = target_item.grasp_prompt
+                grasp_strategy = self._set_executor_strategy_for_item(target_item)
+            else:
+                grasp_strategy = ""
+
+            options, config, hand_eye, planner = self._build_runtime()
+            if target_item is not None:
+                options["target_item_id"] = target_item.item_id
+                options["prompt"] = prompt
+                result_payload["prompt"] = prompt
+                result_payload["target_item"] = {
+                    "item_id": target_item.item_id,
+                    "display_name": target_item.display_name,
+                    "kind": target_item.kind,
+                    "reference_image": str(target_item.reference_image),
+                    "execution_strategy": grasp_strategy,
+                    "source": (
+                        "target_card" if auto_target_from_card else "manual"
+                    ),
+                }
+            if target_card_payload is not None:
+                result_payload["target_card_identification"] = target_card_payload
+            if bool(self.get_parameter("place_after_grasp").value):
+                if target_item is None:
+                    raise RuntimeError(
+                        "place_after_grasp requires target_item_id from the six-item catalog"
+                    )
+                self._placement_observe_pose_values()
+                self._item_catalog().ensure_place_calibrated(
+                    target_item.item_id,
+                    require_slot_centers=not bool(
+                        self.get_parameter("dynamic_box_localization").value
+                    ),
+                )
+            if base_grasp_scan_requested and target_item is None:
+                raise RuntimeError(
+                    "base grasp scan requires target_item_id from the six-item catalog"
+                )
+            request_payload.update(
+                {
+                    "prompt": prompt,
+                    "target_item_id": target_item_id,
+                    "target_source": (
+                        "target_card" if auto_target_from_card else "manual"
+                    ),
+                    "target_card_identification": target_card_payload,
+                    "options": options,
+                    "observe_pose": observe_pose,
+                    "artifact_root": str(self._artifact_root_dir()),
+                }
+            )
+            request_payload["confirm"] = bool(self.get_parameter("confirm").value)
+            request_payload["execute"] = bool(self.get_parameter("execute").value)
+
+            if base_grasp_scan_requested:
+                cycle, grasp_scan_payload = self._run_base_grasp_target_scan(
+                    run_id=run_id,
+                    prompt=prompt,
+                    target_item_id=target_item_id,
+                    options=options,
+                    hand_eye=hand_eye,
+                )
+                cycle_records = [dict(view) for view in grasp_scan_payload["views"]]
+                diagnostics.append(
+                    "grasp single-pass scan: "
+                    f"views={len(grasp_scan_payload['views'])} "
+                    f"offset={float(grasp_scan_payload['final_offset_from_start_m']):.3f}m "
+                    f"target_found={bool(grasp_scan_payload['success'])}"
+                )
+                if bool(self.get_parameter("precenter").value):
+                    diagnostics.append(
+                        "precenter skipped because base grasp scan selected the final view"
+                    )
+            elif bool(self.get_parameter("precenter").value):
                 self._publish_status(f"precentering: run_id={run_id}")
                 cycle, centering_logs, cycle_records = self._run_precenter_loop(
                     run_id=run_id,
@@ -1228,6 +4177,7 @@ class PipelineOrchestratorNode(Node):
                         "centering_logs": centering_logs,
                         "vision": self._analyze_debug_dict(analyze_response),
                         "capture": self._capture_debug_dict(capture_response),
+                        "grasp_target_scan": grasp_scan_payload,
                     }
                 )
                 return
@@ -1294,6 +4244,7 @@ class PipelineOrchestratorNode(Node):
                             "centering_logs": centering_logs,
                             "vision": self._analyze_debug_dict(analyze_response),
                             "capture": self._capture_debug_dict(capture_response),
+                            "grasp_target_scan": grasp_scan_payload,
                             "candidate_validation": validation_records,
                             "execution": None,
                         }
@@ -1325,6 +4276,7 @@ class PipelineOrchestratorNode(Node):
                 {
                     "vision": self._analyze_debug_dict(analyze_response),
                     "capture": self._capture_debug_dict(capture_response),
+                    "grasp_target_scan": grasp_scan_payload,
                     "candidate_validation": validation_records,
                     "candidate": {
                         "score": candidate.score,
@@ -1364,6 +4316,8 @@ class PipelineOrchestratorNode(Node):
                         scene_id=str(capture_response.scene_id),
                         plan=plan,
                         move_home_after=move_home_after,
+                        target_item_id=target_item_id,
+                        hand_eye=np.asarray(hand_eye, dtype=np.float64).copy(),
                         request_payload=dict(request_payload),
                         cycle_records=[dict(record) for record in cycle_records],
                         result_payload=dict(result_payload),
@@ -1373,16 +4327,20 @@ class PipelineOrchestratorNode(Node):
 
             if execute_enabled:
                 self._publish_status(f"executing_plan: run_id={run_id}")
-                execute_req = ExecuteGraspPlan.Request()
-                execute_req.run_id = run_id
-                execute_req.execute = True
-                execute_req.move_home_after = move_home_after
-                execute_req.plan = grasp_plan_to_msg(plan)
-                execute_response = self._call_client(self._execute_plan_client, execute_req, timeout_s=120.0)
-                if not execute_response.success:
-                    raise RuntimeError(execute_response.message)
-                execution_payload = json.loads(execute_response.execution_json)
-                summary = self._append_summary_line(summary, "execution completed")
+                execution_payload = self._execute_grasp_and_optional_place(
+                    run_id=run_id,
+                    plan=plan,
+                    move_home_after=move_home_after,
+                    target_item_id=target_item_id,
+                    hand_eye=hand_eye,
+                    advance_base_after_grasp=base_grasp_scan_requested,
+                )
+                summary = self._append_summary_line(
+                    summary,
+                    "grasp and placement completed"
+                    if bool(self.get_parameter("place_after_grasp").value)
+                    else "execution completed",
+                )
 
             result_payload.update(
                 {
@@ -1401,6 +4359,17 @@ class PipelineOrchestratorNode(Node):
             self.get_logger().error(f"distributed pipeline failed: {exc}")
             result_payload.update({"status": status, "summary": summary, "diagnostics": diagnostics})
         finally:
+            if base_grasp_scan_requested:
+                # One-shot base-motion permission: the dashboard must request
+                # it again for every new grasp scan.
+                try:
+                    self.set_parameters(
+                        [Parameter("base_grasp_scan_enabled", value=False)]
+                    )
+                except Exception as exc:
+                    self.get_logger().warning(
+                        f"could not clear base_grasp_scan_enabled: {exc}"
+                    )
             result_payload.setdefault("artifacts", {})
             result_payload["artifacts"]["artifact_root"] = str(self._artifact_root_dir())
             artifact_dir = self._write_run_artifacts(

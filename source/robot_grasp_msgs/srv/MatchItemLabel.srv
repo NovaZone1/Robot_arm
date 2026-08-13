@@ -1,0 +1,22 @@
+string run_id
+string scene_id
+string expected_item_id
+sensor_msgs/Image color_image
+sensor_msgs/Image depth_image
+sensor_msgs/CameraInfo camera_info
+geometry_msgs/TransformStamped base_to_camera
+string options_json
+---
+bool success
+string message
+string matched_item_id
+float64 confidence
+int32 slot_index
+int32 detected_label_count
+int32 bbox_x
+int32 bbox_y
+int32 bbox_width
+int32 bbox_height
+bool has_box_center
+geometry_msgs/Point box_center_base_m
+string diagnostics_json

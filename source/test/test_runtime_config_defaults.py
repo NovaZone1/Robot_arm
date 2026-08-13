@@ -72,6 +72,25 @@ def test_distributed_pipeline_defaults_use_sdk_backend():
     assert '"pointcloud_backend": str(self.get_parameter("pointcloud_backend").value or "sdk")' in source_text
 
 
+def test_distributed_pipeline_defaults_to_photo_card_target_then_base_scan():
+    yaml_text = (
+        PROJECT_ROOT / "config" / "distributed" / "pipeline_orchestrator.params.yaml"
+    ).read_text(encoding="utf-8")
+    dashboard_source = (
+        PROJECT_ROOT / "scripts" / "run_grasp_dashboard.py"
+    ).read_text(encoding="utf-8")
+
+    assert "auto_target_from_card: true" in yaml_text
+    assert "target_card_min_confidence: 0.53" in yaml_text
+    assert "target_card_min_margin: 0.08" in yaml_text
+    assert "target_card_search_roi_norm: [0.35, 0.01, 0.88, 0.50]" in yaml_text
+    assert "target_card_capture_frames: 3" in yaml_text
+    assert "target_card_consensus_frames: 2" in yaml_text
+    assert "observation_speed: 10" in yaml_text
+    assert "base_grasp_scan_enabled: true" in yaml_text
+    assert 'id="autoTargetCardInput" type="checkbox" checked' in dashboard_source
+
+
 def test_distributed_competition_defaults_use_center_horizontal_grasp():
     pipeline_yaml = (
         PROJECT_ROOT / "config" / "distributed" / "pipeline_orchestrator.params.yaml"

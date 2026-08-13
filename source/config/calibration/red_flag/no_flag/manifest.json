@@ -1,0 +1,111 @@
+{
+  "label": "no_flag",
+  "frame_count": 15,
+  "frames": [
+    {
+      "index": 0,
+      "file": "frame_00.png",
+      "scene_id": "red-flag-no-flag-00-scene",
+      "stamp_sec": 1786448869,
+      "stamp_nanosec": 310862546
+    },
+    {
+      "index": 1,
+      "file": "frame_01.png",
+      "scene_id": "red-flag-no-flag-01-scene",
+      "stamp_sec": 1786448869,
+      "stamp_nanosec": 837785924
+    },
+    {
+      "index": 2,
+      "file": "frame_02.png",
+      "scene_id": "red-flag-no-flag-02-scene",
+      "stamp_sec": 1786448870,
+      "stamp_nanosec": 388944110
+    },
+    {
+      "index": 3,
+      "file": "frame_03.png",
+      "scene_id": "red-flag-no-flag-03-scene",
+      "stamp_sec": 1786448870,
+      "stamp_nanosec": 893690279
+    },
+    {
+      "index": 4,
+      "file": "frame_04.png",
+      "scene_id": "red-flag-no-flag-04-scene",
+      "stamp_sec": 1786448871,
+      "stamp_nanosec": 426043488
+    },
+    {
+      "index": 5,
+      "file": "frame_05.png",
+      "scene_id": "red-flag-no-flag-05-scene",
+      "stamp_sec": 1786448871,
+      "stamp_nanosec": 939676238
+    },
+    {
+      "index": 6,
+      "file": "frame_06.png",
+      "scene_id": "red-flag-no-flag-06-scene",
+      "stamp_sec": 1786448872,
+      "stamp_nanosec": 454163446
+    },
+    {
+      "index": 7,
+      "file": "frame_07.png",
+      "scene_id": "red-flag-no-flag-07-scene",
+      "stamp_sec": 1786448872,
+      "stamp_nanosec": 972122922
+    },
+    {
+      "index": 8,
+      "file": "frame_08.png",
+      "scene_id": "red-flag-no-flag-08-scene",
+      "stamp_sec": 1786448873,
+      "stamp_nanosec": 491794418
+    },
+    {
+      "index": 9,
+      "file": "frame_09.png",
+      "scene_id": "red-flag-no-flag-09-scene",
+      "stamp_sec": 1786448874,
+      "stamp_nanosec": 12338678
+    },
+    {
+      "index": 10,
+      "file": "frame_10.png",
+      "scene_id": "red-flag-no-flag-10-scene",
+      "stamp_sec": 1786448874,
+      "stamp_nanosec": 531984316
+    },
+    {
+      "index": 11,
+      "file": "frame_11.png",
+      "scene_id": "red-flag-no-flag-11-scene",
+      "stamp_sec": 1786448875,
+      "stamp_nanosec": 27145601
+    },
+    {
+      "index": 12,
+      "file": "frame_12.png",
+      "scene_id": "red-flag-no-flag-12-scene",
+      "stamp_sec": 1786448875,
+      "stamp_nanosec": 553017001
+    },
+    {
+      "index": 13,
+      "file": "frame_13.png",
+      "scene_id": "red-flag-no-flag-13-scene",
+      "stamp_sec": 1786448876,
+      "stamp_nanosec": 84877547
+    },
+    {
+      "index": 14,
+      "file": "frame_14.png",
+      "scene_id": "red-flag-no-flag-14-scene",
+      "stamp_sec": 1786448876,
+      "stamp_nanosec": 595685880
+    }
+  ]
+}

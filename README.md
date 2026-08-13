@@ -722,6 +722,10 @@ table_z_m:        0.161  （操作平面在 base_link 上方 161 mm）
 
 > ⚠️ 机械臂失能前必须先回到 Home；观察位只用于采图，不作为失能位姿。
 
+该观察位同时用于照片标识牌识别。自动流程先拍摄旁桌上单独放置的一张目标照片，只有在
+六类目录中得到唯一且置信度合格的结果后，才设置对应 prompt 并启动底盘单向目标扫描；
+识别失败或前两名过于接近时拒绝继续，不会复用上一次目标。
+
 ### 工作区 top-down 可达性（左侧工作区）
 
 首选腕部方向：`[180, 60, -90] deg`，备选：yaw `90` / `0` / `-90` deg。
@@ -797,21 +801,25 @@ cd Robot_arm/source
 2. moving_to_observation
    └─ 机械臂移动到观察位姿
 
-3. (可选) precenter
+3. identifying_target_card（默认自动模式）
+   └─ 拍摄旁桌照片标识牌 → 六类参考图匹配 → 自动选择 prompt/抓取策略
+   └─ 无结果、低置信度或类别歧义时停止
+
+4. (可选) precenter
    └─ 视觉居中循环：检测目标 → 计算偏移 → 移动到图像中心
 
-4. reading_robot_state
+5. reading_robot_state
    └─ 读取当前 TCP 位姿和机械臂状态
 
-5. capturing_scene
+6. capturing_scene
    └─ camera_server 采集 RGB-D（可选深度多帧融合）
 
-6. analyzing_scene
+7. analyzing_scene
    └─ YOLOv8-seg 实例分割 → 点云重建
    └─ GraspNet 全场景预测 + mask 过滤
    └─ 候选生成与筛选（分数/角度/工作区/位姿地板）
 
-7. (可选) awaiting_confirmation
+8. (可选) awaiting_confirmation
    └─ 等待外部 confirm / reject
 
 8. executing
@@ -963,6 +971,8 @@ ros2 service call /grasp_pipeline/run std_srvs/srv/Trigger "{}"
 
 | 文档 | 说明 |
 |------|------|
+| [README_PIPER_ARM_DEBUG.md](README_PIPER_ARM_DEBUG.md) | 当前 Jetson 的 Piper 机械臂、抓取与 Dashboard 调试操作卡 |
+| [README_SCOUT_BASE_DEBUG.md](README_SCOUT_BASE_DEBUG.md) | 当前 Jetson 的 Scout Mini 底盘、导航与单向扫描调试操作卡 |
 | [CURRENT_STATUS.md](source/docs/CURRENT_STATUS.md) | 当前完成工作、已验证基线、未完成项、已知坑点（**接手必读**） |
 | [DISTRIBUTED_RUNBOOK.md](source/docs/DISTRIBUTED_RUNBOOK.md) | 分布式运行手册：启动步骤、参数说明、结果查看、排障 |
 | [DISTRIBUTED_ARCHITECTURE.md](source/docs/DISTRIBUTED_ARCHITECTURE.md) | 分布式架构设计：节点拓扑、接口边界、状态机语义、部署建议 |

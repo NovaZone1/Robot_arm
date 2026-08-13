@@ -1,0 +1,16 @@
+base_scan_controller:
+  ros__parameters:
+    cmd_vel_topic: "/cmd_vel"
+    odom_topic: "/odom"
+    command_rate_hz: 20.0
+    odom_stale_timeout_s: 0.5
+    # Allows one continuous post-grasp/post-place 1.5 m command. Emergency stop,
+    # odometry freshness, lateral drift, yaw drift and speed limits remain active.
+    max_distance_m: 1.50
+    # Search scans remain slower; the dedicated 1.5 m transfer legs may use
+    # 0.16 m/s after the arm has secured/placed the object.
+    max_speed_mps: 0.18
+    min_speed_mps: 0.02
+    position_tolerance_m: 0.012
+    max_lateral_error_m: 0.05
+    max_yaw_error_deg: 3.0

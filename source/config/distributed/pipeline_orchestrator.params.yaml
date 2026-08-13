@@ -1,7 +1,14 @@
 grasp_pipeline:
   ros__parameters:
     prompt: ""
+    target_item_id: ""
+    item_catalog_path: ""
     execute: false
+    place_after_grasp: false
+    # Independent of automatic placement: after a successful grasp, carry the
+    # object to the calibrated label-scanning pose without opening the gripper.
+    move_to_placement_observation_after_grasp: true
+    dynamic_box_localization: true
     move_home_after: false
     enable_pregrasp: false
     show_pointcloud: false
@@ -11,8 +18,11 @@ grasp_pipeline:
     pointcloud_backend: "sdk"
     depth_fusion_frames: 8
     speed: 5
+    # The calibrated observation route is in free space. Keep grasp descent at
+    # the normal task speed while replaying observation poses more promptly.
+    observation_speed: 10
     graspnet_checkpoint: "checkpoint.tar"
-    hand_eye_config: "/home/ybw/piper_grasp_project/source/config/hand_eye/verify_config_eyeinhand_cam2tcp.yaml"
+    hand_eye_config: ""
     apply_npoint_tool_offset: false
     npoint_tool_offset_file: ""
     tool_contact_offset_scale: 0.5
@@ -39,11 +49,100 @@ grasp_pipeline:
     extra_cli_args: [""]
     auto_start: false
     skip_observation_move: false
+    # The operator no longer selects the grasp target. At the observation pose,
+    # first recognize one printed catalog photo on the adjacent target-card
+    # table; only then start the forward base scan for that resolved item.
+    auto_target_from_card: true
+    # The card can shift inside the upper-center observation area. Recognition
+    # uses photograph-template evidence only inside this broad window; direct
+    # color-marker proposals are reserved for the separate six-box scan.
+    target_card_search_roi_norm: [0.35, 0.01, 0.88, 0.50]
+    target_card_match_threshold: 0.50
+    target_card_min_confidence: 0.53
+    target_card_min_margin: 0.08
+    # Require the same clear catalog winner in at least two of three fresh
+    # captures so one reflection/noisy exposure cannot choose the target.
+    target_card_capture_frames: 3
+    target_card_consensus_frames: 2
+    target_card_capture_interval_s: 0.15
+    # Active competition setup: table on the arm's left side.  The preserved
+    # left/right profiles live under config/calibration/observation_poses/.
+    # Both target acquisition and box-label/placement observation must use the
+    # same side so their camera-to-base geometry remains consistent.
     observe_pose: [0.0, 35.5, 491.1, 180.0, 67.77, -89.97]
+    placement_observe_pose: [0.0, 35.5, 491.1, 180.0, 67.77, -89.97]
+    # Diagnostic joint reference only; Cartesian execution uses the poses
+    # above. The right-side profile uses the opposite base-joint sign.
+    placement_observe_joint_positions_rad:
+      [1.571774176, 0.652510264, -1.397299288, 0.0, 1.218672728, 0.0]
+    label_search_roi_norm: [0.0, 0.0, 1.0, 1.0]
+    label_match_threshold: 0.42
     camera_capture_service: "/camera_server/capture"
     vision_analyze_service: "/vision_worker/analyze"
+    vision_detect_target_2d_service: "/vision_worker/detect_target_2d"
+    vision_match_label_service: "/vision_worker/match_item_label"
     robot_state_service: "/robot_executor/get_state"
     robot_named_pose_service: "/robot_executor/execute_named_pose"
     robot_execute_plan_service: "/robot_executor/execute_grasp_plan"
+    robot_execute_place_service: "/robot_executor/execute_place_plan"
     robot_stop_service: "/robot_executor/stop_robot"
     artifact_root: ""
+    placement_scan_viz_dir: ""
+    # Disabled until the operator clears the forward scan lane, starts the
+    # Scout Mini driver, and has the hardware e-stop ready.
+    base_multiview_enabled: false
+    base_alignment_enabled: false
+    base_target_alignment_enabled: false
+    base_aligned_place_enabled: false
+    # One-shot permission for a grab-target search. When enabled from the
+    # dashboard, Scout scans forward until the selected item has a grasp
+    # candidate, then remains at that view for the grasp.
+    base_grasp_scan_enabled: true
+    # Start near the left end of the six-box row, then scan forward only.
+    base_multiview_offset_m: 0.15
+    base_multiview_max_travel_m: 1.50
+    # 24 views also cover the worst case where the target appears early but
+    # needs repeated 7 cm fine-centering steps across most of the scan lane.
+    base_multiview_max_views: 24
+    base_multiview_speed_mps: 0.04
+    base_multiview_move_timeout_s: 22.0
+    base_multiview_settle_s: 0.5
+    # Fixed-box placement keeps its own horizontal label-centering threshold.
+    base_target_center_tolerance_norm: 0.03
+    # Operator-recorded target centers, calibrated from the standard RGB-D
+    # frames under config/calibration/target_center on 2026-08-08. Separate
+    # vertical references account for the bottle/block height difference.
+    base_grasp_bottle_center_norm: [0.598, 0.485]
+    base_grasp_block_center_norm: [0.606, 0.619]
+    # Deliberately practical margins: about 51 px horizontally and 58 px
+    # vertically at 640x480, rather than requiring one exact center pixel.
+    base_grasp_center_tolerance_u_norm: 0.08
+    # Relaxed after the right-side mirrored observation trial: the red block
+    # had valid grasps and horizontal alignment at v-error 0.138. Keep a small
+    # margin while still requiring the correct target and a valid grasp.
+    base_grasp_center_tolerance_v_norm: 0.15
+    # Once the target first appears, switch from 15 cm search steps to a 7 cm
+    # approach step. The final center tolerance is calibrated from a standard
+    # operator-provided frame and intentionally keeps practical margin.
+    base_target_fine_step_m: 0.07
+    # For any catalog target found by the base grasp scan (bottle or block),
+    # advance only after the grasp executor has closed and retreated, before
+    # placement observation.
+    post_grasp_base_advance_m: 1.50
+    post_grasp_base_advance_speed_mps: 0.16
+    post_grasp_base_advance_timeout_s: 50.0
+    # After the object has been released and the arm has retreated from the box,
+    # continue forward by the same distance.
+    post_place_base_advance_m: 1.50
+    post_place_base_advance_speed_mps: 0.16
+    post_place_base_advance_timeout_s: 50.0
+    # After release and vertical retreat, fold Home while Scout performs the
+    # post-place transfer leg. The two actions start together.
+    post_place_home_pose: [57.0, 0.0, 215.0, 0.0, 85.0, 0.0]
+    base_odom_topic: "/odom"
+    base_move_service: "/base_scan_controller/move_relative"
+    base_stop_service: "/base_scan_controller/stop"
+    use_cached_multiview_box_map: false
+    cached_box_map_max_age_s: 600.0
+    cached_box_map_position_tolerance_m: 0.025
+    cached_box_map_yaw_tolerance_deg: 2.0

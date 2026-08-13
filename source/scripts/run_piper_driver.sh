@@ -10,7 +10,11 @@ piper_driver_executable="${piper_root}/install/piper/lib/piper/piper_single_ctrl
 can_port="${PIPER_CAN_PORT:-can0}"
 auto_enable="${PIPER_AUTO_ENABLE:-false}"
 gripper_exist="${PIPER_GRIPPER_EXIST:-true}"
-gripper_val_mutiple="${PIPER_GRIPPER_VAL_MUTIPLE:-2}"
+# The grasp client publishes the physical full-stroke opening in metres
+# (70 mm -> 0.070). RViz's paired finger joints use half-stroke semantics, but
+# that conversion is handled by the feedback relay and must not be applied to
+# /joint_ctrl_single commands a second time.
+gripper_val_mutiple="${PIPER_GRIPPER_VAL_MUTIPLE:-1}"
 piper_sdk_root="${PIPER_SDK_ROOT:-${bundle_root}/piper_sdk}"
 python_can_site="${PIPER_PYTHON_CAN_SITE:-}"
 
@@ -72,8 +76,9 @@ fi
 
 if [[ -z "${python_can_site}" ]]; then
   for candidate in \
-    /home/ybw/miniforge3/envs/piper/lib/python3.10/site-packages \
-    /home/ybw/miniforge3/lib/python3.12/site-packages
+    "${bundle_root}/.venv/lib/python3.10/site-packages" \
+    /usr/local/lib/python3.10/dist-packages \
+    /usr/lib/python3/dist-packages
   do
     if [[ -f "${candidate}/can/__init__.py" ]]; then
       python_can_site="${candidate}"

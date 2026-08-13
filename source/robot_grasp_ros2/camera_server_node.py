@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -46,9 +47,9 @@ class ExternalCameraBridge:
         configured = str(self._node.get_parameter("worker_python_executable").value or "").strip()
         if configured:
             return configured
-        default_conda = Path("/home/ybw/miniforge3/envs/piper/bin/python")
-        if default_conda.exists():
-            return str(default_conda)
+        worker_python = str(os.environ.get("ROBOT_GRASP_CONDA_PYTHON") or "").strip()
+        if worker_python and Path(worker_python).exists():
+            return worker_python
         return sys.executable
 
     def _worker_script(self) -> str:

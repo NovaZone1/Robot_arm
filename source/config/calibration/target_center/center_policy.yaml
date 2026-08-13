@@ -1,0 +1,37 @@
+version: 1
+calibrated_at: "2026-08-08"
+image_size: [640, 480]
+
+# Centers are segmentation-mask centroids from operator-approved standard
+# frames, not the geometric image center.
+bottle:
+  reference_center_norm: [0.598, 0.485]
+  reference_center_uv: [382.4, 232.8]
+  reference_frame: "bottle_20260808_110219/color.png"
+  measurement: "bottle_20260808_110219/target_measurement.json"
+
+block:
+  reference_center_norm: [0.606, 0.619]
+  reference_center_uv: [387.7, 297.1]
+  reference_frame: "block_20260808_110437/color.png"
+  measurement: "block_20260808_110437/target_measurement.json"
+
+# Practical acceptance band around each reference. At 640x480 this is about
+# +/-51 horizontal pixels and +/-58 vertical pixels.
+tolerance_u_norm: 0.08
+tolerance_v_norm: 0.15
+
+coarse_scan_step_m: 0.15
+fine_scan_step_m: 0.07
+
+post_grasp_target_motion:
+  enabled_for_base_scanned_catalog_targets: true
+  distance_m: 1.50
+  order: "grasp_close_and_retreat -> (base_advance || placement_observation)"
+  timeout_s: 50.0
+
+post_place_motion:
+  enabled: true
+  distance_m: 1.50
+  order: "place_release_and_retreat -> base_advance"
+  timeout_s: 50.0

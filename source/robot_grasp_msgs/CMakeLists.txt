@@ -15,13 +15,18 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   msg/Pose6D.msg
   msg/GraspCandidate.msg
   msg/GraspPlan.msg
+  msg/PlacePlan.msg
   msg/PerceptionSummary.msg
   msg/PipelineStatus.msg
   srv/CaptureScene.srv
   srv/AnalyzeScene.srv
+  srv/DetectTarget2D.srv
+  srv/MatchItemLabel.srv
   srv/GetRobotState.srv
   srv/ExecuteNamedPose.srv
   srv/ExecuteGraspPlan.srv
+  srv/ExecutePlacePlan.srv
+  srv/MoveBaseRelative.srv
   srv/StopRobot.srv
   DEPENDENCIES builtin_interfaces geometry_msgs sensor_msgs
 )

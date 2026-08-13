@@ -1,0 +1,27 @@
+{
+  "success": true,
+  "message": "waved red flag detected",
+  "elapsed_s": 2.4054843909998453,
+  "frame_index": 3,
+  "detection": {
+    "found": true,
+    "area_ratio": 0.149267578125,
+    "center_u_norm": 0.6518230018536693,
+    "center_v_norm": 0.5121686566350453,
+    "bbox_xywh": [
+      308,
+      123,
+      229,
+      245
+    ]
+  },
+  "metrics": {
+    "valid_detections": 4,
+    "x_range_norm": 0.08410599331284407,
+    "y_range_norm": 0.6736041701986077,
+    "path_length_norm": 0.9082244005760216,
+    "direction_reversals": 1,
+    "peak_area_ratio": 0.154697265625,
+    "triggered": true
+  }
+}
