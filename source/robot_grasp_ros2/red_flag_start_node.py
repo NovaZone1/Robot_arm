@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 import time
 
 import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
 
 from robot_grasp_msgs.srv import CaptureScene
 from src.perception.red_flag_signal import (
@@ -21,6 +24,10 @@ class RedFlagStartGate(Node):
     def __init__(self) -> None:
         super().__init__("red_flag_start_gate")
         self.declare_parameter("camera_capture_service", "/camera_server/capture")
+        self.declare_parameter("use_continuous_preview", True)
+        self.declare_parameter("continuous_preview_image_topic", "/camera_server/latest/color")
+        self.declare_parameter("continuous_preview_max_age_s", 0.8)
+        self.declare_parameter("continuous_preview_wait_s", 1.0)
         self.declare_parameter("timeout_s", 180.0)
         self.declare_parameter("capture_timeout_s", 8.0)
         self.declare_parameter("sample_interval_s", 0.08)
@@ -40,6 +47,27 @@ class RedFlagStartGate(Node):
             CaptureScene,
             str(self.get_parameter("camera_capture_service").value),
         )
+        self._preview_lock = threading.Lock()
+        self._preview_image: np.ndarray | None = None
+        self._preview_received_monotonic = 0.0
+        self._preview_sequence = 0
+        self._preview_subscription = self.create_subscription(
+            Image,
+            str(self.get_parameter("continuous_preview_image_topic").value),
+            self._on_preview_image,
+            qos_profile_sensor_data,
+        )
+
+    def _on_preview_image(self, message: Image) -> None:
+        try:
+            image = self._image_from_message(message).copy()
+        except Exception as exc:
+            self.get_logger().warning(f"ignoring invalid continuous preview frame: {exc}")
+            return
+        with self._preview_lock:
+            self._preview_image = image
+            self._preview_received_monotonic = time.monotonic()
+            self._preview_sequence += 1
 
     def _config(self) -> RedFlagSignalConfig:
         roi = tuple(float(value) for value in self.get_parameter("roi_norm").value)
@@ -107,8 +135,31 @@ class RedFlagStartGate(Node):
             raise RuntimeError(response.message)
         return self._image_from_message(response.color_image)
 
+    def _next_preview_image(self, after_sequence: int) -> tuple[np.ndarray | None, int]:
+        """Return one fresh camera-server preview frame, without competing for RealSense."""
+        if not bool(self.get_parameter("use_continuous_preview").value):
+            return None, after_sequence
+        deadline = time.monotonic() + max(
+            0.0, float(self.get_parameter("continuous_preview_wait_s").value)
+        )
+        max_age_s = max(0.05, float(self.get_parameter("continuous_preview_max_age_s").value))
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            with self._preview_lock:
+                image = self._preview_image
+                received = self._preview_received_monotonic
+                sequence = self._preview_sequence
+                if (
+                    image is not None
+                    and sequence > after_sequence
+                    and time.monotonic() - received <= max_age_s
+                ):
+                    return image.copy(), sequence
+        return None, after_sequence
+
     def wait(self) -> dict[str, object]:
-        if not self._capture_client.wait_for_service(timeout_sec=10.0):
+        use_preview = bool(self.get_parameter("use_continuous_preview").value)
+        if not use_preview and not self._capture_client.wait_for_service(timeout_sec=10.0):
             raise RuntimeError("/camera_server/capture is unavailable")
         config = self._config()
         tracker = RedFlagWaveTracker(config)
@@ -117,12 +168,21 @@ class RedFlagStartGate(Node):
         index = 0
         last_image = None
         last_detection = None
+        preview_sequence = 0
         started = time.monotonic()
         self.get_logger().info(
             "armed: waiting for a waved red flag; navigation remains stopped"
         )
         while rclpy.ok() and time.monotonic() < deadline:
-            image = self._capture(index)
+            image, preview_sequence = self._next_preview_image(preview_sequence)
+            if image is None:
+                # A preview can be absent during camera start-up.  Preserve the old
+                # service path as a safe fallback rather than failing the start gate.
+                if not self._capture_client.wait_for_service(timeout_sec=1.0):
+                    raise RuntimeError(
+                        "no fresh continuous preview and /camera_server/capture is unavailable"
+                    )
+                image = self._capture(index)
             detection, _mask = detect_red_flag(image, config)
             triggered = tracker.update(time.monotonic(), detection)
             last_image = image
@@ -224,4 +284,3 @@ def main(args=None) -> None:
 
 if __name__ == "__main__":
     main()
-

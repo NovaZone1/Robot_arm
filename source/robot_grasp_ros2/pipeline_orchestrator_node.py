@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import rclpy
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Image
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.exceptions import ParameterUninitializedException
@@ -39,6 +40,7 @@ from robot_grasp_ros2.distributed_utils import (
     base_to_camera_from_tcp_and_hand_eye,
     build_runtime_config,
     camera_info_to_intrinsics,
+    color_image_to_msg,
     candidate_debug_dict,
     color_msg_to_bgr,
     depth_msg_to_meters,
@@ -129,6 +131,10 @@ class PipelineOrchestratorNode(Node):
         self.create_service(Trigger, "~/reject", self._handle_reject_service)
 
         self._rpc_callback_group = ReentrantCallbackGroup()
+        self._search_preview_lock = threading.Lock()
+        self._search_preview_bgr: np.ndarray | None = None
+        self._search_preview_sequence = 0
+        self._search_preview_received_at = 0.0
         self._capture_client = self.create_client(
             CaptureScene,
             self._service_name("camera_capture_service"),
@@ -196,6 +202,13 @@ class PipelineOrchestratorNode(Node):
             20,
             callback_group=self._rpc_callback_group,
         )
+        self.create_subscription(
+            Image,
+            str(self.get_parameter("continuous_search_image_topic").value),
+            self._handle_search_preview,
+            5,
+            callback_group=self._rpc_callback_group,
+        )
 
         self._run_lock = threading.Lock()
         self._run_thread: threading.Thread | None = None
@@ -228,6 +241,18 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("pointcloud_filter_mode", "bilateral")
         self.declare_parameter("pointcloud_backend", "sdk")
         self.declare_parameter("depth_fusion_frames", 8)
+        # Search phases only need a current RGB image.  Reserve the full
+        # multi-frame depth fusion for the stopped, final grasp/placement
+        # validation frame.
+        self.declare_parameter("search_depth_fusion_frames", 1)
+        self.declare_parameter("continuous_search_enabled", True)
+        self.declare_parameter(
+            "continuous_search_image_topic", "/camera_server/latest/color"
+        )
+        self.declare_parameter("continuous_search_preview_max_age_s", 0.8)
+        self.declare_parameter("continuous_search_preview_wait_s", 1.2)
+        self.declare_parameter("continuous_search_stop_on_center", True)
+        self.declare_parameter("continuous_search_poll_s", 0.08)
         self.declare_parameter("speed", 40)
         self.declare_parameter("observation_speed", 10)
         self.declare_parameter("graspnet_checkpoint", "checkpoint.tar")
@@ -264,6 +289,14 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("target_card_capture_frames", 3)
         self.declare_parameter("target_card_consensus_frames", 2)
         self.declare_parameter("target_card_capture_interval_s", 0.15)
+        # If the arm observation pose is slightly behind the printed target
+        # card, let Scout make a short, slow forward search instead of
+        # repeatedly analyzing the same empty view.
+        self.declare_parameter("target_card_base_search_enabled", False)
+        self.declare_parameter("target_card_base_search_step_m", 0.07)
+        self.declare_parameter("target_card_base_search_max_travel_m", 0.35)
+        self.declare_parameter("target_card_base_search_speed_mps", 0.03)
+        self.declare_parameter("target_card_base_search_timeout_s", 18.0)
         self.declare_parameter("observe_pose", [30.0, 0.0, 400.0, 0.0, 120.0, 0.0])
         self.declare_parameter("placement_observe_pose", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter(
@@ -272,6 +305,10 @@ class PipelineOrchestratorNode(Node):
         )
         self.declare_parameter("label_search_roi_norm", [0.0, 0.0, 1.0, 1.0])
         self.declare_parameter("label_match_threshold", 0.42)
+        # The six box labels are printed catalog images.  Keep generic HSV
+        # color/shape markers disabled by default: ground shadows, reflections
+        # and a held blue block must not be sufficient to stop the base scan.
+        self.declare_parameter("label_marker_detection_enabled", False)
         self.declare_parameter("camera_capture_service", "/camera_server/capture")
         self.declare_parameter("vision_analyze_service", "/vision_worker/analyze")
         self.declare_parameter(
@@ -339,6 +376,81 @@ class PipelineOrchestratorNode(Node):
                 float(yaw),
                 time.monotonic(),
             )
+
+    def _handle_search_preview(self, message: Image) -> None:
+        try:
+            image = color_msg_to_bgr(message).copy()
+        except Exception as exc:
+            self.get_logger().warning(f"continuous search preview ignored: {exc}")
+            return
+        with self._search_preview_lock:
+            self._search_preview_bgr = image
+            self._search_preview_sequence += 1
+            self._search_preview_received_at = time.monotonic()
+
+    def _wait_for_search_preview(
+        self,
+        *,
+        after_sequence: int = -1,
+        wait_s: float | None = None,
+    ) -> tuple[np.ndarray, int] | None:
+        if not bool(self.get_parameter("continuous_search_enabled").value):
+            return None
+        deadline = time.monotonic() + max(
+            0.0,
+            float(self.get_parameter("continuous_search_preview_wait_s").value)
+            if wait_s is None
+            else float(wait_s),
+        )
+        maximum_age = max(
+            0.05,
+            float(self.get_parameter("continuous_search_preview_max_age_s").value),
+        )
+        while time.monotonic() <= deadline:
+            with self._search_preview_lock:
+                image = self._search_preview_bgr
+                sequence = self._search_preview_sequence
+                age = time.monotonic() - self._search_preview_received_at
+                if (
+                    image is not None
+                    and sequence > after_sequence
+                    and age <= maximum_age
+                ):
+                    return image.copy(), sequence
+            time.sleep(0.02)
+        return None
+
+    def _detect_target_2d_from_preview(
+        self,
+        *,
+        run_id: str,
+        prompt: str,
+        after_sequence: int = -1,
+        wait_s: float | None = None,
+    ) -> tuple[object, int] | None:
+        preview = self._wait_for_search_preview(
+            after_sequence=after_sequence,
+            wait_s=wait_s,
+        )
+        if preview is None:
+            return None
+        preview_bgr, preview_sequence = preview
+        request = DetectTarget2D.Request()
+        request.run_id = run_id
+        request.prompt = prompt
+        request.color_image = color_image_to_msg(
+            preview_bgr,
+            frame_id="camera_color_optical_frame",
+            stamp=self.get_clock().now().to_msg(),
+        )
+        response = self._call_client(
+            self._detect_target_2d_client,
+            request,
+            timeout_s=30.0,
+        )
+        if not response.success:
+            raise RuntimeError(response.message)
+        return response, int(preview_sequence)
 
     def _base_odom_snapshot(self) -> tuple[float, float, float]:
         with self._base_odom_lock:
@@ -789,7 +901,7 @@ class PipelineOrchestratorNode(Node):
             "rejected_frames": rejected_frames,
         }
 
-    def _identify_target_card(self, *, run_id: str) -> tuple[object, dict[str, object]]:
+    def _identify_target_card_once(self, *, run_id: str) -> tuple[object, dict[str, object]]:
         self._publish_status(f"identifying_target_card: run_id={run_id}")
         roi_values = tuple(
             float(value)
@@ -818,12 +930,24 @@ class PipelineOrchestratorNode(Node):
         frame_images: list[np.ndarray] = []
         frame_overlays: list[np.ndarray] = []
         search_roi: tuple[int, int, int, int] | None = None
+        last_preview_sequence = -1
         for frame_index in range(capture_frames):
-            capture = self._capture_scene_once(
-                run_id=run_id,
-                phase_label=f"target_card_{frame_index:02d}",
+            preview = self._wait_for_search_preview(
+                after_sequence=last_preview_sequence
             )
-            image = color_msg_to_bgr(capture.color_image)
+            if preview is not None:
+                image, last_preview_sequence = preview
+                scene_id = f"continuous-preview-{last_preview_sequence}"
+            else:
+                capture = self._capture_scene_once(
+                    run_id=run_id,
+                    phase_label=f"target_card_{frame_index:02d}",
+                    depth_fusion_frames=int(
+                        self.get_parameter("search_depth_fusion_frames").value
+                    ),
+                )
+                image = color_msg_to_bgr(capture.color_image)
+                scene_id = str(capture.scene_id)
             detections, current_search_roi = self._target_card_matcher().match_all(
                 image,
                 roi_norm=roi_values,
@@ -870,7 +994,7 @@ class PipelineOrchestratorNode(Node):
             frame_records.append(
                 {
                     "frame_index": frame_index,
-                    "scene_id": str(capture.scene_id),
+                    "scene_id": scene_id,
                     "detections": [
                         {
                             "item_id": detection.item_id,
@@ -888,6 +1012,29 @@ class PipelineOrchestratorNode(Node):
                     "overlay_path": str(frame_overlay_path),
                 }
             )
+
+            # The normal policy is two matching, high-confidence photographs
+            # out of at most three.  Do not incur a third camera transaction
+            # once that policy has already been satisfied; retain the third
+            # frame only as a tie/noise fallback.
+            if len(frame_detections) >= consensus_frames:
+                try:
+                    self._select_target_card_consensus(
+                        frame_detections,
+                        minimum_confidence=float(
+                            self.get_parameter("target_card_min_confidence").value
+                        ),
+                        minimum_margin=float(
+                            self.get_parameter("target_card_min_margin").value
+                        ),
+                        minimum_votes=consensus_frames,
+                    )
+                except RuntimeError:
+                    # A third frame may still resolve a weak or conflicting
+                    # result, so continue until the configured maximum.
+                    pass
+                else:
+                    break
             if frame_index + 1 < capture_frames and capture_interval_s > 0.0:
                 time.sleep(capture_interval_s)
 
@@ -935,6 +1082,95 @@ class PipelineOrchestratorNode(Node):
             f"confidence={float(selected.confidence):.3f}"
         )
         return item, payload
+
+    def _probe_target_card_preview(self, *, after_sequence: int, wait_s: float):
+        """Return catalog-photo detections from one fresh live preview frame."""
+        preview = self._wait_for_search_preview(
+            after_sequence=after_sequence,
+            wait_s=wait_s,
+        )
+        if preview is None:
+            return None
+        image, sequence = preview
+        roi_values = tuple(
+            float(value)
+            for value in list(self.get_parameter("target_card_search_roi_norm").value or [])
+        )
+        detections, _roi = self._target_card_matcher().match_all(
+            image,
+            roi_norm=roi_values,
+            threshold=float(self.get_parameter("target_card_match_threshold").value),
+            marker_detection_enabled=False,
+        )
+        return tuple(detections), sequence
+
+    def _identify_target_card(self, *, run_id: str) -> tuple[object, dict[str, object]]:
+        """Identify the card, advancing Scout slowly if it is initially out of view."""
+        try:
+            return self._identify_target_card_once(run_id=run_id)
+        except RuntimeError as initial_error:
+            if not bool(self.get_parameter("target_card_base_search_enabled").value):
+                raise
+            failures = [str(initial_error)]
+
+        step_m = max(0.01, float(self.get_parameter("target_card_base_search_step_m").value))
+        max_travel_m = max(0.0, float(self.get_parameter("target_card_base_search_max_travel_m").value))
+        speed_mps = max(0.01, float(self.get_parameter("target_card_base_search_speed_mps").value))
+        timeout_s = max(3.0, float(self.get_parameter("target_card_base_search_timeout_s").value))
+        traveled_m = 0.0
+        commanded_m = 0.0
+        movements: list[dict[str, object]] = []
+        self._publish_status(
+            f"target_card_not_visible: run_id={run_id}; "
+            f"slow_forward_search max={max_travel_m:.2f}m speed={speed_mps:.2f}m/s"
+        )
+
+        while commanded_m + 1e-6 < max_travel_m:
+            segment_m = min(step_m, max_travel_m - commanded_m)
+            trigger = None
+            if bool(self.get_parameter("continuous_search_enabled").value):
+                movement, trigger = self._move_base_for_scan_until_preview_trigger(
+                    segment_m,
+                    run_id=run_id,
+                    preview_probe=self._probe_target_card_preview,
+                    should_stop=lambda detections: bool(detections),
+                    timeout_s=timeout_s,
+                    speed_mps=speed_mps,
+                )
+            else:
+                movement = self._move_base_for_scan(
+                    segment_m, timeout_s=timeout_s, speed_mps=speed_mps
+                )
+            movements.append(dict(movement))
+            traveled_m += max(0.0, float(movement.get("traveled_m", segment_m)))
+            # A visual early-stop can legitimately report zero odometry travel.
+            # Count the bounded command budget separately so an ambiguous card
+            # cannot cause an endless stop/retry loop at one physical position.
+            commanded_m += segment_m
+            time.sleep(max(0.0, float(self.get_parameter("base_multiview_settle_s").value)))
+            try:
+                item, payload = self._identify_target_card_once(run_id=run_id)
+            except RuntimeError as error:
+                failures.append(str(error))
+                continue
+            payload["base_target_card_search"] = {
+                "enabled": True,
+                "max_travel_m": max_travel_m,
+                "speed_mps": speed_mps,
+                "traveled_m": traveled_m,
+                "commanded_search_m": commanded_m,
+                "stopped_by_preview": bool(
+                    trigger is not None
+                    or any(bool(record.get("stopped_by_continuous_preview")) for record in movements)
+                ),
+                "moves": movements,
+            }
+            return item, payload
+
+        raise RuntimeError(
+            "target card not recognized after low-speed forward search "
+            f"({traveled_m:.2f}m/{max_travel_m:.2f}m): {failures[-1]}"
+        )
 
     def _set_executor_strategy_for_item(self, item) -> str:
         strategy = "safe_top_down" if str(item.kind) == "block" else "center_horizontal"
@@ -1073,11 +1309,24 @@ class PipelineOrchestratorNode(Node):
             "base_to_camera": base_to_camera,
         }
 
-    def _capture_scene_once(self, *, run_id: str, phase_label: str):
+    def _capture_scene_once(
+        self,
+        *,
+        run_id: str,
+        phase_label: str,
+        depth_fusion_frames: int | None = None,
+    ):
         self._publish_status(f"capturing_scene: run_id={run_id} phase={phase_label}")
         capture_req = CaptureScene.Request()
         capture_req.run_id = run_id
-        capture_req.depth_fusion_frames = int(self.get_parameter("depth_fusion_frames").value)
+        capture_req.depth_fusion_frames = max(
+            1,
+            int(
+                self.get_parameter("depth_fusion_frames").value
+                if depth_fusion_frames is None
+                else depth_fusion_frames
+            ),
+        )
         capture_req.pointcloud_filter_mode = str(self.get_parameter("pointcloud_filter_mode").value)
         capture_req.pointcloud_backend = str(self.get_parameter("pointcloud_backend").value)
         capture_response = self._call_client(self._capture_client, capture_req, timeout_s=30.0)
@@ -1115,7 +1364,14 @@ class PipelineOrchestratorNode(Node):
                     for value in list(self.get_parameter("label_search_roi_norm").value or [])
                 ],
                 "label_match_threshold": float(self.get_parameter("label_match_threshold").value),
+                "label_marker_detection_enabled": bool(
+                    self.get_parameter("label_marker_detection_enabled").value
+                ),
                 "table_z_m": float(self.get_parameter("table_z_m").value),
+                # Target-alignment scans only need the photograph label and
+                # its pixel center.  Avoid expensive transparent-box depth
+                # localization until an actual placement plan needs it.
+                "localize_box_row": bool(require_complete),
             }
         )
         response = self._call_client(self._match_label_client, request, timeout_s=30.0)
@@ -1158,6 +1414,81 @@ class PipelineOrchestratorNode(Node):
                 f"box label verification failed for {item_id}: {response.message}"
             )
         return payload
+
+    def _match_box_label_from_preview(
+        self,
+        *,
+        run_id: str,
+        item_id: str,
+        after_sequence: int = -1,
+        wait_s: float | None = None,
+    ) -> tuple[dict[str, object], np.ndarray, int] | None:
+        """Match a target box label from RGB preview without depth localization."""
+        preview = self._wait_for_search_preview(
+            after_sequence=after_sequence,
+            wait_s=wait_s,
+        )
+        if preview is None:
+            return None
+        color_bgr, preview_sequence = preview
+        request = MatchItemLabel.Request()
+        request.run_id = run_id
+        request.scene_id = f"continuous-preview-{preview_sequence}"
+        request.expected_item_id = item_id
+        request.color_image = color_image_to_msg(
+            color_bgr,
+            frame_id="camera_color_optical_frame",
+            stamp=self.get_clock().now().to_msg(),
+        )
+        request.options_json = json_dumps(
+            {
+                "label_search_roi_norm": [
+                    float(value)
+                    for value in list(
+                        self.get_parameter("label_search_roi_norm").value or []
+                    )
+                ],
+                "label_match_threshold": float(
+                    self.get_parameter("label_match_threshold").value
+                ),
+                "label_marker_detection_enabled": bool(
+                    self.get_parameter("label_marker_detection_enabled").value
+                ),
+                "localize_box_row": False,
+            }
+        )
+        response = self._call_client(
+            self._match_label_client,
+            request,
+            timeout_s=30.0,
+        )
+        payload = {
+            "success": bool(response.success),
+            "message": str(response.message),
+            "expected_item_id": item_id,
+            "matched_item_id": str(response.matched_item_id or ""),
+            "confidence": float(response.confidence),
+            "slot_index": int(response.slot_index),
+            "detected_label_count": int(response.detected_label_count),
+            "has_box_center": False,
+            "box_center_base_m": [0.0, 0.0, 0.0],
+            "bbox_xywh": [
+                int(response.bbox_x),
+                int(response.bbox_y),
+                int(response.bbox_width),
+                int(response.bbox_height),
+            ],
+            "diagnostics": (
+                json.loads(response.diagnostics_json)
+                if str(response.diagnostics_json or "").strip()
+                else {}
+            ),
+            "complete": False,
+            "source": "continuous_preview",
+            "color_width": int(color_bgr.shape[1]),
+            "color_height": int(color_bgr.shape[0]),
+        }
+        return payload, color_bgr, int(preview_sequence)
 
     @staticmethod
     def _pose6d_from_mm_deg(values: tuple[float, float, float, float, float, float]):
@@ -1721,15 +2052,37 @@ class PipelineOrchestratorNode(Node):
         prompt: str,
         hand_eye: np.ndarray,
         phase_label: str,
+        depth_fusion_frames: int | None = None,
     ) -> dict[str, object]:
         """Capture one scan view and run only inexpensive 2-D target detection."""
         self._publish_status(
             f"reading_robot_state: run_id={run_id} phase={phase_label}"
         )
+        # During base search, use the current preview frame first.  It is
+        # intentionally RGB-only: a centered preview is always re-captured
+        # with full fused depth before GraspNet is called.
+        if depth_fusion_frames is None:
+            preview_detection = self._detect_target_2d_from_preview(
+                run_id=run_id,
+                prompt=prompt,
+            )
+            if preview_detection is not None:
+                response, preview_sequence = preview_detection
+                return {
+                    "state_snapshot": None,
+                    "capture_response": None,
+                    "detection_response": response,
+                    "preview_sequence": int(preview_sequence),
+                }
         state_snapshot = self._read_robot_state_snapshot(hand_eye=hand_eye)
         capture_response = self._capture_scene_once(
             run_id=run_id,
             phase_label=phase_label,
+            depth_fusion_frames=int(
+                self.get_parameter("search_depth_fusion_frames").value
+                if depth_fusion_frames is None
+                else depth_fusion_frames
+            ),
         )
         request = DetectTarget2D.Request()
         request.run_id = run_id
@@ -2184,6 +2537,96 @@ class PipelineOrchestratorNode(Node):
             raise RuntimeError(f"Scout scan move failed: {response.message}")
         return payload
 
+    def _move_base_for_scan_until_preview_trigger(
+        self,
+        distance_m: float,
+        *,
+        run_id: str,
+        preview_probe,
+        should_stop,
+        timeout_s: float | None = None,
+        speed_mps: float | None = None,
+    ) -> tuple[dict[str, object], object | None]:
+        """Move one bounded scan segment and stop early on a live RGB trigger.
+
+        The Scout controller remains responsible for odometry, drift, yaw and
+        emergency-stop checks.  This method only adds a visual stop request;
+        the returned trigger is always re-checked from a stopped full RGB-D
+        capture before any grasp is executed.
+        """
+        request = MoveBaseRelative.Request()
+        request.distance_m = float(distance_m)
+        request.speed_mps = float(
+            speed_mps
+            if speed_mps is not None
+            else self.get_parameter("base_multiview_speed_mps").value
+        )
+        request.timeout_s = float(
+            timeout_s
+            if timeout_s is not None
+            else self.get_parameter("base_multiview_move_timeout_s").value
+        )
+        self._wait_for_client(self._move_base_client, timeout_s=5.0)
+        future = self._move_base_client.call_async(request)
+        deadline = time.monotonic() + float(request.timeout_s) + 3.0
+        preview_sequence = -1
+        trigger = None
+        while rclpy.ok() and not future.done() and time.monotonic() < deadline:
+            if self._stop_requested:
+                self._request_base_scan_stop()
+                raise RuntimeError("orchestrator stop requested")
+            preview_detection = preview_probe(
+                after_sequence=preview_sequence,
+                wait_s=min(
+                    0.10,
+                    max(
+                        0.02,
+                        float(
+                            self.get_parameter(
+                                "continuous_search_poll_s"
+                            ).value
+                        ),
+                    ),
+                ),
+            )
+            if preview_detection is None:
+                continue
+            detection, preview_sequence = preview_detection
+            if bool(should_stop(detection)):
+                trigger = detection
+                self._publish_status(
+                    f"continuous_search_trigger: run_id={run_id} "
+                    f"distance={float(distance_m):.3f}m"
+                )
+                self._request_base_scan_stop()
+                break
+
+        if trigger is not None:
+            stop_deadline = time.monotonic() + 4.0
+            while not future.done() and time.monotonic() < stop_deadline:
+                time.sleep(0.02)
+        if not future.done():
+            self._request_base_scan_stop()
+            raise TimeoutError("Scout continuous scan move did not complete")
+        if future.cancelled():
+            raise RuntimeError("Scout continuous scan move was cancelled")
+        exception = future.exception()
+        if exception is not None:
+            raise exception
+        response = future.result()
+        payload = {
+            "success": bool(response.success) or trigger is not None,
+            "message": str(response.message),
+            "requested_distance_m": float(distance_m),
+            "traveled_m": float(response.traveled_m),
+            "lateral_error_m": float(response.lateral_error_m),
+            "yaw_error_deg": float(response.yaw_error_deg),
+            "stopped_by_continuous_preview": trigger is not None,
+        }
+        if not response.success and trigger is None:
+            raise RuntimeError(f"Scout scan move failed: {response.message}")
+        return payload, trigger
+
     def _request_base_scan_stop(self) -> None:
         try:
             self._call_client(
@@ -2308,6 +2751,33 @@ class PipelineOrchestratorNode(Node):
         if fine_step_m <= 0.01:
             raise RuntimeError("base_target_fine_step_m must be greater than 0.01")
 
+        def detection_metrics(detection):
+            center_norm = (
+                (float(detection.center_u_norm), float(detection.center_v_norm))
+                if bool(detection.found)
+                else None
+            )
+            center_error_u = (
+                abs(center_norm[0] - center_reference[0])
+                if center_norm is not None
+                else None
+            )
+            center_error_v = (
+                abs(center_norm[1] - center_reference[1])
+                if center_norm is not None
+                else None
+            )
+            centered = bool(
+                bool(detection.found)
+                and center_error_u is not None
+                and center_error_v is not None
+                and math.isfinite(center_error_u)
+                and math.isfinite(center_error_v)
+                and center_error_u <= center_tolerance_u
+                and center_error_v <= center_tolerance_v
+            )
+            return center_norm, center_error_u, center_error_v, centered
+
         scan_id = f"grasp-single-pass-{int(time.time() * 1000)}"
         views: list[dict[str, object]] = []
         movements: list[dict[str, object]] = []
@@ -2316,6 +2786,7 @@ class PipelineOrchestratorNode(Node):
         last_cycle: dict[str, object] | None = None
         last_captured: dict[str, object] | None = None
         last_phase_label = "grasp_scan_start"
+        force_full_confirmation = False
         self._publish_status(
             f"scanning_grasp_target: run_id={run_id} item={target_item_id}"
         )
@@ -2328,40 +2799,47 @@ class PipelineOrchestratorNode(Node):
                     prompt=prompt,
                     hand_eye=hand_eye,
                     phase_label=phase_label,
+                    depth_fusion_frames=(
+                        int(self.get_parameter("depth_fusion_frames").value)
+                        if force_full_confirmation
+                        else None
+                    ),
                 )
+                force_full_confirmation = False
                 last_captured = captured
                 last_phase_label = phase_label
                 detection = captured["detection_response"]
-                center_norm = (
-                    (
-                        float(detection.center_u_norm),
-                        float(detection.center_v_norm),
-                    )
-                    if bool(detection.found)
-                    else None
-                )
-                center_error_u = (
-                    abs(center_norm[0] - center_reference[0])
-                    if center_norm is not None
-                    else None
-                )
-                center_error_v = (
-                    abs(center_norm[1] - center_reference[1])
-                    if center_norm is not None
-                    else None
-                )
-                detection_centered = bool(
-                    bool(detection.found)
-                    and center_error_u is not None
-                    and center_error_v is not None
-                    and math.isfinite(center_error_u)
-                    and math.isfinite(center_error_v)
-                    and center_error_u <= center_tolerance_u
-                    and center_error_v <= center_tolerance_v
-                )
+                (
+                    center_norm,
+                    center_error_u,
+                    center_error_v,
+                    detection_centered,
+                ) = detection_metrics(detection)
                 cycle = None
                 candidates: list[object] = []
                 target_centered = False
+                if detection_centered:
+                    # Search used one fast depth frame.  Before committing to
+                    # a grasp, take a fresh full-fusion frame while stopped
+                    # and verify the object is still in the calibrated window.
+                    captured = self._capture_detect_target_2d(
+                        run_id=run_id,
+                        prompt=prompt,
+                        hand_eye=hand_eye,
+                        phase_label=f"{phase_label}_final",
+                        depth_fusion_frames=int(
+                            self.get_parameter("depth_fusion_frames").value
+                        ),
+                    )
+                    last_captured = captured
+                    last_phase_label = f"{phase_label}_final"
+                    detection = captured["detection_response"]
+                    (
+                        center_norm,
+                        center_error_u,
+                        center_error_v,
+                        detection_centered,
+                    ) = detection_metrics(detection)
                 if detection_centered:
                     cycle = self._analyze_captured_cycle(
                         run_id=run_id,
@@ -2399,9 +2877,15 @@ class PipelineOrchestratorNode(Node):
                     {
                         "view_name": view_name,
                         "offset_from_start_m": float(current_offset),
-                        "scene_id": str(captured["capture_response"].scene_id),
-                        "capture": self._capture_debug_dict(
-                            captured["capture_response"]
+                        "scene_id": (
+                            str(captured["capture_response"].scene_id)
+                            if captured.get("capture_response") is not None
+                            else f"continuous-preview-{captured.get('preview_sequence', -1)}"
+                        ),
+                        "capture": (
+                            self._capture_debug_dict(captured["capture_response"])
+                            if captured.get("capture_response") is not None
+                            else {"source": "continuous_preview"}
                         ),
                         "target_detection_2d": {
                             "found": bool(detection.found),
@@ -2435,7 +2919,26 @@ class PipelineOrchestratorNode(Node):
                     and center_norm is not None
                 )
                 next_step_m = fine_step_m if target_seen else step_m
-                movement = self._move_base_for_scan(min(next_step_m, remaining))
+                if bool(
+                    self.get_parameter("continuous_search_stop_on_center").value
+                ) and bool(self.get_parameter("continuous_search_enabled").value):
+                    movement, trigger = self._move_base_for_scan_until_preview_trigger(
+                        min(next_step_m, remaining),
+                        run_id=run_id,
+                        preview_probe=lambda **kwargs: self._detect_target_2d_from_preview(
+                            run_id=run_id,
+                            prompt=prompt,
+                            **kwargs,
+                        ),
+                        should_stop=lambda preview_detection: detection_metrics(
+                            preview_detection
+                        )[3],
+                    )
+                    force_full_confirmation = trigger is not None
+                else:
+                    movement = self._move_base_for_scan(
+                        min(next_step_m, remaining)
+                    )
                 current_offset += float(movement["traveled_m"])
                 movement["offset_after_move_m"] = float(current_offset)
                 movements.append(movement)
@@ -2471,6 +2974,16 @@ class PipelineOrchestratorNode(Node):
             # Preserve the old failure diagnostics while avoiding GraspNet on
             # every search frame: analyze only the final view if no centered
             # target ever triggered a full analysis.
+            if last_captured.get("capture_response") is None:
+                last_captured = self._capture_detect_target_2d(
+                    run_id=run_id,
+                    prompt=prompt,
+                    hand_eye=hand_eye,
+                    phase_label=f"{last_phase_label}_final_diagnostic",
+                    depth_fusion_frames=int(
+                        self.get_parameter("depth_fusion_frames").value
+                    ),
+                )
             last_cycle = self._analyze_captured_cycle(
                 run_id=run_id,
                 prompt=prompt,
@@ -2526,9 +3039,41 @@ class PipelineOrchestratorNode(Node):
         base_to_camera: np.ndarray,
         output_dir: Path,
     ) -> dict[str, object]:
+        preview_match = self._match_box_label_from_preview(
+            run_id=f"{scan_id}-{view_name}",
+            item_id=item_id,
+        )
+        if preview_match is not None:
+            label, color, preview_sequence = preview_match
+            image_names = {
+                "color": f"{view_name}_color.png",
+                "overlay": f"{view_name}_overlay.png",
+            }
+            for name, image in (
+                ("color", color),
+                ("overlay", self._label_overlay(color, label)),
+            ):
+                path = output_dir / image_names[name]
+                if not cv2.imwrite(str(path), image):
+                    raise RuntimeError(f"failed to write placement scan image: {path}")
+            return {
+                "view_name": view_name,
+                "offset_from_start_m": float(offset_from_start_m),
+                "capture": {
+                    "source": "continuous_preview",
+                    "scene_id": f"continuous-preview-{preview_sequence}",
+                    "color_width": int(color.shape[1]),
+                    "color_height": int(color.shape[0]),
+                },
+                "label_match": label,
+                "images": image_names,
+            }
         capture = self._capture_scene_once(
             run_id=f"{scan_id}-{view_name}",
             phase_label=f"placement_scan_{view_name}",
+            depth_fusion_frames=int(
+                self.get_parameter("search_depth_fusion_frames").value
+            ),
         )
         label = self._match_box_label_once(
             run_id=f"{scan_id}-{view_name}",
@@ -3341,6 +3886,36 @@ class PipelineOrchestratorNode(Node):
             if step_m <= 0.01 or fine_step_m <= 0.01:
                 raise RuntimeError("base_multiview_offset_m must be greater than 0.01")
 
+            def label_center_error(label: dict[str, object]) -> float:
+                bbox = list(label.get("bbox_xywh") or [])
+                width = float(label.get("color_width") or 0.0)
+                if len(bbox) != 4 or width <= 1.0:
+                    return float("inf")
+                return abs(
+                    (float(bbox[0]) + (0.5 * float(bbox[2]))) / width - 0.5
+                )
+
+            def label_is_centered(label: dict[str, object]) -> bool:
+                center_error = label_center_error(label)
+                return bool(
+                    str(label.get("matched_item_id") or "") == item.item_id
+                    and float(label.get("confidence") or 0.0)
+                    >= float(self.get_parameter("label_match_threshold").value)
+                    and math.isfinite(center_error)
+                    and center_error <= center_limit
+                )
+
+            def preview_label_probe(**kwargs):
+                matched = self._match_box_label_from_preview(
+                    run_id=scan_id,
+                    item_id=item.item_id,
+                    **kwargs,
+                )
+                if matched is None:
+                    return None
+                label, _color, sequence = matched
+                return label, sequence
+
             selected_view: dict[str, object] | None = None
             for view_index in range(max_views):
                 view_name = "start" if view_index == 0 else f"forward_{view_index:02d}"
@@ -3354,22 +3929,11 @@ class PipelineOrchestratorNode(Node):
                 )
                 label = dict(view.get("label_match") or {})
                 capture = dict(view.get("capture") or {})
-                bbox = list(label.get("bbox_xywh") or [])
-                width = float(capture.get("color_width") or 0.0)
-                center_error_norm = float("inf")
-                if len(bbox) == 4 and width > 1.0:
-                    center_error_norm = abs(
-                        (float(bbox[0]) + (0.5 * float(bbox[2]))) / width
-                        - 0.5
-                    )
+                if not label.get("color_width"):
+                    label["color_width"] = float(capture.get("color_width") or 0.0)
+                center_error_norm = label_center_error(label)
                 label["center_error_norm"] = center_error_norm
-                label["centered"] = bool(
-                    str(label.get("matched_item_id") or "") == item.item_id
-                    and float(label.get("confidence") or 0.0)
-                    >= float(self.get_parameter("label_match_threshold").value)
-                    and math.isfinite(center_error_norm)
-                    and center_error_norm <= center_limit
-                )
+                label["centered"] = label_is_centered(label)
                 view["label_match"] = label
                 views.append(view)
                 if bool(label["centered"]):
@@ -3385,7 +3949,19 @@ class PipelineOrchestratorNode(Node):
                     and math.isfinite(center_error_norm)
                 )
                 next_step_m = fine_step_m if target_seen else step_m
-                movement = self._move_base_for_scan(min(next_step_m, remaining))
+                if bool(
+                    self.get_parameter("continuous_search_stop_on_center").value
+                ) and bool(self.get_parameter("continuous_search_enabled").value):
+                    movement, _trigger = self._move_base_for_scan_until_preview_trigger(
+                        min(next_step_m, remaining),
+                        run_id=scan_id,
+                        preview_probe=preview_label_probe,
+                        should_stop=label_is_centered,
+                    )
+                else:
+                    movement = self._move_base_for_scan(
+                        min(next_step_m, remaining)
+                    )
                 current_offset += float(movement["traveled_m"])
                 movement["offset_after_move_m"] = float(current_offset)
                 movements.append(movement)

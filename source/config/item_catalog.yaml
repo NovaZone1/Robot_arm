@@ -2,7 +2,8 @@ schema_version: 1
 
 # All competition boxes have the same measured outer size. Labels are mounted
 # on the rear vertical wall. Box order changes between runs, so these six slots
-# are calibrated left-to-right as seen from placement_observe_pose; vision maps
+# are calibrated left-to-right as seen from the active right-side
+# placement_observe_pose; vision maps
 # each detected label to one slot dynamically.
 box:
   outer_size_m: [0.180, 0.132, 0.087]
@@ -36,11 +37,14 @@ items:
     placement:
       enabled: false
       # Base alignment puts every target box in the same arm-relative pose.
+      # Active path is the right-side mirror of the 2026-07-31 left-side
+      # calibration. Piper's calibrated Cartesian convention mirrors Y and
+      # yaw; roll is retained (matching the verified observation profiles).
       base_aligned_enabled: true
       # Keep the forward extension above the box rim; descend only after alignment.
-      base_aligned_approach_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
-      base_aligned_release_pose_mm_deg: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
-      base_aligned_retreat_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_approach_pose_mm_deg: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
+      base_aligned_release_pose_mm_deg: [-22.262, -283.822, 307.657, 85.074, 87.787, -179.697]
+      base_aligned_retreat_pose_mm_deg: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
       release_offset_mm: [0.0, 0.0, 0.0]
       release_rpy_deg: []
       approach_height_mm: 120.0
@@ -56,9 +60,9 @@ items:
     placement:
       enabled: false
       base_aligned_enabled: true
-      base_aligned_approach_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
-      base_aligned_release_pose_mm_deg: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
-      base_aligned_retreat_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_approach_pose_mm_deg: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
+      base_aligned_release_pose_mm_deg: [-22.262, -283.822, 307.657, 85.074, 87.787, -179.697]
+      base_aligned_retreat_pose_mm_deg: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
       release_offset_mm: [0.0, 0.0, 0.0]
       release_rpy_deg: []
       approach_height_mm: 120.0
@@ -74,16 +78,17 @@ items:
     placement:
       enabled: false
       base_aligned_enabled: true
-      # Calibrated 2026-07-31. After Scout aligns any target label, every box
+      # Mirrored for the active right-side setup from the 2026-07-31 left-side
+      # calibration. After Scout aligns any target label, every box
       # shares this same arm-relative TCP path. It enters from Z=491.1 mm,
       # above the box rim, then descends vertically to release. The generic
       # depth-derived path remains independently locked.
       base_aligned_approach_pose_mm_deg:
-        [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+        [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
       base_aligned_release_pose_mm_deg:
-        [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
+        [-22.262, -283.822, 307.657, 85.074, 87.787, -179.697]
       base_aligned_retreat_pose_mm_deg:
-        [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+        [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
       release_offset_mm: [0.0, 0.0, 0.0]
       release_rpy_deg: []
       approach_height_mm: 120.0
@@ -99,9 +104,9 @@ items:
     placement:
       enabled: false
       base_aligned_enabled: true
-      base_aligned_approach_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
-      base_aligned_release_pose_mm_deg: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
-      base_aligned_retreat_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_approach_pose_mm_deg: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
+      base_aligned_release_pose_mm_deg: [-22.262, -283.822, 307.657, 85.074, 87.787, -179.697]
+      base_aligned_retreat_pose_mm_deg: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
       release_offset_mm: [0.0, 0.0, 0.0]
       release_rpy_deg: []
       approach_height_mm: 140.0
@@ -117,9 +122,9 @@ items:
     placement:
       enabled: false
       base_aligned_enabled: true
-      base_aligned_approach_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
-      base_aligned_release_pose_mm_deg: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
-      base_aligned_retreat_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_approach_pose_mm_deg: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
+      base_aligned_release_pose_mm_deg: [-22.262, -283.822, 307.657, 85.074, 87.787, -179.697]
+      base_aligned_retreat_pose_mm_deg: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
       release_offset_mm: [0.0, 0.0, 0.0]
       release_rpy_deg: []
       approach_height_mm: 140.0
@@ -135,9 +140,9 @@ items:
     placement:
       enabled: false
       base_aligned_enabled: true
-      base_aligned_approach_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
-      base_aligned_release_pose_mm_deg: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
-      base_aligned_retreat_pose_mm_deg: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+      base_aligned_approach_pose_mm_deg: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
+      base_aligned_release_pose_mm_deg: [-22.262, -283.822, 307.657, 85.074, 87.787, -179.697]
+      base_aligned_retreat_pose_mm_deg: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
       release_offset_mm: [0.0, 0.0, 0.0]
       release_rpy_deg: []
       approach_height_mm: 140.0

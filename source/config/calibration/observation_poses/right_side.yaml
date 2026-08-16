@@ -1,8 +1,7 @@
-# Preserved calibrated observation profile: work table on the Piper arm's right side.
-# This was the active profile from 2026-08-09 until 2026-08-12.
+# Active calibrated observation profile: work table on the Piper arm's right side.
 # Units: Cartesian poses are [x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg].
 profile: right_side
-preserved_at: "2026-08-12"
+active_from: "2026-08-15"
 grasp_observe_pose: [0.0, -35.5, 491.1, 180.0, 67.77, 89.97]
 placement_observe_pose: [0.0, -35.5, 491.1, 180.0, 67.77, 89.97]
 placement_observe_joint_positions_rad:
@@ -12,5 +11,5 @@ execution_orientation:
   center_horizontal_reference_azimuth_deg: -90.0
   safe_top_down_reference_azimuth_deg: -90.0
 notes:
-  - "Preserved for future reuse; not loaded by the current runtime configuration."
+  - "Active profile in config/distributed/pipeline_orchestrator.params.yaml."
   - "The joint vector is diagnostic only; runtime observation moves are Cartesian."

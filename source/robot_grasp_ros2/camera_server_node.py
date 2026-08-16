@@ -13,6 +13,7 @@ import time
 
 import numpy as np
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
@@ -245,6 +246,13 @@ class CameraServerNode(Node):
         self.declare_parameter("bilateral_sigma_color", 0.02)
         self.declare_parameter("bilateral_sigma_space", 5.0)
         self.declare_parameter("median_kernel_size", 5)
+        # A lightweight RGB-D preview stream lets search logic inspect the
+        # scene while Scout is moving.  It shares the persistent camera daemon
+        # with the explicit capture service, so final RGB-D captures retain
+        # their existing semantics.
+        self.declare_parameter("continuous_preview_enabled", True)
+        self.declare_parameter("continuous_preview_rate_hz", 4.0)
+        self.declare_parameter("continuous_preview_depth_fusion_frames", 1)
 
         text_qos = make_latched_qos(depth=10)
         image_qos = make_latched_qos(depth=1)
@@ -255,6 +263,17 @@ class CameraServerNode(Node):
         self.create_service(CaptureScene, "~/capture", self._handle_capture)
 
         self._bridge = ExternalCameraBridge(self)
+        self._preview_lock = threading.Lock()
+        self._last_preview_error_at = 0.0
+        self._preview_callback_group = ReentrantCallbackGroup()
+        preview_rate_hz = max(
+            0.2, float(self.get_parameter("continuous_preview_rate_hz").value)
+        )
+        self._preview_timer = self.create_timer(
+            1.0 / preview_rate_hz,
+            self._publish_continuous_preview,
+            callback_group=self._preview_callback_group,
+        )
         self._publish_status("idle")
 
     def destroy_node(self) -> None:
@@ -268,21 +287,66 @@ class CameraServerNode(Node):
     def _camera_frame(self) -> str:
         return str(self.get_parameter("camera_frame").value or "camera_color_optical_frame")
 
+    def _capture_arrays(
+        self,
+        *,
+        depth_fusion_frames: int,
+        pointcloud_filter_mode: str = "bilateral",
+    ):
+        return self._bridge.capture(
+            depth_fusion_frames=max(1, int(depth_fusion_frames)),
+            pointcloud_filter_mode=str(pointcloud_filter_mode or "bilateral"),
+            width=int(self.get_parameter("camera_width").value),
+            height=int(self.get_parameter("camera_height").value),
+            fps=int(self.get_parameter("camera_fps").value),
+            clip_max_m=float(self.get_parameter("clip_max_m").value),
+            bilateral_diameter=int(self.get_parameter("bilateral_diameter").value),
+            bilateral_sigma_color=float(self.get_parameter("bilateral_sigma_color").value),
+            bilateral_sigma_space=float(self.get_parameter("bilateral_sigma_space").value),
+            median_kernel_size=int(self.get_parameter("median_kernel_size").value),
+        )
+
+    def _publish_continuous_preview(self) -> None:
+        if not bool(self.get_parameter("continuous_preview_enabled").value):
+            return
+        if not self._preview_lock.acquire(blocking=False):
+            return
+        try:
+            color_bgr, depth_meters, intrinsics = self._capture_arrays(
+                depth_fusion_frames=int(
+                    self.get_parameter("continuous_preview_depth_fusion_frames").value
+                )
+            )
+            stamp = self.get_clock().now().to_msg()
+            frame_id = self._camera_frame()
+            self._color_pub.publish(
+                color_image_to_msg(color_bgr, frame_id=frame_id, stamp=stamp)
+            )
+            # Publish depth/info as well so RViz and diagnostics stay in sync;
+            # the target-search pipeline consumes RGB only during motion.
+            self._depth_pub.publish(
+                depth_image_to_msg(depth_meters, frame_id=frame_id, stamp=stamp)
+            )
+            self._camera_info_pub.publish(
+                intrinsics_to_camera_info(intrinsics, frame_id=frame_id, stamp=stamp)
+            )
+        except Exception as exc:
+            now = time.monotonic()
+            if now - self._last_preview_error_at >= 5.0:
+                self.get_logger().warning(f"continuous preview capture failed: {exc}")
+                self._last_preview_error_at = now
+        finally:
+            self._preview_lock.release()
+
     def _handle_capture(self, request: CaptureScene.Request, response: CaptureScene.Response):
         run_id = request.run_id.strip() or f"capture-{int(time.time() * 1000)}"
         try:
             self._publish_status(f"capturing: run_id={run_id}")
-            color_bgr, depth_meters, intrinsics = self._bridge.capture(
+            color_bgr, depth_meters, intrinsics = self._capture_arrays(
                 depth_fusion_frames=int(request.depth_fusion_frames),
-                pointcloud_filter_mode=str(request.pointcloud_filter_mode or "bilateral"),
-                width=int(self.get_parameter("camera_width").value),
-                height=int(self.get_parameter("camera_height").value),
-                fps=int(self.get_parameter("camera_fps").value),
-                clip_max_m=float(self.get_parameter("clip_max_m").value),
-                bilateral_diameter=int(self.get_parameter("bilateral_diameter").value),
-                bilateral_sigma_color=float(self.get_parameter("bilateral_sigma_color").value),
-                bilateral_sigma_space=float(self.get_parameter("bilateral_sigma_space").value),
-                median_kernel_size=int(self.get_parameter("median_kernel_size").value),
+                pointcloud_filter_mode=str(
+                    request.pointcloud_filter_mode or "bilateral"
+                ),
             )
 
             stamp = self.get_clock().now().to_msg()

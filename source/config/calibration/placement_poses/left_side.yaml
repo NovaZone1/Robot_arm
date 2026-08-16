@@ -1,0 +1,11 @@
+# Preserved fixed base-aligned placement path: work table on Piper's left.
+# Units: [x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg].
+# This was the source calibration used before the active right-side mirror.
+profile: left_side
+preserved_at: "2026-08-15"
+approach_pose: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+release_pose: [-22.262, 283.822, 307.657, 85.074, 87.787, 179.697]
+retreat_pose: [-22.262, 283.822, 491.100, 85.074, 87.787, 179.697]
+notes:
+  - "The active item catalog holds the right-side mirror."
+  - "Use this file as the source if switching back to the left table."

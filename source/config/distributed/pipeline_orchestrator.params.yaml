@@ -17,10 +17,26 @@ grasp_pipeline:
     pointcloud_filter_mode: "bilateral"
     pointcloud_backend: "sdk"
     depth_fusion_frames: 8
-    speed: 5
+    # Fast search/card/box-label views do not require a fused depth cloud.
+    # A fresh 8-frame capture is still used before final grasp planning.
+    search_depth_fusion_frames: 1
+    # Read the camera server's 4 Hz preview during target-card and target-item
+    # search. Any centered item is still re-captured at full depth before
+    # GraspNet is allowed to plan a grasp.
+    continuous_search_enabled: true
+    continuous_search_image_topic: "/camera_server/latest/color"
+    continuous_search_preview_max_age_s: 0.8
+    continuous_search_preview_wait_s: 1.2
+    # While each bounded scan segment is moving, 2-D detection may request an
+    # early stop only when the calibrated target-center window is reached.
+    continuous_search_stop_on_center: true
+    continuous_search_poll_s: 0.08
+    # Transit, scan and non-contact arm motion speed. Contact descent retains
+    # the executor's dedicated low-speed safety setting.
+    speed: 25
     # The calibrated observation route is in free space. Keep grasp descent at
     # the normal task speed while replaying observation poses more promptly.
-    observation_speed: 10
+    observation_speed: 25
     graspnet_checkpoint: "checkpoint.tar"
     hand_eye_config: ""
     apply_npoint_tool_offset: false
@@ -65,18 +81,28 @@ grasp_pipeline:
     target_card_capture_frames: 3
     target_card_consensus_frames: 2
     target_card_capture_interval_s: 0.15
-    # Active competition setup: table on the arm's left side.  The preserved
-    # left/right profiles live under config/calibration/observation_poses/.
-    # Both target acquisition and box-label/placement observation must use the
-    # same side so their camera-to-base geometry remains consistent.
-    observe_pose: [0.0, 35.5, 491.1, 180.0, 67.77, -89.97]
-    placement_observe_pose: [0.0, 35.5, 491.1, 180.0, 67.77, -89.97]
+    # If the card table is initially just beyond the camera view, move Scout
+    # forward at walking-slow speed while inspecting the live RGB preview.
+    # The scan is bounded and stops immediately when a card photograph appears.
+    target_card_base_search_enabled: true
+    target_card_base_search_step_m: 0.07
+    target_card_base_search_max_travel_m: 0.35
+    target_card_base_search_speed_mps: 0.03
+    target_card_base_search_timeout_s: 18.0
+    # Active competition setup: table on the arm's right side. Both target-card
+    # acquisition and box-label/placement observation must use the same side
+    # so their camera-to-base geometry remains consistent.
+    observe_pose: [0.0, -35.5, 491.1, 180.0, 67.77, 89.97]
+    placement_observe_pose: [0.0, -35.5, 491.1, 180.0, 67.77, 89.97]
     # Diagnostic joint reference only; Cartesian execution uses the poses
     # above. The right-side profile uses the opposite base-joint sign.
     placement_observe_joint_positions_rad:
-      [1.571774176, 0.652510264, -1.397299288, 0.0, 1.218672728, 0.0]
+      [-1.571774176, 0.652510264, -1.397299288, 0.0, 1.218672728, 0.0]
     label_search_roi_norm: [0.0, 0.0, 1.0, 1.0]
     label_match_threshold: 0.42
+    # Printed box labels must match a catalog image (or a YOLO bottle proposal).
+    # Do not let HSV-only colored ground shadows/held objects stop placement.
+    label_marker_detection_enabled: false
     camera_capture_service: "/camera_server/capture"
     vision_analyze_service: "/vision_worker/analyze"
     vision_detect_target_2d_service: "/vision_worker/detect_target_2d"
@@ -104,23 +130,31 @@ grasp_pipeline:
     # 24 views also cover the worst case where the target appears early but
     # needs repeated 7 cm fine-centering steps across most of the scan lane.
     base_multiview_max_views: 24
-    base_multiview_speed_mps: 0.04
+    # Bounded by scout_scan_controller's 0.18 m/s safety limit.  Final
+    # 7-cm centering remains odometry-closed-loop.
+    base_multiview_speed_mps: 0.08
     base_multiview_move_timeout_s: 22.0
-    base_multiview_settle_s: 0.5
+    # D435 frames stay stable after a short stop; final grasp/placement still
+    # takes its own fresh RGB-D frame.  This trims every search viewpoint
+    # without relaxing the final action validation.
+    base_multiview_settle_s: 0.3
     # Fixed-box placement keeps its own horizontal label-centering threshold.
-    base_target_center_tolerance_norm: 0.03
+    # ±12% is about ±77 px at 640 px. The target label need not be pixel-center
+    # perfect before stopping; identity still requires strict template/YOLO
+    # verification before any release path may execute.
+    base_target_center_tolerance_norm: 0.12
     # Operator-recorded target centers, calibrated from the standard RGB-D
     # frames under config/calibration/target_center on 2026-08-08. Separate
     # vertical references account for the bottle/block height difference.
     base_grasp_bottle_center_norm: [0.598, 0.485]
     base_grasp_block_center_norm: [0.606, 0.619]
-    # Deliberately practical margins: about 51 px horizontally and 58 px
+    # Deliberately practical margins: about 64 px horizontally and 82 px
     # vertically at 640x480, rather than requiring one exact center pixel.
-    base_grasp_center_tolerance_u_norm: 0.08
+    base_grasp_center_tolerance_u_norm: 0.10
     # Relaxed after the right-side mirrored observation trial: the red block
     # had valid grasps and horizontal alignment at v-error 0.138. Keep a small
     # margin while still requiring the correct target and a valid grasp.
-    base_grasp_center_tolerance_v_norm: 0.15
+    base_grasp_center_tolerance_v_norm: 0.17
     # Once the target first appears, switch from 15 cm search steps to a 7 cm
     # approach step. The final center tolerance is calibrated from a standard
     # operator-provided frame and intentionally keeps practical margin.

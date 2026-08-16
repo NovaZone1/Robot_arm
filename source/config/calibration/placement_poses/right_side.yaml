@@ -1,0 +1,12 @@
+# Active fixed base-aligned placement path: work table on Piper's right.
+# Units: [x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg].
+# It mirrors the left calibration in Piper's measured Cartesian convention:
+# Y and yaw change sign, while roll remains unchanged. Validate it
+# empty-handed before allowing a real release.
+profile: right_side
+active_from: "2026-08-15"
+approach_pose: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
+release_pose: [-22.262, -283.822, 307.657, 85.074, 87.787, -179.697]
+retreat_pose: [-22.262, -283.822, 491.100, 85.074, 87.787, -179.697]
+notes:
+  - "Mirrored nominal path; replace with a measured right-side calibration after dry-run verification."

@@ -1,14 +1,22 @@
 red_flag_start_gate:
   ros__parameters:
     camera_capture_service: "/camera_server/capture"
+    # Prefer the persistent camera-server stream.  This avoids competing with the
+    # explicit capture service for the one RealSense daemon while the flag is waved.
+    use_continuous_preview: true
+    continuous_preview_image_topic: "/camera_server/latest/color"
+    continuous_preview_max_age_s: 0.8
+    continuous_preview_wait_s: 1.0
     timeout_s: 180.0
     capture_timeout_s: 8.0
     sample_interval_s: 0.08
-    # Calibrated from config/calibration/red_flag on 2026-08-11.
-    roi_norm: [0.10, 0.0, 1.0, 0.95]
-    saturation_min: 110
-    value_min: 90
-    component_min_area_ratio: 0.002
+    # Inspect the whole image.  Motion verification below prevents a static red
+    # object in the scene from becoming a start signal, while a flag at an image
+    # edge is no longer discarded before detection.
+    roi_norm: [0.0, 0.0, 1.0, 1.0]
+    saturation_min: 80
+    value_min: 60
+    component_min_area_ratio: 0.001
     peak_area_ratio: 0.03
     motion_window_s: 3.0
     min_valid_detections: 4
@@ -17,4 +25,3 @@ red_flag_start_gate:
     min_direction_step_norm: 0.025
     min_direction_reversals: 1
     artifact_dir: "/home/nvidia/auto/Robot_arm/source/config/calibration/red_flag/runtime"
-

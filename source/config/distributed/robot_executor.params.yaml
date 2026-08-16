@@ -4,9 +4,11 @@ robot_executor:
     auto_enable: true
     disconnect_after_run: false
     poll_interval_s: 0.05
-    default_speed_percent: 5.0
+    default_speed_percent: 25.0
     default_gripper_open_mm: 70.0
-    default_gripper_close_effort_nm: 0.6
+    # Increased from 0.6 after objects could slip during transit. Keep this
+    # below the gripper's high-force limit while retaining a firm grasp.
+    default_gripper_close_effort_nm: 0.8
     enable_pregrasp: false
     execution_strategy: "center_horizontal"
     pose_execution_mode: "direct"
@@ -34,22 +36,22 @@ robot_executor:
     reject_degenerate_grasp_waypoints: true
     min_grasp_approach_offset_m: 0.005
     min_retreat_lift_m: 0.03
-    # Active work table is on the arm's left side. Keep the wrist heading on
-    # the verified left-side branch; the former right-side +90 deg profile is
-    # preserved under config/calibration/observation_poses/right_side.yaml.
-    top_down_rpy_deg: [180.0, 85.0, -90.0]
-    top_down_rpy_variants_deg: [180.0, 85.0, -90.0]
+    # Active work table is on the arm's right side. Keep the wrist heading on
+    # the verified right-side branch; the left-side profile remains preserved
+    # under config/calibration/observation_poses/left_side.yaml.
+    top_down_rpy_deg: [180.0, 85.0, 90.0]
+    top_down_rpy_variants_deg: [180.0, 85.0, 90.0]
     # Keep the wrist aligned with the arm-to-target radial direction. At the
-    # verified straight-left work-area center (azimuth +90 deg), yaw remains
+    # verified straight-right work-area center (azimuth -90 deg), yaw remains
     # -90 deg; offset targets rotate base and tool yaw together.
     center_horizontal_follow_target_azimuth: true
-    center_horizontal_reference_azimuth_deg: 90.0
+    center_horizontal_reference_azimuth_deg: -90.0
     center_horizontal_max_yaw_adjust_deg: 45.0
     # For cube top-down grasps, align yaw with the base-to-target radial
     # direction once at safe height so the wrist does not repeatedly correct
     # above an offset object.
     safe_top_down_follow_target_azimuth: true
-    safe_top_down_reference_azimuth_deg: 90.0
+    safe_top_down_reference_azimuth_deg: -90.0
     safe_top_down_max_yaw_adjust_deg: 45.0
     top_down_min_safe_z_mm: 350.0
     top_down_min_target_z_mm: 200.0

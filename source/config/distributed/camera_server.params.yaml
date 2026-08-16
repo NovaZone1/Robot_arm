@@ -15,3 +15,8 @@ camera_server:
     bilateral_sigma_color: 0.02
     bilateral_sigma_space: 5.0
     median_kernel_size: 5
+    # Publish a fresh low-cost RGB-D frame at 4 Hz for moving-base search.
+    # Explicit capture requests remain serialized through the same daemon.
+    continuous_preview_enabled: true
+    continuous_preview_rate_hz: 4.0
+    continuous_preview_depth_fusion_frames: 1

@@ -508,6 +508,10 @@ class VisionWorkerNode(Node):
                 else None
             )
             threshold = options.get("label_match_threshold")
+            localize_box_row = bool(options.get("localize_box_row", True))
+            marker_detection_enabled = bool(
+                options.get("label_marker_detection_enabled", False)
+            )
             matcher = self._get_label_matcher()
             color_bgr = color_msg_to_bgr(request.color_image)
             try:
@@ -523,10 +527,11 @@ class VisionWorkerNode(Node):
                 roi_norm=roi,
                 threshold=(float(threshold) if threshold is not None else None),
                 bottle_proposals=bottle_proposals,
+                marker_detection_enabled=marker_detection_enabled,
             )
             partial_label_observations: list[dict[str, object]] = []
             partial_projection_errors: list[str] = []
-            if match.detections:
+            if match.detections and localize_box_row:
                 depth_meters = depth_msg_to_meters(request.depth_image)
                 camera_k = tuple(float(value) for value in request.camera_info.k)
                 base_to_camera = transform_msg_to_matrix(request.base_to_camera)
@@ -609,7 +614,7 @@ class VisionWorkerNode(Node):
                         }
                     )
             localization = None
-            if match.accepted:
+            if match.accepted and localize_box_row:
                 localization = matcher.localize_box_row(
                     depth_meters=depth_msg_to_meters(request.depth_image),
                     camera_k=tuple(float(value) for value in request.camera_info.k),
@@ -618,11 +623,19 @@ class VisionWorkerNode(Node):
                     target_item_id=match.expected_item_id,
                     table_z_m=float(options.get("table_z_m", 0.0)),
                 )
-            response.success = bool(match.accepted and localization is not None)
+            target_present = bool(
+                str(match.matched_item_id or "")
+                == str(request.expected_item_id or "")
+            )
+            response.success = bool(
+                (match.accepted and localization is not None)
+                if localize_box_row
+                else target_present
+            )
             response.message = (
                 f"label matched: {match.matched_item_id} slot={match.slot_index} "
                 f"confidence={match.confidence:.3f}"
-                if match.accepted
+                if (match.accepted if localize_box_row else target_present)
                 else f"complete six-label row not verified for {match.expected_item_id}: "
                 f"detected={len(match.detected_item_ids)} confidence={match.confidence:.3f}"
             )
@@ -661,6 +674,7 @@ class VisionWorkerNode(Node):
                         if bottle_proposals is not None
                         else None
                     ),
+                    "marker_detection_enabled": marker_detection_enabled,
                     "partial_label_observations_base_m": partial_label_observations,
                     "partial_projection_errors": partial_projection_errors,
                     "box_center_base_m": (
