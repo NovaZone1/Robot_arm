@@ -7,6 +7,10 @@ from setuptools import find_packages, setup
 package_name = "robot_grasp_ros2"
 
 
+def files_only(pattern: str) -> list[str]:
+    return [path for path in glob(pattern) if os.path.isfile(path)]
+
+
 setup(
     name=package_name,
     version="0.1.0",
@@ -19,7 +23,7 @@ setup(
         (os.path.join("share", package_name, "config", "distributed"), glob("config/distributed/*.yaml")),
         (
             os.path.join("share", package_name, "assets", "item_references"),
-            glob("assets/item_references/*"),
+            files_only("assets/item_references/*"),
         ),
         (os.path.join("share", package_name, "rviz"), glob("rviz/*.rviz")),
         (os.path.join("share", package_name, "docs"), glob("docs/*.md")),

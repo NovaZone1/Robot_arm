@@ -1,5 +1,6 @@
 # Captured from live Piper feedback at the operator-taught red-flag view and
-# verified reachable under normal CAN control at 5% speed.
+# verified reachable under normal CAN control at 5% speed. Runtime replay now
+# uses 25% for this free-space transit; only final grasp contact stays at 5%.
 red_flag_observation:
   valid_for_replay: true
   captured_from_live_feedback: true

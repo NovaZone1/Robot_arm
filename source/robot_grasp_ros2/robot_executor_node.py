@@ -38,7 +38,11 @@ from src.robot.executor_models import (
     SleepCommand,
     parse_execution_plan_json,
 )
-from src.robot.motion_tolerances import effective_position_tolerance_mm, wait_until_pose_goal
+from src.robot.motion_tolerances import (
+    effective_position_tolerance_mm,
+    translation_distance_mm,
+    wait_until_pose_goal,
+)
 from src.robot.moveit_ik import ensure_moveit_pose_mode_supported
 from src.robot.plan_validation import validate_grasp_plan_waypoints_detailed
 from src.robot.types import EndPoseMMDeg
@@ -62,6 +66,7 @@ class RobotExecutorNode(Node):
         self.create_service(Trigger, "~/cancel", self._handle_cancel)
         self.create_service(Trigger, "~/probe", self._handle_probe)
         self.create_service(Trigger, "~/open_gripper", self._handle_open_gripper)
+        self.create_service(Trigger, "~/close_gripper", self._handle_close_gripper)
         self.create_service(GetRobotState, "~/get_state", self._handle_get_state)
         self.create_service(ExecuteNamedPose, "~/execute_named_pose", self._handle_execute_named_pose)
         self.create_service(ExecuteGraspPlan, "~/execute_grasp_plan", self._handle_execute_grasp_plan)
@@ -88,7 +93,8 @@ class RobotExecutorNode(Node):
         self.declare_parameter("auto_enable", True)
         self.declare_parameter("disconnect_after_run", False)
         self.declare_parameter("poll_interval_s", 0.05)
-        self.declare_parameter("default_speed_percent", 40.0)
+        self.declare_parameter("default_speed_percent", 25.0)
+        self.declare_parameter("home_speed_percent", 25.0)
         self.declare_parameter("default_gripper_open_mm", 70.0)
         self.declare_parameter("default_gripper_close_effort_nm", 0.6)
         self.declare_parameter("enable_pregrasp", False)
@@ -123,6 +129,11 @@ class RobotExecutorNode(Node):
         self.declare_parameter("center_horizontal_follow_target_azimuth", True)
         self.declare_parameter("center_horizontal_reference_azimuth_deg", 90.0)
         self.declare_parameter("center_horizontal_max_yaw_adjust_deg", 45.0)
+        self.declare_parameter("center_horizontal_pregrasp_distance_mm", 80.0)
+        self.declare_parameter("center_horizontal_approach_step_mm", 30.0)
+        self.declare_parameter("center_horizontal_final_speed_percent", 5.0)
+        self.declare_parameter("center_horizontal_min_held_opening_mm", 12.0)
+        self.declare_parameter("center_horizontal_max_held_opening_mm", 65.0)
         self.declare_parameter("safe_top_down_follow_target_azimuth", True)
         self.declare_parameter("safe_top_down_reference_azimuth_deg", 90.0)
         self.declare_parameter("safe_top_down_max_yaw_adjust_deg", 45.0)
@@ -134,14 +145,15 @@ class RobotExecutorNode(Node):
         self.declare_parameter("top_down_lateral_step_mm", 35.0)
         self.declare_parameter("top_down_vertical_step_mm", 25.0)
         self.declare_parameter("safe_top_down_vertical_step_mm", 80.0)
-        self.declare_parameter("safe_top_down_final_speed_percent", 2.0)
+        self.declare_parameter("safe_top_down_final_speed_percent", 5.0)
         self.declare_parameter("top_down_max_speed_percent", 10.0)
         self.declare_parameter("placement_box_outer_size_m", [0.180, 0.132, 0.087])
         self.declare_parameter("placement_slot_count", 6)
         self.declare_parameter("placement_box_size_tolerance_m", 0.005)
         self.declare_parameter("placement_min_label_confidence", 0.42)
         self.declare_parameter("placement_min_vertical_clearance_mm", 50.0)
-        self.declare_parameter("placement_final_speed_percent", 2.0)
+        self.declare_parameter("placement_speed_percent", 25.0)
+        self.declare_parameter("placement_final_speed_percent", 5.0)
         self.declare_parameter("handoff_pose", [200.0, 20.0, 300.0, 10.0, 120.0, 0.0])
         self.declare_parameter("home_pose", [57.0, 0.0, 215.0, 0.0, 85.0, 0.0])
         self.declare_parameter("move_to_post_grasp_pose", True)
@@ -173,6 +185,27 @@ class RobotExecutorNode(Node):
 
     def _default_speed(self) -> float:
         return float(self.get_parameter("default_speed_percent").value)
+
+    def _home_speed_percent(self) -> float:
+        return max(
+            1.0,
+            min(100.0, float(self.get_parameter("home_speed_percent").value or 25.0)),
+        )
+
+    def _placement_speed_percent(self) -> float:
+        return max(
+            1.0,
+            min(100.0, float(self.get_parameter("placement_speed_percent").value or 25.0)),
+        )
+
+    def _placement_final_speed_percent(self) -> float:
+        return max(
+            1.0,
+            min(
+                self._placement_speed_percent(),
+                float(self.get_parameter("placement_final_speed_percent").value or 5.0),
+            ),
+        )
 
     def _default_gripper_open_mm(self) -> float:
         return float(self.get_parameter("default_gripper_open_mm").value)
@@ -323,11 +356,35 @@ class RobotExecutorNode(Node):
     def _safe_top_down_final_speed_percent(self) -> float:
         return max(
             1.0,
-            float(self.get_parameter("safe_top_down_final_speed_percent").value or 2.0),
+            float(self.get_parameter("safe_top_down_final_speed_percent").value or 5.0),
+        )
+
+    def _center_horizontal_final_speed_percent(self) -> float:
+        return max(
+            1.0,
+            float(self.get_parameter("center_horizontal_final_speed_percent").value or 5.0),
         )
 
     def _top_down_speed_percent(self) -> float:
         return min(self._default_speed(), max(1.0, float(self.get_parameter("top_down_max_speed_percent").value or 10.0)))
+
+    def _waypoint_command_speed_percent(
+        self,
+        *,
+        step_name: str,
+        descend_index: int,
+        descend_total: int,
+        transit_speed: float,
+    ) -> float:
+        if (
+            step_name.startswith("topdown_descend")
+            and descend_total > 0
+            and descend_index + 1 == descend_total
+        ):
+            return min(float(transit_speed), self._safe_top_down_final_speed_percent())
+        if step_name.startswith("bottle_final_approach"):
+            return min(float(transit_speed), self._center_horizontal_final_speed_percent())
+        return float(transit_speed)
 
     def _configured_pose(self, parameter_name: str) -> EndPoseMMDeg | None:
         values = list(self.get_parameter(parameter_name).value or [])
@@ -664,6 +721,73 @@ class RobotExecutorNode(Node):
             and str(snapshot.motion_status).strip().upper() == "NOT_ARRIVED"
         )
 
+    def _clear_stale_arrival_latch(self, *, target, start_pose, publish_command) -> bool:
+        """Force a new move after teach/standby/ARRIVED leftover.
+
+        After drag-teach the arm is often disabled and in STANDBY with
+        motion_status=NOT_ARRIVED. The first observe command is ignored
+        unless teach is exited and CAN MOVE_J is restored.
+        """
+        if self._backend() != "ros2" or publish_command is None:
+            return True
+        robot = self._robot_client()
+        try:
+            snapshot = robot.get_arm_status_snapshot()
+        except Exception:
+            snapshot = None
+        remaining_mm = translation_distance_mm(start_pose, target)
+        if remaining_mm < 15.0:
+            return True
+        motion = str(getattr(snapshot, "motion_status", "") or "").strip().upper()
+        mode = str(getattr(snapshot, "control_mode", "") or "").strip().upper()
+        teach_code = int(getattr(snapshot, "teach_status_code", 0) or 0)
+        already_commanding = (
+            motion == "NOT_ARRIVED" and mode == "CAN" and teach_code == 0
+        )
+        if already_commanding:
+            return True
+        self.get_logger().info(
+            "recovering post-teach motion "
+            f"({remaining_mm:.1f}mm from target, mode={mode or '?'}, "
+            f"motion={motion or '?'}, teach={teach_code})"
+        )
+        for attempt in range(8):
+            publish_command()
+            time.sleep(0.45)
+            try:
+                current = robot.read_end_pose_mm_deg()
+            except Exception:
+                continue
+            if translation_distance_mm(start_pose, current) > 20.0:
+                self.get_logger().info(
+                    f"post-teach motion started after {attempt + 1} command(s)"
+                )
+                return True
+        self.get_logger().warning(
+            "joint command did not start motion; trying Cartesian observe"
+        )
+        try:
+            for attempt in range(6):
+                robot.move_end_pose_mm_deg(
+                    x_mm=target.x_mm,
+                    y_mm=target.y_mm,
+                    z_mm=target.z_mm,
+                    roll_deg=target.roll_deg,
+                    pitch_deg=target.pitch_deg,
+                    yaw_deg=target.yaw_deg,
+                    speed_percent=25.0,
+                )
+                time.sleep(0.45)
+                current = robot.read_end_pose_mm_deg()
+                if translation_distance_mm(start_pose, current) > 20.0:
+                    self.get_logger().info(
+                        f"Cartesian observe started after {attempt + 1} command(s)"
+                    )
+                    return True
+        except Exception as exc:
+            self.get_logger().warning(f"Cartesian observe fallback failed: {exc}")
+        return False
+
     def _execute_command(self, cmd, executed_commands: list[str]) -> None:
         robot = self._robot_client()
         self._check_interrupt()
@@ -671,17 +795,24 @@ class RobotExecutorNode(Node):
         if isinstance(cmd, MovePoseCommand):
             speed = cmd.speed_percent if cmd.speed_percent > 0 else self._default_speed()
             refresh_command = None
+            start_pose = self._read_pose_with_retry()
             if self._pose_execution_mode() == "moveit_ik":
                 self._ensure_moveit_pose_mode_ready()
                 moveit_executor = self._moveit_ik_executor()
                 arm_joint_positions = moveit_executor.compute_ik(cmd.pose)
-                moveit_executor.publish_joint_command(arm_joint_positions, speed)
-                # Piper treats /joint_ctrl_single as a persistent joint target.
-                # Re-publishing the same target every poll re-enters
-                # MotionCtrl_2 + JointCtrl and produces visible stop/re-correct
-                # motion near an offset bottle.  Publish once and only poll
-                # feedback while the controller finishes the move.
-                refresh_command = None
+
+                def publish_command() -> None:
+                    moveit_executor.publish_joint_command(arm_joint_positions, speed)
+
+                publish_command()
+                started = self._clear_stale_arrival_latch(
+                    target=cmd.pose,
+                    start_pose=start_pose,
+                    publish_command=publish_command,
+                )
+                # Keep refreshing only when the arm has not started moving;
+                # a live refresh near the target causes stop/re-correct.
+                refresh_command = None if started else publish_command
             else:
                 refresh_command = lambda: robot.move_end_pose_mm_deg(
                     x_mm=cmd.pose.x_mm,
@@ -693,6 +824,11 @@ class RobotExecutorNode(Node):
                     speed_percent=speed,
                 )
                 refresh_command()
+                self._clear_stale_arrival_latch(
+                    target=cmd.pose,
+                    start_pose=start_pose,
+                    publish_command=refresh_command,
+                )
             self._wait_pose_with_interrupt(cmd, refresh_command=refresh_command)
             executed_commands.append(cmd.name)
             return
@@ -1034,6 +1170,75 @@ class RobotExecutorNode(Node):
         )
         return waypoints
 
+    def _build_center_horizontal_waypoints(
+        self,
+        *,
+        plan,
+        current_pose: EndPoseMMDeg,
+        rpy_deg: tuple[float, float, float] | None = None,
+    ) -> list[tuple[str, EndPoseMMDeg]]:
+        """Approach bottles horizontally only after reaching a clear standoff pose."""
+        rpy = self._top_down_rpy_deg() if rpy_deg is None else tuple(float(v) for v in rpy_deg)
+        target = self._target_pose_from_plan_top_down(plan, rpy_deg=rpy)
+        contact = np.asarray(plan.target_contact_point_base_m, dtype=np.float64).reshape(3)
+        radial_xy = contact[:2]
+        radial_norm = float(np.linalg.norm(radial_xy))
+        if radial_norm < 1.0e-6:
+            raise RuntimeError("center_horizontal target is too close to the base axis")
+        radial_xy /= radial_norm
+        standoff_mm = max(
+            30.0,
+            float(self.get_parameter("center_horizontal_pregrasp_distance_mm").value or 80.0),
+        )
+        pregrasp = self._copy_pose_with(
+            target,
+            x_mm=float(target.x_mm) - float(radial_xy[0]) * standoff_mm,
+            y_mm=float(target.y_mm) - float(radial_xy[1]) * standoff_mm,
+            rpy_deg=rpy,
+        )
+        safe_z_mm = max(
+            float(target.z_mm) + self._top_down_approach_height_mm(),
+            self._top_down_min_safe_z_mm(),
+        )
+        lift_z_mm = max(safe_z_mm, float(target.z_mm) + self._top_down_lift_height_mm())
+        current_safe = self._copy_pose_with(current_pose, z_mm=safe_z_mm)
+        start_safe = self._copy_pose_with(current_pose, z_mm=safe_z_mm, rpy_deg=rpy)
+        pregrasp_safe = self._copy_pose_with(pregrasp, z_mm=safe_z_mm, rpy_deg=rpy)
+        lifted_pregrasp = self._copy_pose_with(pregrasp, z_mm=lift_z_mm, rpy_deg=rpy)
+        approach_step_mm = max(
+            10.0,
+            float(self.get_parameter("center_horizontal_approach_step_mm").value or 30.0),
+        )
+
+        waypoints: list[tuple[str, EndPoseMMDeg]] = []
+        for prefix, start, end, step in (
+            ("bottle_lift_clear", current_pose, current_safe, self._top_down_vertical_step_mm()),
+            ("bottle_set_wrist", current_safe, start_safe, self._top_down_lateral_step_mm()),
+            ("bottle_lateral_safe", start_safe, pregrasp_safe, self._top_down_lateral_step_mm()),
+            ("bottle_descend_pregrasp", pregrasp_safe, pregrasp, self._top_down_vertical_step_mm()),
+            ("bottle_final_approach", pregrasp, target, approach_step_mm),
+            ("bottle_retreat_horizontal", target, pregrasp, approach_step_mm),
+            ("bottle_lift_object", pregrasp, lifted_pregrasp, self._top_down_vertical_step_mm()),
+        ):
+            waypoints.extend(
+                self._interpolate_pose_segment(
+                    name_prefix=prefix,
+                    start=start,
+                    end=end,
+                    max_step_mm=step,
+                )
+            )
+        return waypoints
+
+    def _build_safe_cartesian_waypoints(self, *, plan, current_pose, rpy_deg):
+        if self._execution_strategy() == "center_horizontal":
+            return self._build_center_horizontal_waypoints(
+                plan=plan, current_pose=current_pose, rpy_deg=rpy_deg
+            )
+        return self._build_safe_top_down_waypoints(
+            plan=plan, current_pose=current_pose, rpy_deg=rpy_deg
+        )
+
     def _evaluate_safe_top_down_variants(
         self,
         *,
@@ -1049,7 +1254,7 @@ class RobotExecutorNode(Node):
         for variant_index, rpy in enumerate(self._safe_cartesian_rpy_variants(plan)):
             waypoint_results: list[dict[str, object]] = []
             try:
-                waypoints = self._build_safe_top_down_waypoints(
+                waypoints = self._build_safe_cartesian_waypoints(
                     plan=plan,
                     current_pose=current_pose,
                     rpy_deg=rpy,
@@ -1231,6 +1436,7 @@ class RobotExecutorNode(Node):
         post_grasp_pose = None
         handoff_pose = None
         home_pose = None
+        grip_validation_error: str | None = None
 
         current_pose = self._read_pose_with_retry()
         selected_rpy = self._safe_cartesian_rpy_variants(plan)[0]
@@ -1244,7 +1450,7 @@ class RobotExecutorNode(Node):
             if selected_rpy is None or top_down_waypoints is None:
                 raise RuntimeError("no IK-reachable safe_top_down RPY variant")
         else:
-            top_down_waypoints = self._build_safe_top_down_waypoints(
+            top_down_waypoints = self._build_safe_cartesian_waypoints(
                 plan=plan,
                 current_pose=current_pose,
                 rpy_deg=selected_rpy,
@@ -1263,22 +1469,17 @@ class RobotExecutorNode(Node):
         )
 
         descend_steps = 0
-        descend_step_total = sum(
-            1 for name, _pose in top_down_waypoints if name.startswith("topdown_descend")
-        )
+        contact_prefix = "bottle_final_approach" if strategy == "center_horizontal" else "topdown_descend"
+        descend_step_total = sum(1 for name, _pose in top_down_waypoints if name.startswith(contact_prefix))
         lift_steps = 0
         for step_name, waypoint in top_down_waypoints:
-            command_speed_percent = speed_percent
-            is_descend = step_name.startswith("topdown_descend")
-            if (
-                strategy == "safe_top_down"
-                and is_descend
-                and descend_steps + 1 == descend_step_total
-            ):
-                command_speed_percent = min(
-                    speed_percent,
-                    self._safe_top_down_final_speed_percent(),
-                )
+            is_descend = step_name.startswith(contact_prefix)
+            command_speed_percent = self._waypoint_command_speed_percent(
+                step_name=step_name,
+                descend_index=descend_steps,
+                descend_total=descend_step_total,
+                transit_speed=speed_percent,
+            )
             actual = self._run_traced_action(
                 execution_trace=execution_trace,
                 step_name=step_name,
@@ -1297,28 +1498,48 @@ class RobotExecutorNode(Node):
                     tighten_position_tolerance=True,
                 ),
             )
-            if step_name.startswith("topdown_lift_clear") or step_name.startswith("topdown_lateral"):
+            if step_name.startswith(("topdown_lift_clear", "topdown_lateral", "bottle_lift_clear", "bottle_lateral_safe", "bottle_descend_pregrasp")):
                 pregrasp_actual = actual
             elif is_descend:
                 target_actual = actual
                 descend_steps += 1
-            elif step_name.startswith("topdown_lift_object"):
+            elif step_name.startswith(("topdown_lift_object", "bottle_lift_object")):
                 retreat_pose = actual
                 lift_steps += 1
 
             if is_descend and descend_steps == descend_step_total:
-                self._run_traced_action(
-                    execution_trace=execution_trace,
-                    step_name="close_gripper",
-                    command_type="close_gripper",
-                    command_payload={
-                        "effort_nm": float(self._default_gripper_close_effort_nm()),
-                    },
-                    action=lambda: self._set_gripper_closed(),
-                )
+                try:
+                    self._run_traced_action(
+                        execution_trace=execution_trace,
+                        step_name="close_gripper",
+                        command_type="close_gripper",
+                        command_payload={
+                            "effort_nm": float(self._default_gripper_close_effort_nm()),
+                        },
+                        action=lambda: self._set_gripper_closed(),
+                    )
+                except Exception as exc:
+                    if strategy != "center_horizontal":
+                        raise
+                    # A bottle is most vulnerable while the open fingers are
+                    # beside it. Preserve the failure, but first execute the
+                    # already validated horizontal retreat and vertical lift.
+                    grip_validation_error = f"bottle close failed: {exc}; completed retreat before aborting"
+                if strategy == "center_horizontal":
+                    opening_mm = float(self._robot_client().get_gripper_status().angle_mm)
+                    minimum = float(self.get_parameter("center_horizontal_min_held_opening_mm").value)
+                    maximum = float(self.get_parameter("center_horizontal_max_held_opening_mm").value)
+                    if not minimum <= opening_mm <= maximum:
+                        grip_validation_error = (
+                            "bottle grip validation failed: "
+                            f"opening={opening_mm:.1f}mm expected={minimum:.1f}..{maximum:.1f}mm; "
+                            "completed horizontal retreat before aborting"
+                        )
 
         if lift_steps <= 0:
             raise RuntimeError(f"{strategy} produced no lift-object waypoint")
+        if grip_validation_error is not None:
+            raise RuntimeError(grip_validation_error)
 
         if self._move_to_post_grasp_pose_enabled() and not bool(request.move_home_after):
             post_grasp_safe_lift_pose, post_grasp_pose = (
@@ -1360,20 +1581,21 @@ class RobotExecutorNode(Node):
                 action=lambda: self._set_gripper_open(),
             )
             home_target = self._configured_pose("home_pose")
+            home_speed = self._home_speed_percent()
             home_pose = self._run_traced_action(
                 execution_trace=execution_trace,
                 step_name="home",
                 command_type="move_pose",
                 command_payload={
                     "pose_mm_deg": self._pose_to_dict(home_target),
-                    "speed_percent": float(speed_percent),
+                    "speed_percent": float(home_speed),
                     "timeout_s": float(self._plan_pose_timeout_s()),
                     "execution_strategy": strategy,
                 },
                 action=lambda: self._move_configured_pose(
                     name="home",
                     pose=home_target,
-                    speed_percent=speed_percent,
+                    speed_percent=home_speed,
                     timeout_s=self._plan_pose_timeout_s(),
                 ),
             )
@@ -1388,8 +1610,6 @@ class RobotExecutorNode(Node):
             "top_down_speed_percent": float(speed_percent),
             "top_down_final_descent_speed_percent": float(
                 min(speed_percent, self._safe_top_down_final_speed_percent())
-                if strategy == "safe_top_down"
-                else speed_percent
             ),
             "pregrasp_executed": True,
             "move_home_after": bool(request.move_home_after),
@@ -1449,6 +1669,36 @@ class RobotExecutorNode(Node):
                 {
                     "status": "failed",
                     "kind": "open_gripper",
+                    "message": str(exc),
+                }
+            )
+        return response
+
+    def _handle_close_gripper(self, _request, response):
+        """Close the gripper without commanding any arm motion."""
+        try:
+            self._reset_interrupt_flags()
+            self._ensure_robot_ready()
+            self._set_gripper_closed()
+            response.success = True
+            response.message = (
+                f"gripper closed at {self._default_gripper_close_effort_nm():.2f} Nm; "
+                "arm pose unchanged"
+            )
+            self._publish_service_result(
+                {
+                    "status": "ok",
+                    "kind": "close_gripper",
+                    "effort_nm": float(self._default_gripper_close_effort_nm()),
+                }
+            )
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            self._publish_service_result(
+                {
+                    "status": "failed",
+                    "kind": "close_gripper",
                     "message": str(exc),
                 }
             )
@@ -1680,19 +1930,20 @@ class RobotExecutorNode(Node):
                     action=lambda: self._set_gripper_open(),
                 )
                 home_target = self._configured_pose("home_pose")
+                home_speed = self._home_speed_percent()
                 home_pose = self._run_traced_action(
                     execution_trace=execution_trace,
                     step_name="home",
                     command_type="move_pose",
                     command_payload={
                         "pose_mm_deg": self._pose_to_dict(home_target),
-                        "speed_percent": float(speed_percent),
+                        "speed_percent": float(home_speed),
                         "timeout_s": float(self._plan_pose_timeout_s()),
                     },
                     action=lambda: self._move_configured_pose(
                         name="home",
                         pose=home_target,
-                        speed_percent=speed_percent,
+                        speed_percent=home_speed,
                         timeout_s=self._plan_pose_timeout_s(),
                     ),
                 )
@@ -1862,11 +2113,8 @@ class RobotExecutorNode(Node):
                 return response
 
             trace: list[dict[str, object]] = []
-            speed = self._default_speed()
-            final_speed = min(
-                speed,
-                max(1.0, float(self.get_parameter("placement_final_speed_percent").value or 2.0)),
-            )
+            speed = self._placement_speed_percent()
+            final_speed = self._placement_final_speed_percent()
             for stage, pose, move_speed in (
                 ("place_approach", approach, speed),
                 ("place_release", release, final_speed),
@@ -1915,19 +2163,20 @@ class RobotExecutorNode(Node):
             home_pose = None
             if bool(request.move_home_after):
                 home_target = self._configured_pose("home_pose")
+                home_speed = self._home_speed_percent()
                 home_pose = self._run_traced_action(
                     execution_trace=trace,
                     step_name="home",
                     command_type="move_pose",
                     command_payload={
                         "pose_mm_deg": self._pose_to_dict(home_target),
-                        "speed_percent": float(speed),
+                        "speed_percent": float(home_speed),
                         "timeout_s": float(self._plan_pose_timeout_s()),
                     },
                     action=lambda: self._move_configured_pose(
                         name="home",
                         pose=home_target,
-                        speed_percent=speed,
+                        speed_percent=home_speed,
                         timeout_s=self._plan_pose_timeout_s(),
                     ),
                 )

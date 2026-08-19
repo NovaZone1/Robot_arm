@@ -165,6 +165,9 @@ class ExternalVisionWorkerBridge:
         self,
         color_bgr: np.ndarray,
         prompt: str,
+        *,
+        search_roi_norm: list[float] | None = None,
+        exclude_roi_norm: list[float] | None = None,
     ) -> dict[str, object]:
         with tempfile.TemporaryDirectory(prefix="target_2d_worker_") as tmp_dir_str:
             tmp_dir = Path(tmp_dir_str)
@@ -175,6 +178,8 @@ class ExternalVisionWorkerBridge:
                 "work_dir": str(tmp_dir),
                 "color_npy": color_path.name,
                 "prompt": str(prompt),
+                "search_roi_norm": list(search_roi_norm or []),
+                "exclude_roi_norm": list(exclude_roi_norm or []),
             }
             with self._daemon_lock:
                 payload = self._call_daemon(request_payload)
@@ -465,9 +470,22 @@ class VisionWorkerNode(Node):
         run_id = request.run_id.strip() or "unknown"
         try:
             self._publish_status(f"detecting_target_2d: run_id={run_id}")
+            options = parse_options_json(getattr(request, "options_json", "") or "")
+            raw_search = options.get("search_roi_norm")
+            raw_exclude = options.get("exclude_roi_norm")
             result = self._bridge.detect_target_2d(
                 color_msg_to_bgr(request.color_image),
                 request.prompt,
+                search_roi_norm=(
+                    [float(value) for value in list(raw_search)]
+                    if isinstance(raw_search, list) and len(raw_search) == 4
+                    else None
+                ),
+                exclude_roi_norm=(
+                    [float(value) for value in list(raw_exclude)]
+                    if isinstance(raw_exclude, list) and len(raw_exclude) == 4
+                    else None
+                ),
             )
             response.success = True
             response.found = bool(result.get("found"))

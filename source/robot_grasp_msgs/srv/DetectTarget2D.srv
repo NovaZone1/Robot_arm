@@ -1,6 +1,8 @@
 string run_id
 string prompt
 sensor_msgs/Image color_image
+# Optional JSON: search_roi_norm / exclude_roi_norm as [x0, y0, x1, y1].
+string options_json
 ---
 bool success
 string message

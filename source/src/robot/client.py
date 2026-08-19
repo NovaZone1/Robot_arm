@@ -756,14 +756,24 @@ class Ros2PiperClient(RobotArmClient):
         indicates that the gripper has either gripped an object or reached its travel limit.
         """
         deadline = time.monotonic() + timeout_s
+        start_angle_mm = self.get_gripper_status().angle_mm
         prev_angle_mm: float | None = None
+        movement_seen = start_angle_mm <= 5.0
+        stable_samples = 0
         while time.monotonic() < deadline:
             current_angle_mm = self.get_gripper_status().angle_mm
-            if prev_angle_mm is not None and abs(current_angle_mm - prev_angle_mm) < 1.0:
-                return True
+            if start_angle_mm - current_angle_mm >= 3.0:
+                movement_seen = True
+            if movement_seen and prev_angle_mm is not None:
+                if abs(current_angle_mm - prev_angle_mm) < 0.8:
+                    stable_samples += 1
+                    if stable_samples >= 3:
+                        return True
+                else:
+                    stable_samples = 0
             prev_angle_mm = current_angle_mm
             time.sleep(self.config.poll_interval_s)
-        return True  # treat timeout as success to avoid blocking retreat/handoff/home
+        return False
 
     def get_gripper_status(self) -> GripperStatus:
         with self._lock:

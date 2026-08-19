@@ -34,6 +34,58 @@ def test_plan_pose_timeout_reads_configured_parameter(monkeypatch):
     assert RobotExecutorNode._plan_pose_timeout_s(node) == 27.5
 
 
+def test_clear_stale_arrival_latch_republishes_until_piper_moves(monkeypatch):
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    node._backend = lambda: "ros2"
+    node.get_logger = lambda: SimpleNamespace(
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+    )
+    start = EndPoseMMDeg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    target = EndPoseMMDeg(180.0, -30.0, 491.0, 180.0, 68.0, 90.0)
+    current = {"pose": start}
+    publishes: list[int] = []
+    robot = SimpleNamespace(
+        get_arm_status_snapshot=lambda: SimpleNamespace(motion_status="ARRIVED"),
+        read_end_pose_mm_deg=lambda: current["pose"],
+        enable=lambda: True,
+    )
+    node._robot_client = lambda: robot
+    monkeypatch.setattr("robot_grasp_ros2.robot_executor_node.time.sleep", lambda _s: None)
+
+    def publish() -> None:
+        publishes.append(1)
+        if len(publishes) >= 2:
+            current["pose"] = EndPoseMMDeg(40.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    RobotExecutorNode._clear_stale_arrival_latch(
+        node,
+        target=target,
+        start_pose=start,
+        publish_command=publish,
+    )
+    assert len(publishes) >= 2
+
+
+def test_clear_stale_arrival_latch_skips_when_already_close():
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    node._backend = lambda: "ros2"
+    node.get_logger = lambda: SimpleNamespace(info=lambda *_a, **_k: None)
+    start = EndPoseMMDeg(0.0, 0.0, 491.0, 180.0, 68.0, 90.0)
+    target = EndPoseMMDeg(2.0, 0.0, 491.0, 180.0, 68.0, 90.0)
+    publishes: list[int] = []
+    node._robot_client = lambda: SimpleNamespace(
+        get_arm_status_snapshot=lambda: SimpleNamespace(motion_status="ARRIVED"),
+    )
+    RobotExecutorNode._clear_stale_arrival_latch(
+        node,
+        target=target,
+        start_pose=start,
+        publish_command=lambda: publishes.append(1),
+    )
+    assert publishes == []
+
+
 def test_pose_only_completion_requires_healthy_can_control():
     healthy = SimpleNamespace(
         err_code=0,
@@ -329,6 +381,56 @@ def test_center_horizontal_coarse_vertical_steps_reduce_near_object_replanning(m
     assert len(lift) == 1
 
 
+def test_center_horizontal_approaches_bottle_from_radial_standoff(monkeypatch):
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    rpy = (180.0, 85.0, -90.0)
+    target = EndPoseMMDeg(0.0, 400.0, 250.0, *rpy)
+    values = {
+        "center_horizontal_pregrasp_distance_mm": 80.0,
+        "center_horizontal_approach_step_mm": 30.0,
+    }
+    monkeypatch.setattr(node, "get_parameter", lambda name: SimpleNamespace(value=values[name]))
+    monkeypatch.setattr(node, "_top_down_rpy_deg", lambda: rpy)
+    monkeypatch.setattr(node, "_target_pose_from_plan_top_down", lambda _plan, rpy_deg=None: target)
+    monkeypatch.setattr(node, "_top_down_approach_height_mm", lambda: 110.0)
+    monkeypatch.setattr(node, "_top_down_min_safe_z_mm", lambda: 350.0)
+    monkeypatch.setattr(node, "_top_down_lift_height_mm", lambda: 80.0)
+    monkeypatch.setattr(node, "_top_down_vertical_step_mm", lambda: 80.0)
+    monkeypatch.setattr(node, "_top_down_lateral_step_mm", lambda: 1000.0)
+    plan = SimpleNamespace(target_contact_point_base_m=[0.0, 0.4, 0.25])
+
+    waypoints = RobotExecutorNode._build_center_horizontal_waypoints(
+        node,
+        plan=plan,
+        current_pose=EndPoseMMDeg(0.0, 0.0, 490.0, *rpy),
+    )
+
+    pregrasp = [p for n, p in waypoints if n.startswith("bottle_descend_pregrasp")][-1]
+    approach = [p for n, p in waypoints if n.startswith("bottle_final_approach")]
+    retreat = [p for n, p in waypoints if n.startswith("bottle_retreat_horizontal")]
+    assert pregrasp.y_mm == pytest.approx(320.0)
+    assert pregrasp.z_mm == pytest.approx(target.z_mm)
+    assert approach[-1] == target
+    assert all(p.z_mm == pytest.approx(target.z_mm) for p in approach + retreat)
+    assert retreat[-1].y_mm == pytest.approx(pregrasp.y_mm)
+    names = [name for name, _pose in waypoints]
+    final_approach_index = max(i for i, name in enumerate(names) if name.startswith("bottle_final_approach"))
+    first_retreat_index = min(i for i, name in enumerate(names) if name.startswith("bottle_retreat_horizontal"))
+    assert final_approach_index < first_retreat_index
+
+
+def test_bottle_final_approach_uses_configured_slow_speed(monkeypatch):
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    monkeypatch.setattr(node, "_center_horizontal_final_speed_percent", lambda: 4.0)
+    assert RobotExecutorNode._waypoint_command_speed_percent(
+        node,
+        step_name="bottle_final_approach_003",
+        descend_index=0,
+        descend_total=3,
+        transit_speed=25.0,
+    ) == pytest.approx(4.0)
+
+
 def test_top_down_speed_uses_dashboard_speed_when_guard_is_100(monkeypatch):
     node = RobotExecutorNode.__new__(RobotExecutorNode)
     values = {
@@ -500,11 +602,49 @@ def test_safe_top_down_final_descent_uses_slow_contact_speed(monkeypatch):
         node,
         "get_parameter",
         lambda name: SimpleNamespace(
-            value={"safe_top_down_final_speed_percent": 2.0}[name]
+            value={"safe_top_down_final_speed_percent": 5.0}[name]
         ),
     )
 
-    assert RobotExecutorNode._safe_top_down_final_speed_percent(node) == 2.0
+    assert RobotExecutorNode._safe_top_down_final_speed_percent(node) == 5.0
+    assert RobotExecutorNode._waypoint_command_speed_percent(
+        node,
+        step_name="topdown_descend_02",
+        descend_index=1,
+        descend_total=2,
+        transit_speed=25.0,
+    ) == 2.0
+    assert RobotExecutorNode._waypoint_command_speed_percent(
+        node,
+        step_name="topdown_descend_01",
+        descend_index=0,
+        descend_total=2,
+        transit_speed=25.0,
+    ) == 25.0
+    assert RobotExecutorNode._waypoint_command_speed_percent(
+        node,
+        step_name="topdown_lateral",
+        descend_index=0,
+        descend_total=2,
+        transit_speed=25.0,
+    ) == 25.0
+
+
+def test_place_transit_stays_fast_and_final_drop_is_slow(monkeypatch):
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    monkeypatch.setattr(
+        node,
+        "get_parameter",
+        lambda name: SimpleNamespace(
+            value={
+                "placement_speed_percent": 25.0,
+                "placement_final_speed_percent": 5.0,
+            }[name]
+        ),
+    )
+
+    assert RobotExecutorNode._placement_speed_percent(node) == 25.0
+    assert RobotExecutorNode._placement_final_speed_percent(node) == 5.0
 
 
 def test_grasp_plan_message_preserves_tool_contact_geometry():
@@ -691,6 +831,23 @@ def test_set_gripper_closed_locks_moveit_gripper_after_effort_reached(monkeypatc
     RobotExecutorNode._set_gripper_closed(node)
 
     assert moveit.locked == (0.0, 0.6)
+
+
+def test_close_gripper_service_does_not_move_the_arm(monkeypatch):
+    node = RobotExecutorNode.__new__(RobotExecutorNode)
+    published = []
+    monkeypatch.setattr(node, "_reset_interrupt_flags", lambda: None)
+    monkeypatch.setattr(node, "_ensure_robot_ready", lambda: None)
+    monkeypatch.setattr(node, "_set_gripper_closed", lambda: None)
+    monkeypatch.setattr(node, "_default_gripper_close_effort_nm", lambda: 0.6)
+    monkeypatch.setattr(node, "_publish_service_result", published.append)
+    response = SimpleNamespace(success=False, message="")
+
+    result = RobotExecutorNode._handle_close_gripper(node, SimpleNamespace(), response)
+
+    assert result.success is True
+    assert "arm pose unchanged" in result.message
+    assert published[0]["kind"] == "close_gripper"
 
 
 def test_execute_grasp_plan_returns_execution_trace(monkeypatch):

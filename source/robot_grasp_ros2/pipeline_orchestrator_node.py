@@ -62,6 +62,7 @@ from src.perception.item_catalog import (
     ReferenceLabelMatcher,
     default_item_catalog_path,
 )
+from src.perception.placement_uv_map import load_mapping_for_item
 from src.robot.plan_validation import select_first_reachable_candidate
 
 
@@ -218,6 +219,10 @@ class PipelineOrchestratorNode(Node):
         self._pending_confirmation: PendingConfirmation | None = None
         self._item_catalog_cache: ItemCatalog | None = None
         self._target_card_matcher_cache: ReferenceLabelMatcher | None = None
+        self._last_card_search_travel_m = 0.0
+        self._last_placement_scan_travel_m = 0.0
+        self._grasp_exclude_roi_norm: list[float] | None = None
+        self._grasp_search_roi_norm: list[float] | None = None
         self._base_odom_lock = threading.Lock()
         self._latest_base_odom: tuple[float, float, float, float] | None = None
 
@@ -253,8 +258,9 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("continuous_search_preview_wait_s", 1.2)
         self.declare_parameter("continuous_search_stop_on_center", True)
         self.declare_parameter("continuous_search_poll_s", 0.08)
-        self.declare_parameter("speed", 40)
-        self.declare_parameter("observation_speed", 10)
+        self.declare_parameter("speed", 25)
+        self.declare_parameter("observation_speed", 25)
+        self.declare_parameter("home_speed", 25)
         self.declare_parameter("graspnet_checkpoint", "checkpoint.tar")
         self.declare_parameter("hand_eye_config", "")
         self.declare_parameter("apply_npoint_tool_offset", False)
@@ -268,7 +274,7 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("manual_target_bias_z_mm", 0.0)
         self.declare_parameter("table_z_m", 0.0)
         self.declare_parameter("min_gripper_table_clearance_m", 0.03)
-        self.declare_parameter("color_block_center_height_m", 0.045)
+        self.declare_parameter("color_block_center_height_m", 0.060)
         self.declare_parameter("pregrasp_offset_m", 0.0)
         self.declare_parameter("descend_offset_m", 0.0)
         self.declare_parameter("grasp_z_offset_m", 0.0)
@@ -297,6 +303,11 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("target_card_base_search_max_travel_m", 0.35)
         self.declare_parameter("target_card_base_search_speed_mps", 0.03)
         self.declare_parameter("target_card_base_search_timeout_s", 18.0)
+        # First failure returns to the observation pose and retries. Two
+        # repeats means three attempts total, then the run skips grasping.
+        self.declare_parameter("target_card_max_retries", 2)
+        self.declare_parameter("grasp_scan_max_retries", 2)
+        self.declare_parameter("placement_scan_max_retries", 2)
         self.declare_parameter("observe_pose", [30.0, 0.0, 400.0, 0.0, 120.0, 0.0])
         self.declare_parameter("placement_observe_pose", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter(
@@ -337,9 +348,10 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("base_target_center_tolerance_norm", 0.18)
         self.declare_parameter("base_grasp_bottle_center_norm", [0.598, 0.485])
         self.declare_parameter("base_grasp_block_center_norm", [0.606, 0.619])
-        self.declare_parameter("base_grasp_center_tolerance_u_norm", 0.08)
-        self.declare_parameter("base_grasp_center_tolerance_v_norm", 0.12)
+        self.declare_parameter("base_grasp_center_tolerance_u_norm", 0.18)
+        self.declare_parameter("base_grasp_center_tolerance_v_norm", 0.24)
         self.declare_parameter("base_target_fine_step_m", 0.07)
+        self.declare_parameter("grasp_scan_lost_frames_before_reverse", 2)
         self.declare_parameter("post_grasp_base_advance_m", 1.50)
         self.declare_parameter("post_grasp_base_advance_speed_mps", 0.10)
         self.declare_parameter("post_grasp_base_advance_timeout_s", 50.0)
@@ -443,6 +455,8 @@ class PipelineOrchestratorNode(Node):
             frame_id="camera_color_optical_frame",
             stamp=self.get_clock().now().to_msg(),
         )
+        if hasattr(request, "options_json"):
+            request.options_json = self._detect_target_2d_options_json()
         response = self._call_client(
             self._detect_target_2d_client,
             request,
@@ -736,6 +750,11 @@ class PipelineOrchestratorNode(Node):
             "pointcloud_backend": str(self.get_parameter("pointcloud_backend").value or "sdk"),
             "depth_fusion_frames": int(self.get_parameter("depth_fusion_frames").value),
             "speed": int(self.get_parameter("speed").value),
+            "observation_speed": int(self.get_parameter("observation_speed").value),
+            "home_speed": int(self.get_parameter("home_speed").value),
+            "prefer_object_center_candidates": bool(
+                str(self.get_parameter("target_item_id").value or "").strip()
+            ),
             "graspnet_checkpoint": str(self.get_parameter("graspnet_checkpoint").value or "checkpoint.tar"),
             "apply_npoint_tool_offset": bool(self.get_parameter("apply_npoint_tool_offset").value),
             "npoint_tool_offset_file": str(self.get_parameter("npoint_tool_offset_file").value or ""),
@@ -1076,6 +1095,8 @@ class PipelineOrchestratorNode(Node):
             "frames": frame_records,
             "color_path": str(color_path),
             "overlay_path": str(overlay_path),
+            "image_width": int(image.shape[1]),
+            "image_height": int(image.shape[0]),
         }
         self._publish_status(
             f"target_card_identified: run_id={run_id} item={item.item_id} "
@@ -1106,6 +1127,7 @@ class PipelineOrchestratorNode(Node):
 
     def _identify_target_card(self, *, run_id: str) -> tuple[object, dict[str, object]]:
         """Identify the card, advancing Scout slowly if it is initially out of view."""
+        self._last_card_search_travel_m = 0.0
         try:
             return self._identify_target_card_once(run_id=run_id)
         except RuntimeError as initial_error:
@@ -1153,6 +1175,7 @@ class PipelineOrchestratorNode(Node):
             except RuntimeError as error:
                 failures.append(str(error))
                 continue
+            self._last_card_search_travel_m = traveled_m
             payload["base_target_card_search"] = {
                 "enabled": True,
                 "max_travel_m": max_travel_m,
@@ -1167,10 +1190,194 @@ class PipelineOrchestratorNode(Node):
             }
             return item, payload
 
+        self._last_card_search_travel_m = traveled_m
         raise RuntimeError(
             "target card not recognized after low-speed forward search "
             f"({traveled_m:.2f}m/{max_travel_m:.2f}m): {failures[-1]}"
         )
+
+    def _recognition_max_retries(self, parameter_name: str) -> int:
+        return max(0, int(self.get_parameter(parameter_name).value))
+
+    @staticmethod
+    def _norm_point_in_roi(
+        u_norm: float,
+        v_norm: float,
+        roi: list[float] | tuple[float, float, float, float] | None,
+    ) -> bool:
+        if roi is None or len(roi) != 4:
+            return False
+        x0, y0, x1, y1 = (float(value) for value in roi)
+        return x0 <= u_norm <= x1 and y0 <= v_norm <= y1
+
+    def _clear_grasp_card_exclusion(self) -> None:
+        self._grasp_exclude_roi_norm = None
+        self._grasp_search_roi_norm = None
+
+    def _remember_target_card_exclusion(self, card_payload: dict[str, object] | None) -> None:
+        """Ignore only the printed photograph, not the real object window."""
+        if not card_payload or not bool(card_payload.get("success")):
+            self._clear_grasp_card_exclusion()
+            return
+        bbox = [int(value) for value in list(card_payload.get("bbox_xywh") or [])]
+        image_width = int(card_payload.get("image_width") or 0)
+        image_height = int(card_payload.get("image_height") or 0)
+        if len(bbox) != 4 or image_width <= 1 or image_height <= 1:
+            self._clear_grasp_card_exclusion()
+            return
+        pad = 0.04
+        x, y, width, height = bbox
+        self._grasp_exclude_roi_norm = [
+            max(0.0, (x / image_width) - pad),
+            max(0.0, (y / image_height) - pad),
+            min(1.0, ((x + width) / image_width) + pad),
+            min(1.0, ((y + height) / image_height) + pad),
+        ]
+        # Search the whole frame except the printed card. A bottle's
+        # calibrated center sits near v=0.485; clipping below the card
+        # search window previously hid the real object.
+        self._grasp_search_roi_norm = None
+
+    def _detect_target_2d_options_json(self) -> str:
+        options: dict[str, object] = {}
+        search_roi = getattr(self, "_grasp_search_roi_norm", None)
+        exclude_roi = getattr(self, "_grasp_exclude_roi_norm", None)
+        if search_roi and len(search_roi) == 4:
+            options["search_roi_norm"] = list(search_roi)
+        if exclude_roi and len(exclude_roi) == 4:
+            options["exclude_roi_norm"] = list(exclude_roi)
+        return json_dumps(options) if options else ""
+
+    def _scan_reverse_speed_mps(self) -> float:
+        return max(0.02, float(self.get_parameter("base_multiview_speed_mps").value))
+
+    def _scan_reverse_timeout_s(self, distance_m: float, *, speed_mps: float) -> float:
+        # Card-search 0.03 m/s / 18 s only covers ~0.5 m and cannot undo a
+        # 1.5 m item scan. Size the timeout from the remaining distance.
+        min_timeout = max(
+            8.0,
+            float(self.get_parameter("base_multiview_move_timeout_s").value),
+        )
+        return max(min_timeout, abs(float(distance_m)) / max(speed_mps, 0.02) + 8.0)
+
+    def _reverse_scan_travel(self, reverse_m: float) -> dict[str, object]:
+        """Drive the chassis back to the scan origin, retrying leftover distance."""
+        requested_m = abs(float(reverse_m))
+        remaining_m = requested_m
+        traveled_m = 0.0
+        if remaining_m <= 0.02:
+            return {
+                "requested_m": requested_m,
+                "traveled_m": 0.0,
+                "remaining_m": remaining_m,
+                "complete": True,
+                "moves": [],
+            }
+        speed_mps = self._scan_reverse_speed_mps()
+        moves: list[dict[str, object]] = []
+        failures = 0
+        while remaining_m > 0.02 and failures < 3:
+            timeout_s = self._scan_reverse_timeout_s(remaining_m, speed_mps=speed_mps)
+            try:
+                movement = self._move_base_for_scan(
+                    -remaining_m,
+                    timeout_s=timeout_s,
+                    speed_mps=speed_mps,
+                )
+            except Exception as exc:
+                failures += 1
+                self.get_logger().warning(
+                    f"scan reverse move failed "
+                    f"({traveled_m:.3f}/{requested_m:.3f}m): {exc}"
+                )
+                continue
+            step_m = abs(float(movement.get("traveled_m") or 0.0))
+            moves.append(dict(movement))
+            if step_m < 0.02:
+                failures += 1
+                continue
+            traveled_m += step_m
+            remaining_m = max(0.0, requested_m - traveled_m)
+            failures = 0
+        complete = remaining_m <= 0.05
+        if not complete:
+            self.get_logger().error(
+                "failed to return to scan start: "
+                f"reversed {traveled_m:.3f}m of {requested_m:.3f}m"
+            )
+        return {
+            "requested_m": requested_m,
+            "traveled_m": traveled_m,
+            "remaining_m": remaining_m,
+            "complete": complete,
+            "speed_mps": speed_mps,
+            "moves": moves,
+        }
+
+    def _return_to_observation_for_retry(
+        self,
+        *,
+        run_id: str,
+        reverse_m: float,
+        reason: str,
+    ) -> None:
+        """Reverse any search travel, then put the arm back at the observation pose."""
+        self._publish_status(
+            f"recognition_retry_return: run_id={run_id} reason={reason} "
+            f"reverse_m={float(reverse_m):.3f}"
+        )
+        reverse_payload = self._reverse_scan_travel(reverse_m)
+        self._publish_status(
+            f"recognition_retry_reversed: run_id={run_id} "
+            f"traveled={float(reverse_payload['traveled_m']):.3f}m/"
+            f"{float(reverse_payload['requested_m']):.3f}m "
+            f"complete={bool(reverse_payload['complete'])}"
+        )
+        observe_pose = self._observe_pose_values()
+        self._execute_named_pose(
+            name="observation",
+            position_m=(
+                observe_pose[0] / 1000.0,
+                observe_pose[1] / 1000.0,
+                observe_pose[2] / 1000.0,
+            ),
+            rpy_deg=(observe_pose[3], observe_pose[4], observe_pose[5]),
+            speed_percent=float(self.get_parameter("observation_speed").value),
+            open_gripper_first=True,
+            timeout_s=45.0,
+        )
+
+    def _identify_target_card_with_retries(
+        self, *, run_id: str
+    ) -> tuple[object, dict[str, object]]:
+        max_retries = self._recognition_max_retries("target_card_max_retries")
+        attempts: list[dict[str, object]] = []
+        for attempt in range(1 + max_retries):
+            if attempt > 0:
+                self._return_to_observation_for_retry(
+                    run_id=run_id,
+                    reverse_m=self._last_card_search_travel_m,
+                    reason=f"target_card_retry_{attempt + 1}",
+                )
+                self._last_card_search_travel_m = 0.0
+            try:
+                item, payload = self._identify_target_card(run_id=run_id)
+                payload = dict(payload)
+                payload["attempt"] = attempt + 1
+                payload["max_attempts"] = 1 + max_retries
+                payload["retry_history"] = attempts
+                return item, payload
+            except RuntimeError as error:
+                attempts.append({"attempt": attempt + 1, "error": str(error)})
+                self.get_logger().warning(
+                    f"target card attempt {attempt + 1}/{1 + max_retries} failed: {error}"
+                )
+        return None, {
+            "status": "skipped_no_target_card",
+            "attempt": 1 + max_retries,
+            "max_attempts": 1 + max_retries,
+            "retry_history": attempts,
+        }
 
     def _set_executor_strategy_for_item(self, item) -> str:
         strategy = "safe_top_down" if str(item.kind) == "block" else "center_horizontal"
@@ -1798,7 +2005,7 @@ class PipelineOrchestratorNode(Node):
                     home_values[2] / 1000.0,
                 ),
                 rpy_deg=(home_values[3], home_values[4], home_values[5]),
-                speed_percent=float(self.get_parameter("speed").value),
+                speed_percent=float(self.get_parameter("home_speed").value),
                 open_gripper_first=False,
                 timeout_s=60.0,
             )
@@ -1809,9 +2016,19 @@ class PipelineOrchestratorNode(Node):
             raise
         base_thread.join()
         if base_errors:
-            raise RuntimeError(str(base_errors[0])) from base_errors[0]
+            self.get_logger().warning(
+                "post-place base advance failed after a successful release: "
+                f"{base_errors[0]}"
+            )
+            base_result = {
+                "success": False,
+                "error": str(base_errors[0]),
+            }
         if base_result is None:
-            raise RuntimeError("post-place base advance returned no result")
+            base_result = {
+                "success": False,
+                "error": "post-place base advance returned no result",
+            }
         home_result = {
             "success": True,
             "requested_pose_mm_deg": {
@@ -2088,6 +2305,8 @@ class PipelineOrchestratorNode(Node):
         request.run_id = run_id
         request.prompt = prompt
         request.color_image = capture_response.color_image
+        if hasattr(request, "options_json"):
+            request.options_json = self._detect_target_2d_options_json()
         response = self._call_client(
             self._detect_target_2d_client,
             request,
@@ -2751,10 +2970,24 @@ class PipelineOrchestratorNode(Node):
         if fine_step_m <= 0.01:
             raise RuntimeError("base_target_fine_step_m must be greater than 0.01")
 
+        def detection_is_usable(detection) -> bool:
+            if not bool(getattr(detection, "found", False)):
+                return False
+            u_norm = float(getattr(detection, "center_u_norm", 0.0))
+            v_norm = float(getattr(detection, "center_v_norm", 0.0))
+            exclude_roi = getattr(self, "_grasp_exclude_roi_norm", None)
+            search_roi = getattr(self, "_grasp_search_roi_norm", None)
+            if exclude_roi and self._norm_point_in_roi(u_norm, v_norm, exclude_roi):
+                return False
+            if search_roi and not self._norm_point_in_roi(u_norm, v_norm, search_roi):
+                return False
+            return True
+
         def detection_metrics(detection):
+            usable = detection_is_usable(detection)
             center_norm = (
                 (float(detection.center_u_norm), float(detection.center_v_norm))
-                if bool(detection.found)
+                if usable
                 else None
             )
             center_error_u = (
@@ -2768,7 +3001,7 @@ class PipelineOrchestratorNode(Node):
                 else None
             )
             centered = bool(
-                bool(detection.found)
+                usable
                 and center_error_u is not None
                 and center_error_v is not None
                 and math.isfinite(center_error_u)
@@ -2787,6 +3020,9 @@ class PipelineOrchestratorNode(Node):
         last_captured: dict[str, object] | None = None
         last_phase_label = "grasp_scan_start"
         force_full_confirmation = False
+        had_target = False
+        scan_sign = 1.0
+        consecutive_target_misses = 0
         self._publish_status(
             f"scanning_grasp_target: run_id={run_id} item={target_item_id}"
         )
@@ -2862,6 +3098,18 @@ class PipelineOrchestratorNode(Node):
                         if getattr(candidate, "object_center_camera_m", None)
                         is not None
                     ]
+                    exclude_roi = getattr(self, "_grasp_exclude_roi_norm", None)
+                    if exclude_roi and candidates:
+                        kept: list[object] = []
+                        for candidate in candidates:
+                            center = self._grasp_scan_target_center_norm(
+                                {"candidate": candidate, "capture_response": captured.get("capture_response")}
+                            )
+                            if center is None or not self._norm_point_in_roi(
+                                center[0], center[1], exclude_roi
+                            ):
+                                kept.append(candidate)
+                        candidates = kept
                     if candidates:
                         cycle = dict(cycle)
                         cycle["candidate_pool"] = candidates
@@ -2911,19 +3159,59 @@ class PipelineOrchestratorNode(Node):
                     selected_cycle = cycle
                     break
 
-                remaining = max_travel_m - current_offset
-                if remaining <= 0.01:
-                    break
                 target_seen = bool(
-                    bool(detection.found)
+                    detection_is_usable(detection)
                     and center_norm is not None
+                    and center_error_v is not None
+                    # The calibrated block/bottle heights are deliberately
+                    # different. A red bottle cap high in the image must not
+                    # steer a red-block search merely because its hue matches.
+                    and center_error_v <= center_tolerance_v
                 )
-                next_step_m = fine_step_m if target_seen else step_m
+                if target_seen:
+                    had_target = True
+                    consecutive_target_misses = 0
+                    # Keep moving in the established direction while the
+                    # target remains visible. Color-block proposals can jump
+                    # between two red regions for one frame; reversing on a
+                    # larger center error made Scout oscillate at the origin.
+                    next_step_m = scan_sign * fine_step_m
+                elif had_target:
+                    consecutive_target_misses += 1
+                    reverse_after = max(
+                        1,
+                        int(
+                            self.get_parameter(
+                                "grasp_scan_lost_frames_before_reverse"
+                            ).value
+                        ),
+                    )
+                    if consecutive_target_misses >= reverse_after:
+                        # Do not abandon a briefly visible dark bottle. After
+                        # a confirmed loss, reverse in fine steps toward the
+                        # last visible view.
+                        scan_sign = -1.0
+                    next_step_m = scan_sign * fine_step_m
+                else:
+                    next_step_m = step_m
+                if next_step_m > 0.0:
+                    remaining = max_travel_m - current_offset
+                    if remaining <= 0.01:
+                        break
+                    move_m = min(next_step_m, remaining)
+                else:
+                    if current_offset <= 0.02:
+                        # The target was seen near the scan origin; continue
+                        # forward rather than driving behind the cleared lane.
+                        scan_sign = 1.0
+                        move_m = min(fine_step_m, max_travel_m - current_offset)
+                    else:
+                        move_m = -min(abs(next_step_m), current_offset)
                 if bool(
                     self.get_parameter("continuous_search_stop_on_center").value
                 ) and bool(self.get_parameter("continuous_search_enabled").value):
                     movement, trigger = self._move_base_for_scan_until_preview_trigger(
-                        min(next_step_m, remaining),
+                        move_m,
                         run_id=run_id,
                         preview_probe=lambda **kwargs: self._detect_target_2d_from_preview(
                             run_id=run_id,
@@ -2936,10 +3224,9 @@ class PipelineOrchestratorNode(Node):
                     )
                     force_full_confirmation = trigger is not None
                 else:
-                    movement = self._move_base_for_scan(
-                        min(next_step_m, remaining)
-                    )
+                    movement = self._move_base_for_scan(move_m)
                 current_offset += float(movement["traveled_m"])
+                current_offset = max(0.0, float(current_offset))
                 movement["offset_after_move_m"] = float(current_offset)
                 movements.append(movement)
                 time.sleep(
@@ -3828,7 +4115,7 @@ class PipelineOrchestratorNode(Node):
         return response
 
     def _handle_scan_and_align_placement_target_service(self, _request, response):
-        """Scan forward only until the selected box label is arm-aligned."""
+        """Scan for the selected box label, reversing after a miss instead of walking on."""
         if not bool(self.get_parameter("base_target_alignment_enabled").value):
             response.success = False
             response.message = (
@@ -3883,17 +4170,32 @@ class PipelineOrchestratorNode(Node):
                     ),
                 ),
             )
+            taught_map = load_mapping_for_item(item.item_id)
+            taught_align_u_px = (
+                None if taught_map is None else taught_map.align_u_px
+            )
+            if taught_align_u_px is not None:
+                self.get_logger().info(
+                    f"placement scan align target is taught center "
+                    f"u={float(taught_align_u_px):.1f}px, not image center"
+                )
             if step_m <= 0.01 or fine_step_m <= 0.01:
                 raise RuntimeError("base_multiview_offset_m must be greater than 0.01")
+
+            def label_align_u_norm(width: float) -> float:
+                if taught_map is not None:
+                    taught_norm = taught_map.alignment_u_norm(width)
+                    if taught_norm is not None:
+                        return taught_norm
+                return 0.5
 
             def label_center_error(label: dict[str, object]) -> float:
                 bbox = list(label.get("bbox_xywh") or [])
                 width = float(label.get("color_width") or 0.0)
                 if len(bbox) != 4 or width <= 1.0:
                     return float("inf")
-                return abs(
-                    (float(bbox[0]) + (0.5 * float(bbox[2]))) / width - 0.5
-                )
+                u_px = float(bbox[0]) + (0.5 * float(bbox[2]))
+                return abs(u_px / width - label_align_u_norm(width))
 
             def label_is_centered(label: dict[str, object]) -> bool:
                 center_error = label_center_error(label)
@@ -3916,65 +4218,159 @@ class PipelineOrchestratorNode(Node):
                 label, _color, sequence = matched
                 return label, sequence
 
-            selected_view: dict[str, object] | None = None
-            for view_index in range(max_views):
-                view_name = "start" if view_index == 0 else f"forward_{view_index:02d}"
-                view = self._capture_placement_scan_view(
-                    scan_id=scan_id,
-                    view_name=view_name,
-                    offset_from_start_m=current_offset,
-                    item_id=item.item_id,
-                    base_to_camera=state["base_to_camera"],
-                    output_dir=output_dir,
+            try:
+                max_retries = self._recognition_max_retries("placement_scan_max_retries")
+            except Exception:
+                max_retries = 2
+
+            def reverse_to_start(offset: float, *, reason: str) -> float:
+                if abs(float(offset)) <= 0.02:
+                    return 0.0
+                self._publish_status(
+                    f"placement_scan_return: reason={reason} reverse_m={float(offset):.3f}"
                 )
-                label = dict(view.get("label_match") or {})
-                capture = dict(view.get("capture") or {})
-                if not label.get("color_width"):
-                    label["color_width"] = float(capture.get("color_width") or 0.0)
-                center_error_norm = label_center_error(label)
-                label["center_error_norm"] = center_error_norm
-                label["centered"] = label_is_centered(label)
-                view["label_match"] = label
-                views.append(view)
-                if bool(label["centered"]):
-                    selected_view = view
-                    break
-                remaining = max_travel_m - current_offset
-                if remaining <= 0.01:
-                    break
-                target_seen = bool(
-                    str(label.get("matched_item_id") or "") == item.item_id
-                    and float(label.get("confidence") or 0.0)
-                    >= float(self.get_parameter("label_match_threshold").value)
-                    and math.isfinite(center_error_norm)
-                )
-                next_step_m = fine_step_m if target_seen else step_m
-                if bool(
-                    self.get_parameter("continuous_search_stop_on_center").value
-                ) and bool(self.get_parameter("continuous_search_enabled").value):
-                    movement, _trigger = self._move_base_for_scan_until_preview_trigger(
-                        min(next_step_m, remaining),
-                        run_id=scan_id,
-                        preview_probe=preview_label_probe,
-                        should_stop=label_is_centered,
-                    )
-                else:
-                    movement = self._move_base_for_scan(
-                        min(next_step_m, remaining)
-                    )
-                current_offset += float(movement["traveled_m"])
-                movement["offset_after_move_m"] = float(current_offset)
+                movement = self._move_base_for_scan(-abs(float(offset)))
+                movement["offset_after_move_m"] = 0.0
                 movements.append(movement)
-                time.sleep(
-                    max(
-                        0.0,
-                        float(self.get_parameter("base_multiview_settle_s").value),
+                return 0.0
+
+            def restore_placement_observe() -> None:
+                try:
+                    observe = self._placement_observe_pose_values()
+                except Exception:
+                    return
+                try:
+                    self._execute_named_pose(
+                        name="placement_observation",
+                        position_m=(
+                            observe[0] / 1000.0,
+                            observe[1] / 1000.0,
+                            observe[2] / 1000.0,
+                        ),
+                        rpy_deg=(observe[3], observe[4], observe[5]),
+                        speed_percent=float(self.get_parameter("observation_speed").value),
+                        open_gripper_first=False,
+                        timeout_s=45.0,
                     )
+                except Exception as exc:
+                    self.get_logger().warning(
+                        f"could not restore placement observation pose: {exc}"
+                    )
+
+            selected_view: dict[str, object] | None = None
+            attempt_records: list[dict[str, object]] = []
+            for attempt in range(1 + max_retries):
+                scan_sign = 1.0
+                last_center_error: float | None = None
+                had_target = False
+                selected_view = None
+                for view_index in range(max_views):
+                    view_name = (
+                        "start"
+                        if not views
+                        else f"{'rev' if scan_sign < 0 else 'forward'}_{len(views):02d}"
+                    )
+                    view = self._capture_placement_scan_view(
+                        scan_id=scan_id,
+                        view_name=view_name,
+                        offset_from_start_m=current_offset,
+                        item_id=item.item_id,
+                        base_to_camera=state["base_to_camera"],
+                        output_dir=output_dir,
+                    )
+                    label = dict(view.get("label_match") or {})
+                    capture = dict(view.get("capture") or {})
+                    if not label.get("color_width"):
+                        label["color_width"] = float(capture.get("color_width") or 0.0)
+                    center_error_norm = label_center_error(label)
+                    label["center_error_norm"] = center_error_norm
+                    label["centered"] = label_is_centered(label)
+                    view["label_match"] = label
+                    view["attempt"] = attempt + 1
+                    views.append(view)
+                    if bool(label["centered"]):
+                        selected_view = view
+                        break
+                    target_seen = bool(
+                        str(label.get("matched_item_id") or "") == item.item_id
+                        and float(label.get("confidence") or 0.0)
+                        >= float(self.get_parameter("label_match_threshold").value)
+                        and math.isfinite(center_error_norm)
+                    )
+                    if target_seen:
+                        had_target = True
+                        if (
+                            last_center_error is not None
+                            and center_error_norm > last_center_error + 0.02
+                        ):
+                            scan_sign = -1.0
+                        last_center_error = center_error_norm
+                        next_step_m = scan_sign * fine_step_m
+                    elif had_target:
+                        scan_sign = -1.0
+                        next_step_m = -fine_step_m
+                    else:
+                        next_step_m = step_m
+                    if next_step_m > 0.0:
+                        remaining = max_travel_m - current_offset
+                        if remaining <= 0.01:
+                            break
+                        move_m = min(next_step_m, remaining)
+                    else:
+                        if current_offset <= 0.02:
+                            break
+                        move_m = -min(abs(next_step_m), current_offset)
+                    if bool(
+                        self.get_parameter("continuous_search_stop_on_center").value
+                    ) and bool(self.get_parameter("continuous_search_enabled").value):
+                        movement, _trigger = self._move_base_for_scan_until_preview_trigger(
+                            move_m,
+                            run_id=scan_id,
+                            preview_probe=preview_label_probe,
+                            should_stop=label_is_centered,
+                        )
+                    else:
+                        movement = self._move_base_for_scan(move_m)
+                    current_offset += float(movement["traveled_m"])
+                    current_offset = max(0.0, float(current_offset))
+                    movement["offset_after_move_m"] = float(current_offset)
+                    movements.append(movement)
+                    time.sleep(
+                        max(
+                            0.0,
+                            float(self.get_parameter("base_multiview_settle_s").value),
+                        )
+                    )
+                if selected_view is not None:
+                    break
+                attempt_records.append(
+                    {
+                        "attempt": attempt + 1,
+                        "offset_m": float(current_offset),
+                        "had_target": had_target,
+                    }
+                )
+                if attempt < max_retries:
+                    current_offset = reverse_to_start(
+                        current_offset,
+                        reason=f"placement_retry_{attempt + 1}",
+                    )
+                    restore_placement_observe()
+            self._last_placement_scan_travel_m = float(current_offset)
+            if selected_view is None and current_offset > 0.02:
+                current_offset = reverse_to_start(
+                    current_offset,
+                    reason="placement_scan_failed",
                 )
 
             aligned_odom = self._base_odom_snapshot()
             selected_label = dict(selected_view.get("label_match") or {}) if selected_view else {}
             validation_ok = selected_view is not None
+            selected_width = float(
+                dict(selected_label).get("color_width")
+                or dict((selected_view or {}).get("capture") or {}).get("color_width")
+                or 0.0
+            )
             alignment = {
                 "success": validation_ok,
                 "item_id": item.item_id,
@@ -3986,6 +4382,19 @@ class PipelineOrchestratorNode(Node):
                 "selected_confidence": float(selected_label.get("confidence") or 0.0),
                 "selected_center_error_norm": float(selected_label.get("center_error_norm") or 0.0),
                 "center_tolerance_norm": center_limit,
+                "align_u_px": (
+                    None if taught_align_u_px is None else float(taught_align_u_px)
+                ),
+                "align_u_norm": (
+                    label_align_u_norm(selected_width)
+                    if selected_width > 1.0
+                    else None
+                ),
+                "align_source": (
+                    "taught_center_sample"
+                    if taught_align_u_px is not None
+                    else "image_center"
+                ),
                 "aligned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             payload = {
@@ -4009,7 +4418,8 @@ class PipelineOrchestratorNode(Node):
                 "base_odom_origin": {
                     "x_m": aligned_odom[0], "y_m": aligned_odom[1], "yaw_rad": aligned_odom[2],
                 },
-                "base_returned_to_start": False,
+                "base_returned_to_start": selected_view is None,
+                "placement_scan_attempts": attempt_records,
                 "views": views,
                 "movements": movements,
                 "target_alignment": alignment,
@@ -4028,6 +4438,12 @@ class PipelineOrchestratorNode(Node):
                 else payload["validation_message"]
             )
         except Exception as exc:
+            try:
+                if current_offset > 0.02:
+                    self._move_base_for_scan(-abs(current_offset))
+                    current_offset = 0.0
+            except Exception:
+                pass
             response.success = False
             response.message = str(exc)
         finally:
@@ -4298,6 +4714,135 @@ class PipelineOrchestratorNode(Node):
         confidence = float(alignment.get("selected_confidence") or 0.0)
         return payload, slot_index, confidence
 
+    def _place_plan_from_poses(
+        self,
+        *,
+        item_id: str,
+        slot_index: int,
+        label_confidence: float,
+        poses: dict[str, tuple[float, ...]],
+    ) -> PlacePlan:
+        catalog = self._item_catalog()
+        message = PlacePlan()
+        message.item_id = item_id
+        message.slot_index = int(slot_index)
+        message.approach_pose = self._pose6d_from_mm_deg(poses["approach"])
+        message.release_pose = self._pose6d_from_mm_deg(poses["release"])
+        message.retreat_pose = self._pose6d_from_mm_deg(poses["retreat"])
+        message.box_outer_size_m = [float(value) for value in catalog.box.outer_size_m]
+        message.label_verified = True
+        message.label_confidence = float(label_confidence)
+        return message
+
+    def _build_live_or_fixed_place_plan(
+        self,
+        *,
+        item_id: str,
+        label_confidence: float,
+        slot_index: int,
+    ) -> tuple[PlacePlan, str, dict[str, object]]:
+        """Prefer taught (u, v)->XY; then label depth; then calibrated TCP."""
+        try:
+            _, _, hand_eye, _ = self._build_runtime()
+            state = self._read_robot_state_snapshot(hand_eye=hand_eye)
+            capture = self._capture_scene_once(
+                run_id=f"aligned-place-{item_id}",
+                phase_label="aligned_place_label",
+            )
+            label = self._match_box_label_once(
+                run_id=f"aligned-place-{item_id}",
+                item_id=item_id,
+                capture_response=capture,
+                base_to_camera=state["base_to_camera"],
+                require_complete=False,
+            )
+            bbox = [int(value) for value in list(label.get("bbox_xywh") or [])]
+            if (
+                str(label.get("matched_item_id") or "") != item_id
+                or len(bbox) != 4
+                or min(bbox[2], bbox[3]) <= 1
+            ):
+                raise RuntimeError(str(label.get("message") or "target label not confirmed"))
+            u_px = float(bbox[0]) + (0.5 * float(bbox[2]))
+            v_px = float(bbox[1]) + (0.5 * float(bbox[3]))
+            confidence = float(label.get("confidence") or label_confidence)
+            mapping = load_mapping_for_item(item_id)
+            if mapping is not None:
+                if not mapping.in_domain(u_px, v_px):
+                    raise RuntimeError(
+                        f"label center ({u_px:.1f},{v_px:.1f}) is outside the taught "
+                        f"u{list(mapping.u_px_range)} v{list(mapping.v_px_range)} window"
+                    )
+                poses = mapping.poses_mm_deg(u_px, v_px)
+                self.get_logger().info(
+                    f"place XY from taught map: u={u_px:.1f} v={v_px:.1f} -> "
+                    f"X={poses['release'][0]:.1f} Y={poses['release'][1]:.1f} "
+                    f"Z={poses['release'][2]:.1f} "
+                    f"rpy={list(poses['release'][3:])} "
+                    f"rms={mapping.fit_rms_xy_mm:.1f}mm"
+                )
+                return (
+                    self._place_plan_from_poses(
+                        item_id=item_id,
+                        slot_index=slot_index,
+                        label_confidence=confidence,
+                        poses=poses,
+                    ),
+                    "taught_uv_xy_map",
+                    {
+                        "source": "taught_uv_xy_map",
+                        "u_px": u_px,
+                        "v_px": v_px,
+                        "release_xy_mm": [poses["release"][0], poses["release"][1]],
+                        "label_bbox_xywh": bbox,
+                        "label_confidence": confidence,
+                        "fit_rms_xy_mm": mapping.fit_rms_xy_mm,
+                    },
+                )
+            detection = LabelDetection(
+                item_id=item_id,
+                confidence=confidence,
+                bbox_xywh=(bbox[0], bbox[1], bbox[2], bbox[3]),
+                method=str(dict(label.get("diagnostics") or {}).get("method") or "label"),
+            )
+            box_center = self._item_catalog().localize_single_box_from_label(
+                depth_meters=depth_msg_to_meters(capture.depth_image),
+                camera_k=list(capture.camera_info.k),
+                base_to_camera=state["base_to_camera"],
+                detection=detection,
+            )
+            poses = self._item_catalog().build_vision_place_poses_mm_deg(
+                item_id, box_center
+            )
+            return (
+                self._place_plan_from_poses(
+                    item_id=item_id,
+                    slot_index=slot_index,
+                    label_confidence=confidence,
+                    poses=poses,
+                ),
+                "label_depth_xy",
+                {
+                    "source": "label_depth_xy",
+                    "box_center_base_m": [float(value) for value in box_center],
+                    "label_bbox_xywh": bbox,
+                    "label_confidence": confidence,
+                },
+            )
+        except Exception as exc:
+            self.get_logger().warning(
+                f"live place pose unavailable ({exc}); using calibrated TCP"
+            )
+            return (
+                self._build_base_aligned_place_plan_message(
+                    item_id=item_id,
+                    label_confidence=label_confidence,
+                    slot_index=slot_index,
+                ),
+                "base_aligned_fixed_tcp_calibration",
+                {"source": "calibrated_fallback", "error": str(exc)},
+            )
+
     def _handle_execute_aligned_place_service(self, _request, response):
         if not bool(self.get_parameter("base_aligned_place_enabled").value):
             response.success = False
@@ -4328,10 +4873,12 @@ class PipelineOrchestratorNode(Node):
             scan_payload, slot_index, confidence = (
                 self._validated_aligned_place_context(item.item_id)
             )
-            plan = self._build_base_aligned_place_plan_message(
-                item_id=item.item_id,
-                label_confidence=confidence,
-                slot_index=slot_index,
+            plan, localization_source, live_diagnostics = (
+                self._build_live_or_fixed_place_plan(
+                    item_id=item.item_id,
+                    label_confidence=confidence,
+                    slot_index=slot_index,
+                )
             )
             run_id = new_run_id("aligned-place")
 
@@ -4379,7 +4926,8 @@ class PipelineOrchestratorNode(Node):
                 "slot_index": slot_index,
                 "label_confidence": confidence,
                 "executed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "localization_source": "base_aligned_fixed_tcp_calibration",
+                "localization_source": localization_source,
+                "live_place_pose": live_diagnostics,
                 "execution": execution,
                 "post_place_home": post_place_home,
                 "post_place_base_advance": post_place_base_advance,
@@ -4390,10 +4938,11 @@ class PipelineOrchestratorNode(Node):
             self._result_pub.publish(String(data=json_dumps(scan_payload)))
             response.success = True
             response.message = (
-                f"fixed aligned placement completed: {item.item_id} "
-                f"slot={slot_index} run_id={run_id}"
+                f"aligned placement completed: {item.item_id} "
+                f"slot={slot_index} source={localization_source} run_id={run_id}"
             )
         except Exception as exc:
+            self.get_logger().error(f"aligned place failed: {exc}")
             response.success = False
             response.message = str(exc)
         finally:
@@ -4593,6 +5142,7 @@ class PipelineOrchestratorNode(Node):
             self.get_parameter("base_grasp_scan_enabled").value
         )
         try:
+            self._clear_grasp_card_exclusion()
             self._publish_candidate_validation_markers(
                 validation_records=[],
                 camera_frame="camera_color_optical_frame",
@@ -4614,12 +5164,30 @@ class PipelineOrchestratorNode(Node):
 
             target_card_payload: dict[str, object] | None = None
             if auto_target_from_card:
-                target_item, target_card_payload = self._identify_target_card(
+                target_item, target_card_payload = self._identify_target_card_with_retries(
                     run_id=run_id
                 )
+                if target_item is None:
+                    self._clear_grasp_card_exclusion()
+                    status = "skipped_no_target_card"
+                    summary = (
+                        "target card not recognized after "
+                        f"{int(target_card_payload.get('max_attempts') or 0)} "
+                        "attempts; grasp skipped"
+                    )
+                    result_payload.update(
+                        {
+                            "status": status,
+                            "summary": summary,
+                            "target_card_identification": target_card_payload,
+                            "diagnostics": diagnostics,
+                        }
+                    )
+                    return
                 # Publish the resolved identity for dashboards and external
                 # observers, but every automatic run still performs a fresh
                 # card capture and never trusts these retained values.
+                self._remember_target_card_exclusion(target_card_payload)
                 self.set_parameters(
                     [
                         Parameter("target_item_id", value=target_item.item_id),
@@ -4686,19 +5254,57 @@ class PipelineOrchestratorNode(Node):
             request_payload["execute"] = bool(self.get_parameter("execute").value)
 
             if base_grasp_scan_requested:
-                cycle, grasp_scan_payload = self._run_base_grasp_target_scan(
-                    run_id=run_id,
-                    prompt=prompt,
-                    target_item_id=target_item_id,
-                    options=options,
-                    hand_eye=hand_eye,
-                )
+                scan_retries = self._recognition_max_retries("grasp_scan_max_retries")
+                cycle = None
+                grasp_scan_payload = None
+                for scan_attempt in range(1 + scan_retries):
+                    if scan_attempt > 0:
+                        reverse_m = float(
+                            (grasp_scan_payload or {}).get("final_offset_from_start_m") or 0.0
+                        )
+                        self._return_to_observation_for_retry(
+                            run_id=run_id,
+                            reverse_m=reverse_m,
+                            reason=f"grasp_item_retry_{scan_attempt + 1}",
+                        )
+                    try:
+                        cycle, grasp_scan_payload = self._run_base_grasp_target_scan(
+                            run_id=run_id,
+                            prompt=prompt,
+                            target_item_id=target_item_id,
+                            options=options,
+                            hand_eye=hand_eye,
+                        )
+                    except RuntimeError as error:
+                        if scan_attempt >= scan_retries:
+                            raise
+                        self.get_logger().warning(
+                            f"grasp item scan attempt {scan_attempt + 1}/"
+                            f"{1 + scan_retries} failed: {error}"
+                        )
+                        grasp_scan_payload = {
+                            "final_offset_from_start_m": 0.0,
+                            "views": [],
+                            "success": False,
+                        }
+                        continue
+                    grasp_scan_payload = dict(grasp_scan_payload)
+                    grasp_scan_payload["attempt"] = scan_attempt + 1
+                    grasp_scan_payload["max_attempts"] = 1 + scan_retries
+                    if bool(grasp_scan_payload.get("success")):
+                        break
+                    self.get_logger().warning(
+                        f"grasp item scan attempt {scan_attempt + 1}/"
+                        f"{1 + scan_retries} did not find {target_item_id}"
+                    )
                 cycle_records = [dict(view) for view in grasp_scan_payload["views"]]
                 diagnostics.append(
                     "grasp single-pass scan: "
                     f"views={len(grasp_scan_payload['views'])} "
                     f"offset={float(grasp_scan_payload['final_offset_from_start_m']):.3f}m "
-                    f"target_found={bool(grasp_scan_payload['success'])}"
+                    f"target_found={bool(grasp_scan_payload['success'])} "
+                    f"attempt={int(grasp_scan_payload.get('attempt') or 1)}/"
+                    f"{int(grasp_scan_payload.get('max_attempts') or 1)}"
                 )
                 if bool(self.get_parameter("precenter").value):
                     diagnostics.append(

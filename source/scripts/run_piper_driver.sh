@@ -15,6 +15,7 @@ gripper_exist="${PIPER_GRIPPER_EXIST:-true}"
 # that conversion is handled by the feedback relay and must not be applied to
 # /joint_ctrl_single commands a second time.
 gripper_val_mutiple="${PIPER_GRIPPER_VAL_MUTIPLE:-1}"
+can_loss_grace_s="${PIPER_CAN_LOSS_GRACE_S:-2.0}"
 piper_sdk_root="${PIPER_SDK_ROOT:-${bundle_root}/piper_sdk}"
 python_can_site="${PIPER_PYTHON_CAN_SITE:-}"
 
@@ -49,6 +50,7 @@ Options:
 Environment overrides:
   PIPER_SDK_ROOT=${piper_sdk_root}
   PIPER_PYTHON_CAN_SITE=<site-packages containing python-can>
+  PIPER_CAN_LOSS_GRACE_S=${can_loss_grace_s}
 EOF
       exit 0
       ;;
@@ -127,6 +129,7 @@ echo "  can_port: ${can_port}"
 echo "  auto_enable: ${auto_enable}"
 echo "  gripper_exist: ${gripper_exist}"
 echo "  gripper_val_mutiple: ${gripper_val_mutiple}"
+echo "  can_loss_grace_s: ${can_loss_grace_s}"
 echo "  piper_sdk_root: ${piper_sdk_root}"
 echo "  python_can_site: ${python_can_site}"
 echo "  driver: ${piper_driver_executable}"
@@ -135,4 +138,5 @@ exec "${piper_driver_executable}" --ros-args \
   -p "can_port:=${can_port}" \
   -p "auto_enable:=${auto_enable}" \
   -p "gripper_exist:=${gripper_exist}" \
-  -p "gripper_val_mutiple:=${gripper_val_mutiple}"
+  -p "gripper_val_mutiple:=${gripper_val_mutiple}" \
+  -p "can_loss_grace_s:=${can_loss_grace_s}"

@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.grasping.models import GraspCandidate, PerceptionResult
 from src.grasping.planning import PureGraspPlanner
+from src.perception.graspnet_runner import make_center_contact_grasp_group
 from src.perception.geometry import (
     depth_to_scene_points,
     keep_largest_point_cluster,
@@ -50,6 +51,24 @@ def _parse_options_json(text: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError("options_json must decode to an object")
     return payload
+
+
+def _optional_norm_roi(value: object) -> tuple[float, float, float, float] | None:
+    if value is None:
+        return None
+    values = [float(item) for item in list(value)]
+    if len(values) != 4:
+        return None
+    return (values[0], values[1], values[2], values[3])
+
+
+def _point_in_norm_roi(
+    u_norm: float,
+    v_norm: float,
+    roi: tuple[float, float, float, float],
+) -> bool:
+    x0, y0, x1, y1 = roi
+    return x0 <= u_norm <= x1 and y0 <= v_norm <= y1
 
 
 def _build_args_from_options(options: dict[str, object]) -> argparse.Namespace:
@@ -221,6 +240,13 @@ class ExternalInferenceEngine:
         self._runtime_key: tuple[str, str] | None = None
         self._planner: PureGraspPlanner | None = None
         self._config = None
+        self._graspnet_checkpoint: str | None = None
+
+    @staticmethod
+    def _use_center_contact_candidates(options: dict[str, object]) -> bool:
+        if bool(options.get("prefer_object_center_candidates", False)):
+            return True
+        return bool(str(options.get("target_item_id") or "").strip())
 
     def _ensure_runtime(self, options: dict[str, object]) -> None:
         args = _build_args_from_options(options)
@@ -235,11 +261,11 @@ class ExternalInferenceEngine:
             self._planner.config = config
             return
 
-        from src.perception.graspnet_runner import GraspNetRunner, resolve_graspnet_checkpoint
+        from src.perception.graspnet_runner import resolve_graspnet_checkpoint
         from src.perception.yolo_segmenter import YOLOSegmenter
 
         checkpoint = resolve_graspnet_checkpoint(config.graspnet_checkpoint)
-        if not checkpoint:
+        if not checkpoint and not self._use_center_contact_candidates(options):
             raise RuntimeError("GraspNet checkpoint is not configured")
 
         hand_eye = _load_hand_eye_matrix(hand_eye_path)
@@ -247,8 +273,25 @@ class ExternalInferenceEngine:
             device=config.grasp_device,
             model_name="yolov8n-seg.pt",
         )
+        self._graspnet = None
+        self._graspnet_checkpoint = checkpoint or None
+        self._planner = PureGraspPlanner(config, hand_eye)
+        self._config = config
+        self._runtime_key = runtime_key
+
+    def _ensure_graspnet(self):
+        if self._graspnet is not None:
+            return self._graspnet
+        if self._config is None:
+            raise RuntimeError("inference runtime did not initialize")
+        if not self._graspnet_checkpoint:
+            raise RuntimeError("GraspNet checkpoint is not configured")
+
+        from src.perception.graspnet_runner import GraspNetRunner
+
+        config = self._config
         self._graspnet = GraspNetRunner(
-            checkpoint_path=checkpoint,
+            checkpoint_path=self._graspnet_checkpoint,
             device=config.grasp_device,
             num_point=config.grasp_num_point,
             topk=config.grasp_topk,
@@ -256,14 +299,12 @@ class ExternalInferenceEngine:
             collision_thresh=config.grasp_collision_thresh,
             approach_dist=config.grasp_approach_dist,
         )
-        self._planner = PureGraspPlanner(config, hand_eye)
-        self._config = config
-        self._runtime_key = runtime_key
+        return self._graspnet
 
     def warmup(self, options: dict[str, object]) -> None:
         """Load models and execute one synthetic pass before a real task."""
         self._ensure_runtime(options)
-        if self._segmenter is None or self._graspnet is None:
+        if self._segmenter is None:
             raise RuntimeError("inference runtime did not initialize")
 
         # Both Ultralytics and CUDA defer meaningful setup until the first
@@ -271,18 +312,23 @@ class ExternalInferenceEngine:
         # keeps it out of the navigation-to-grasp handoff critical path.
         dummy_image = np.zeros((320, 320, 3), dtype=np.uint8)
         self._segmenter.segment_text(dummy_image, "bottle")
-        rng = np.random.default_rng(0)
-        dummy_points = rng.uniform(
-            low=(-0.10, -0.10, 0.35),
-            high=(0.10, 0.10, 0.65),
-            size=(max(64, int(self._graspnet.num_point)), 3),
-        ).astype(np.float32)
-        self._graspnet.predict(dummy_points, dummy_points)
+        if not self._use_center_contact_candidates(options):
+            graspnet = self._ensure_graspnet()
+            rng = np.random.default_rng(0)
+            dummy_points = rng.uniform(
+                low=(-0.10, -0.10, 0.35),
+                high=(0.10, 0.10, 0.65),
+                size=(max(64, int(graspnet.num_point)), 3),
+            ).astype(np.float32)
+            graspnet.predict(dummy_points, dummy_points)
 
     def detect_target_2d(
         self,
         color_bgr: np.ndarray,
         prompt: str,
+        *,
+        search_roi_norm: tuple[float, float, float, float] | None = None,
+        exclude_roi_norm: tuple[float, float, float, float] | None = None,
     ) -> dict[str, object]:
         """Locate a target cheaply, without point-cloud or GraspNet inference."""
         if self._segmenter is None:
@@ -296,42 +342,52 @@ class ExternalInferenceEngine:
         masks = segmentation.get("masks")
         scores = segmentation.get("scores")
         count = self._segmentation_count(segmentation)
+        backend = str(segmentation.get("backend") or "unknown")
+        empty = {
+            "found": False,
+            "center_u_norm": 0.0,
+            "center_v_norm": 0.0,
+            "confidence": 0.0,
+            "backend": backend,
+        }
         if count <= 0:
-            return {
-                "found": False,
-                "center_u_norm": 0.0,
-                "center_v_norm": 0.0,
-                "confidence": 0.0,
-                "backend": str(segmentation.get("backend") or "unknown"),
-            }
+            return empty
         score_values = [
             float(value.detach().cpu().item()) if hasattr(value, "detach") else float(value)
             for value in list(scores)[:count]
         ]
-        selected_index = int(np.argmax(score_values))
-        mask = masks[selected_index].squeeze()
-        mask_np = (
-            mask.detach().cpu().numpy().astype(bool)
-            if hasattr(mask, "detach")
-            else np.asarray(mask).astype(bool)
-        )
-        center_uv = self._mask_centroid_uv(mask_np)
         height, width = np.asarray(color_bgr).shape[:2]
-        if center_uv is None or width <= 0 or height <= 0:
+        if width <= 0 or height <= 0:
+            return empty
+        ranked = sorted(range(count), key=lambda index: score_values[index], reverse=True)
+        for selected_index in ranked:
+            mask = masks[selected_index].squeeze()
+            mask_np = (
+                mask.detach().cpu().numpy().astype(bool)
+                if hasattr(mask, "detach")
+                else np.asarray(mask).astype(bool)
+            )
+            center_uv = self._mask_centroid_uv(mask_np)
+            if center_uv is None:
+                continue
+            center_u = float(center_uv[0]) / float(width)
+            center_v = float(center_uv[1]) / float(height)
+            if search_roi_norm is not None and not _point_in_norm_roi(
+                center_u, center_v, search_roi_norm
+            ):
+                continue
+            if exclude_roi_norm is not None and _point_in_norm_roi(
+                center_u, center_v, exclude_roi_norm
+            ):
+                continue
             return {
-                "found": False,
-                "center_u_norm": 0.0,
-                "center_v_norm": 0.0,
-                "confidence": 0.0,
-                "backend": str(segmentation.get("backend") or "unknown"),
+                "found": True,
+                "center_u_norm": center_u,
+                "center_v_norm": center_v,
+                "confidence": float(score_values[selected_index]),
+                "backend": backend,
             }
-        return {
-            "found": True,
-            "center_u_norm": float(center_uv[0]) / float(width),
-            "center_v_norm": float(center_uv[1]) / float(height),
-            "confidence": float(score_values[selected_index]),
-            "backend": str(segmentation.get("backend") or "unknown"),
-        }
+        return empty
 
     def detect_label_bottles(
         self,
@@ -467,7 +523,9 @@ class ExternalInferenceEngine:
 
         if not keep_indices:
             return None
-        return self._graspnet.subset_grasp_group(scene_grasp_group, keep_indices)
+        from src.perception.graspnet_runner import GraspNetRunner
+
+        return GraspNetRunner.subset_grasp_group(scene_grasp_group, keep_indices)
 
     def _perception_overview_lines(self, perception: PerceptionResult, text_prompt: str) -> list[str]:
         segmentation_count = self._segmentation_count(perception.segmentation)
@@ -508,6 +566,7 @@ class ExternalInferenceEngine:
     ) -> dict[str, object]:
         self._ensure_runtime(options)
         config = self.config
+        use_center_candidates = self._use_center_contact_candidates(options)
 
         filter_mode = str(config.pointcloud_filter_mode)
         if filter_mode == "median":
@@ -540,11 +599,15 @@ class ExternalInferenceEngine:
             clip_max=config.clip_max_m,
             mask=None,
         )
-        scene_grasp_group = self._graspnet.predict(
-            scene_points=scene_points,
-            object_points=scene_points,
-        )
-        scene_grasp_count = int(len(scene_grasp_group)) if scene_grasp_group is not None else 0
+        if use_center_candidates:
+            scene_grasp_group = None
+            scene_grasp_count = 0
+        else:
+            scene_grasp_group = self._ensure_graspnet().predict(
+                scene_points=scene_points,
+                object_points=scene_points,
+            )
+            scene_grasp_count = int(len(scene_grasp_group)) if scene_grasp_group is not None else 0
 
         grasp_groups = []
         grasp_source_debug: list[dict[str, object]] = []
@@ -591,24 +654,35 @@ class ExternalInferenceEngine:
                 object_centers_camera_m.append(None)
             object_centers_uv.append(self._mask_centroid_uv(mask_np))
 
-            # Predict grasps directly on this instance's object point cloud
-            instance_grasps = self._graspnet.predict(
-                scene_points=scene_points,
-                object_points=object_points,
-            )
-            if instance_grasps is not None and len(instance_grasps) > 0:
-                instance_grasps = instance_grasps[: self.config.grasp_topk]
-            scene_mask_grasps = self._filter_scene_grasps_by_mask(
-                scene_grasp_group=scene_grasp_group,
-                mask_np=mask_np,
-                depth_meters=depth_meters,
-                intrinsics=intrinsics,
-            )
-            merged_grasps = self._graspnet.merge_grasp_groups(
-                instance_grasps,
-                scene_mask_grasps,
-                topk=self.config.grasp_topk,
-            )
+            if use_center_candidates:
+                instance_grasps = (
+                    make_center_contact_grasp_group(object_centers_camera_m[-1])
+                    if object_centers_camera_m[-1] is not None
+                    else None
+                )
+                scene_mask_grasps = None
+                merged_grasps = instance_grasps
+                source_kind = "object_center_contact"
+            else:
+                # Predict grasps directly on this instance's object point cloud
+                instance_grasps = self._ensure_graspnet().predict(
+                    scene_points=scene_points,
+                    object_points=object_points,
+                )
+                if instance_grasps is not None and len(instance_grasps) > 0:
+                    instance_grasps = instance_grasps[: self.config.grasp_topk]
+                scene_mask_grasps = self._filter_scene_grasps_by_mask(
+                    scene_grasp_group=scene_grasp_group,
+                    mask_np=mask_np,
+                    depth_meters=depth_meters,
+                    intrinsics=intrinsics,
+                )
+                merged_grasps = self._ensure_graspnet().merge_grasp_groups(
+                    instance_grasps,
+                    scene_mask_grasps,
+                    topk=self.config.grasp_topk,
+                )
+                source_kind = "graspnet"
             grasp_groups.append(merged_grasps)
             grasp_source_debug.append(
                 {
@@ -617,6 +691,7 @@ class ExternalInferenceEngine:
                     "instance_grasps": int(len(instance_grasps)) if instance_grasps is not None else 0,
                     "scene_mask_grasps": int(len(scene_mask_grasps)) if scene_mask_grasps is not None else 0,
                     "merged_grasps": int(len(merged_grasps)) if merged_grasps is not None else 0,
+                    "source": source_kind,
                 }
             )
 
@@ -645,6 +720,7 @@ class ExternalInferenceEngine:
                     "instance_grasps": 0,
                     "scene_mask_grasps": int(len(fallback_grasps)) if fallback_grasps is not None else 0,
                     "merged_grasps": int(len(fallback_grasps)) if fallback_grasps is not None else 0,
+                    "source": "scene_fallback",
                     "fallback": "scene_grasps_without_segmentation",
                 }
             )
@@ -687,7 +763,9 @@ class ExternalInferenceEngine:
         initial_diagnostics.extend(
             "grasp source instance[{instance_index}]: object_points={object_points} "
             "instance_grasps={instance_grasps} scene_mask_grasps={scene_mask_grasps} "
-            "merged_grasps={merged_grasps}".format(**item)
+            "merged_grasps={merged_grasps} source={source}".format(
+                **{"source": "graspnet", **item}
+            )
             for item in grasp_source_debug
         )
         candidate_pool, diagnostics, max_angle = self.planner.collect_grasp_candidates(
@@ -695,6 +773,14 @@ class ExternalInferenceEngine:
             tcp_pose,
             base_to_camera,
             initial_diagnostics=initial_diagnostics,
+            # RGB-D can put a colored cube's raw center below the tabletop.
+            # Keep that candidate until the orchestrator replaces its Z with
+            # the known table-relative cube height, then perform the normal
+            # robot/executor workspace validation on the corrected plan.
+            defer_workspace_validation=(
+                str(options.get("target_item_id") or "").strip().lower()
+                in {"red_block", "yellow_block", "blue_block"}
+            ),
         )
         if preview_notice:
             diagnostics.append(preview_notice)
@@ -760,7 +846,12 @@ def _handle_one_request(engine: ExternalInferenceEngine, request: dict[str, obje
     work_dir = Path(str(request["work_dir"])).expanduser().resolve()
     color_bgr = np.load(work_dir / str(request["color_npy"]))
     if str(request.get("type") or "") == "detect_target_2d":
-        result = engine.detect_target_2d(color_bgr, str(request.get("prompt") or ""))
+        result = engine.detect_target_2d(
+            color_bgr,
+            str(request.get("prompt") or ""),
+            search_roi_norm=_optional_norm_roi(request.get("search_roi_norm")),
+            exclude_roi_norm=_optional_norm_roi(request.get("exclude_roi_norm")),
+        )
         return {"success": True, "message": "target detection completed", "result": result}
     if str(request.get("type") or "") == "detect_label_bottles":
         proposals = engine.detect_label_bottles(color_bgr)

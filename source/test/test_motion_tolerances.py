@@ -19,6 +19,19 @@ def test_small_translation_tightens_position_tolerance():
     assert tolerance_mm < 3.0
 
 
+def test_small_translation_never_tightens_below_one_millimeter():
+    start = EndPoseMMDeg(0.0, 0.0, 100.0, 0.0, 0.0, 0.0)
+    target = EndPoseMMDeg(0.0, 0.0, 101.0, 0.0, 0.0, 0.0)
+
+    tolerance_mm = effective_position_tolerance_mm(
+        start=start,
+        target=target,
+        default_tolerance_mm=20.0,
+    )
+
+    assert tolerance_mm == 1.0
+
+
 def test_large_translation_keeps_default_position_tolerance():
     start = EndPoseMMDeg(50.67, -0.086, 171.186, -165.533, 72.558, -166.143)
     target = EndPoseMMDeg(50.67, -0.086, 221.186, -165.533, 72.558, -166.143)

@@ -291,11 +291,92 @@ def test_post_place_advance_is_one_continuous_1_5m_move(monkeypatch):
     assert result["traveled_m"] == pytest.approx(1.49)
 
 
+def _retry_return_node(monkeypatch, parameters=None):
+    node = PipelineOrchestratorNode.__new__(PipelineOrchestratorNode)
+    values = {
+        "base_multiview_speed_mps": 0.08,
+        "base_multiview_move_timeout_s": 22.0,
+        "target_card_base_search_speed_mps": 0.03,
+        "target_card_base_search_timeout_s": 18.0,
+        "observation_speed": 20.0,
+        "observe_pose": [30.0, 0.0, 400.0, 0.0, 120.0, 0.0],
+    }
+    if parameters:
+        values.update(parameters)
+    monkeypatch.setattr(
+        node,
+        "get_parameter",
+        lambda name: SimpleNamespace(value=values[name]),
+    )
+    node._publish_status = lambda _message: None
+    node.get_logger = lambda: SimpleNamespace(
+        warning=lambda _message: None,
+        error=lambda _message: None,
+        info=lambda _message: None,
+    )
+    node._execute_named_pose = lambda **_kwargs: None
+    return node
+
+
+def test_recognition_retry_reverses_full_scan_distance_at_scan_speed(monkeypatch):
+    node = _retry_return_node(monkeypatch)
+    calls = []
+
+    def move_base(distance_m, *, timeout_s=None, speed_mps=None):
+        calls.append((distance_m, timeout_s, speed_mps))
+        return {
+            "success": True,
+            "requested_distance_m": distance_m,
+            "traveled_m": abs(distance_m),
+        }
+
+    node._move_base_for_scan = move_base
+    PipelineOrchestratorNode._return_to_observation_for_retry(
+        node,
+        run_id="grasp-test",
+        reverse_m=1.489,
+        reason="grasp_item_retry_2",
+    )
+
+    assert len(calls) == 1
+    distance_m, timeout_s, speed_mps = calls[0]
+    assert distance_m == pytest.approx(-1.489)
+    assert speed_mps == pytest.approx(0.08)
+    assert speed_mps != pytest.approx(0.03)
+    assert timeout_s == pytest.approx(1.489 / 0.08 + 8.0)
+    assert timeout_s > 18.0
+
+
+def test_recognition_retry_keeps_reversing_until_scan_origin(monkeypatch):
+    node = _retry_return_node(monkeypatch)
+    remaining_steps = [0.50, 0.988]
+    calls = []
+
+    def move_base(distance_m, *, timeout_s=None, speed_mps=None):
+        step = remaining_steps.pop(0)
+        calls.append((distance_m, timeout_s, speed_mps))
+        return {
+            "success": True,
+            "requested_distance_m": distance_m,
+            "traveled_m": min(step, abs(distance_m)),
+        }
+
+    node._move_base_for_scan = move_base
+    payload = PipelineOrchestratorNode._reverse_scan_travel(node, 1.488)
+
+    assert payload["complete"] is True
+    assert payload["traveled_m"] == pytest.approx(1.488)
+    assert payload["remaining_m"] == pytest.approx(0.0)
+    assert [call[0] for call in calls] == pytest.approx([-1.488, -0.988])
+    assert all(call[2] == pytest.approx(0.08) for call in calls)
+
+
 def test_post_place_home_and_base_advance_start_in_parallel(monkeypatch):
     node = PipelineOrchestratorNode.__new__(PipelineOrchestratorNode)
     parameters = {
         "post_place_home_pose": [57.0, 0.0, 215.0, 0.0, 85.0, 0.0],
         "speed": 5.0,
+        "home_speed": 25.0,
     }
     monkeypatch.setattr(
         node,
@@ -312,7 +393,8 @@ def test_post_place_home_and_base_advance_start_in_parallel(monkeypatch):
         assert allow_base_finish.wait(timeout=1.0)
         return {"success": True, "traveled_m": 1.49}
 
-    def execute_home(**_kwargs):
+    def execute_home(**kwargs):
+        assert kwargs["speed_percent"] == 25.0
         assert base_started.wait(timeout=1.0)
         allow_base_finish.set()
         return SimpleNamespace(
@@ -356,6 +438,9 @@ def test_base_grasp_scan_stops_at_first_view_with_a_candidate(monkeypatch):
         "base_grasp_center_tolerance_u_norm": 0.08,
         "base_grasp_center_tolerance_v_norm": 0.12,
         "base_target_fine_step_m": 0.07,
+        "depth_fusion_frames": 8,
+        "continuous_search_enabled": False,
+        "continuous_search_stop_on_center": False,
     }
     monkeypatch.setattr(
         node,
@@ -436,6 +521,9 @@ def test_base_grasp_scan_fine_steps_until_target_is_centered(monkeypatch):
         "base_grasp_center_tolerance_u_norm": 0.08,
         "base_grasp_center_tolerance_v_norm": 0.12,
         "base_target_fine_step_m": 0.07,
+        "depth_fusion_frames": 8,
+        "continuous_search_enabled": False,
+        "continuous_search_stop_on_center": False,
     }
     monkeypatch.setattr(
         node,
@@ -458,9 +546,12 @@ def test_base_grasp_scan_fine_steps_until_target_is_centered(monkeypatch):
         k=[600.0, 0.0, 320.0, 0.0, 600.0, 240.0, 0.0, 0.0, 1.0],
     )
     centers = iter(((0.80, 0.485), (0.598, 0.485)))
+    last_center = {"value": (0.80, 0.485)}
 
-    def capture_detect(**_kwargs):
-        center_u, center_v = next(centers)
+    def capture_detect(**kwargs):
+        if kwargs.get("depth_fusion_frames") is None:
+            last_center["value"] = next(centers)
+        center_u, center_v = last_center["value"]
         return {
             "state_snapshot": {},
             "capture_response": SimpleNamespace(
@@ -520,6 +611,9 @@ def test_base_grasp_scan_rejects_scene_fallback_candidate(monkeypatch):
         "base_grasp_center_tolerance_u_norm": 0.08,
         "base_grasp_center_tolerance_v_norm": 0.12,
         "base_target_fine_step_m": 0.07,
+        "depth_fusion_frames": 8,
+        "continuous_search_enabled": False,
+        "continuous_search_stop_on_center": False,
     }
     monkeypatch.setattr(
         node,
@@ -697,6 +791,10 @@ def test_target_box_scan_accepts_centered_label_without_six_label_row(
         ),
     }
     node._pose_debug_dict = lambda _pose: {"z_mm": _pose.z_mm}
+    node.get_logger = lambda: SimpleNamespace(
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+    )
     node._capture_placement_scan_view = lambda **_kwargs: {
         "view_name": "start",
         "offset_from_start_m": 0.0,
@@ -723,6 +821,223 @@ def test_target_box_scan_accepts_centered_label_without_six_label_row(
     assert payload["scan_mode"] == "base_target_single_pass"
     assert payload["target_alignment"]["success"] is True
     assert payload["movements"] == []
+
+
+def test_target_box_scan_reverses_after_overshoot(monkeypatch, tmp_path):
+    node = PipelineOrchestratorNode.__new__(PipelineOrchestratorNode)
+    node._run_lock = threading.Lock()
+    node._scan_active = False
+    node._run_thread = None
+    node._stop_requested = False
+    node._result_pub = SimpleNamespace(publish=lambda _message: None)
+    node.get_logger = lambda: SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+    parameters = {
+        "base_target_alignment_enabled": True,
+        "target_item_id": "blue_block",
+        "base_multiview_offset_m": 0.15,
+        "base_multiview_max_travel_m": 1.2,
+        "base_multiview_max_views": 6,
+        "base_target_center_tolerance_norm": 0.12,
+        "base_target_fine_step_m": 0.07,
+        "label_match_threshold": 0.42,
+        "base_multiview_settle_s": 0.0,
+        "placement_scan_max_retries": 0,
+        "continuous_search_enabled": False,
+        "continuous_search_stop_on_center": False,
+        "observation_speed": 25,
+    }
+    monkeypatch.setattr(
+        node,
+        "get_parameter",
+        lambda name: SimpleNamespace(value=parameters[name]),
+    )
+    node._placement_scan_viz_dir = lambda: tmp_path
+    node._item_catalog = lambda: SimpleNamespace(
+        resolve=lambda _item_id: SimpleNamespace(item_id="blue_block")
+    )
+    node._base_odom_snapshot = lambda: (0.0, 0.0, 0.0)
+    node._build_runtime = lambda: ({}, SimpleNamespace(), np.eye(4), SimpleNamespace())
+    node._read_robot_state_snapshot = lambda **_kwargs: {
+        "base_to_camera": np.eye(4),
+        "current_pose": SimpleNamespace(
+            x_mm=0.0, y_mm=0.0, z_mm=491.0,
+            roll_deg=180.0, pitch_deg=68.0, yaw_deg=-90.0,
+        ),
+    }
+    node._pose_debug_dict = lambda _pose: {"z_mm": _pose.z_mm}
+    node.get_logger = lambda: SimpleNamespace(
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+    )
+    node._publish_status = lambda _text: None
+    labels = [
+        {"matched_item_id": "blue_block", "confidence": 0.9, "bbox_xywh": [200, 100, 40, 60]},
+        {"matched_item_id": "blue_block", "confidence": 0.9, "bbox_xywh": [80, 100, 40, 60]},
+        {"matched_item_id": "blue_block", "confidence": 0.9, "bbox_xywh": [300, 100, 40, 60]},
+    ]
+    call_index = {"value": 0}
+
+    def capture_view(**kwargs):
+        label = dict(labels[min(call_index["value"], len(labels) - 1)])
+        call_index["value"] += 1
+        return {
+            "view_name": kwargs.get("view_name"),
+            "offset_from_start_m": kwargs.get("offset_from_start_m"),
+            "capture": {"color_width": 640},
+            "label_match": label,
+            "images": {},
+        }
+
+    moves: list[float] = []
+
+    def move(distance_m, **_kwargs):
+        moves.append(float(distance_m))
+        return {
+            "success": True,
+            "message": "ok",
+            "requested_distance_m": float(distance_m),
+            "traveled_m": float(distance_m),
+            "lateral_error_m": 0.0,
+            "yaw_error_deg": 0.0,
+        }
+
+    node._capture_placement_scan_view = capture_view
+    node._move_base_for_scan = move
+    node._request_base_scan_stop = lambda: None
+    response = SimpleNamespace(success=False, message="")
+
+    result = PipelineOrchestratorNode._handle_scan_and_align_placement_target_service(
+        node, SimpleNamespace(), response
+    )
+
+    assert result.success is True
+    assert any(distance < 0.0 for distance in moves)
+    assert moves[-1] < 0.0 or any(distance < 0.0 for distance in moves[:-1])
+
+
+def test_target_box_scan_stops_on_taught_center_not_image_center(
+    monkeypatch, tmp_path
+):
+    node = PipelineOrchestratorNode.__new__(PipelineOrchestratorNode)
+    node._run_lock = threading.Lock()
+    node._scan_active = False
+    node._run_thread = None
+    node._stop_requested = False
+    node._result_pub = SimpleNamespace(publish=lambda _message: None)
+    parameters = {
+        "base_target_alignment_enabled": True,
+        "target_item_id": "orange_bottle",
+        "base_multiview_offset_m": 0.15,
+        "base_multiview_max_travel_m": 1.2,
+        "base_multiview_max_views": 6,
+        "base_target_center_tolerance_norm": 0.08,
+        "base_target_fine_step_m": 0.07,
+        "label_match_threshold": 0.42,
+        "base_multiview_settle_s": 0.0,
+        "placement_scan_max_retries": 0,
+        "continuous_search_enabled": False,
+        "continuous_search_stop_on_center": False,
+        "observation_speed": 25,
+    }
+    monkeypatch.setattr(
+        node,
+        "get_parameter",
+        lambda name: SimpleNamespace(value=parameters[name]),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_mapping_for_item",
+        lambda _item_id: SimpleNamespace(
+            align_u_px=395.0,
+            align_v_px=117.5,
+            alignment_u_norm=lambda width: 395.0 / float(width),
+        ),
+    )
+    node._placement_scan_viz_dir = lambda: tmp_path
+    node._item_catalog = lambda: SimpleNamespace(
+        resolve=lambda _item_id: SimpleNamespace(item_id="orange_bottle")
+    )
+    node._base_odom_snapshot = lambda: (0.0, 0.0, 0.0)
+    node._build_runtime = lambda: ({}, SimpleNamespace(), np.eye(4), SimpleNamespace())
+    node._read_robot_state_snapshot = lambda **_kwargs: {
+        "base_to_camera": np.eye(4),
+        "current_pose": SimpleNamespace(
+            x_mm=0.0, y_mm=0.0, z_mm=491.0,
+            roll_deg=180.0, pitch_deg=68.0, yaw_deg=-90.0,
+        ),
+    }
+    node._pose_debug_dict = lambda _pose: {"z_mm": _pose.z_mm}
+    node.get_logger = lambda: SimpleNamespace(
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+    )
+    node._publish_status = lambda _text: None
+    labels = [
+        # Image-center box: old stop condition, but not the taught arm-facing view.
+        {"matched_item_id": "orange_bottle", "confidence": 0.7, "bbox_xywh": [300, 100, 40, 60]},
+        # Taught center sample (u=395).
+        {"matched_item_id": "orange_bottle", "confidence": 0.7, "bbox_xywh": [376, 60, 38, 115]},
+    ]
+    call_index = {"value": 0}
+
+    def capture_view(**kwargs):
+        label = dict(labels[min(call_index["value"], len(labels) - 1)])
+        call_index["value"] += 1
+        return {
+            "view_name": kwargs.get("view_name"),
+            "offset_from_start_m": kwargs.get("offset_from_start_m"),
+            "capture": {"color_width": 640},
+            "label_match": label,
+            "images": {},
+        }
+
+    moves: list[float] = []
+
+    def move(distance_m, **_kwargs):
+        moves.append(float(distance_m))
+        return {
+            "success": True,
+            "message": "ok",
+            "requested_distance_m": float(distance_m),
+            "traveled_m": float(distance_m),
+            "lateral_error_m": 0.0,
+            "yaw_error_deg": 0.0,
+        }
+
+    node._capture_placement_scan_view = capture_view
+    node._move_base_for_scan = move
+    node._request_base_scan_stop = lambda: None
+    response = SimpleNamespace(success=False, message="")
+
+    result = PipelineOrchestratorNode._handle_scan_and_align_placement_target_service(
+        node, SimpleNamespace(), response
+    )
+
+    assert result.success is True
+    assert moves
+    payload = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
+    assert payload["target_alignment"]["align_source"] == "taught_center_sample"
+    assert payload["target_alignment"]["align_u_px"] == pytest.approx(395.0)
+    assert payload["target_alignment"]["selected_view_name"] != "start"
+
+
+def test_remember_target_card_exclusion_only_covers_the_printed_photo():
+    node = PipelineOrchestratorNode.__new__(PipelineOrchestratorNode)
+    PipelineOrchestratorNode._remember_target_card_exclusion(
+        node,
+        {
+            "success": True,
+            "bbox_xywh": [276, 102, 38, 110],
+            "image_width": 640,
+            "image_height": 480,
+        },
+    )
+    exclude = node._grasp_exclude_roi_norm
+    assert exclude is not None
+    assert node._grasp_search_roi_norm is None
+    # Printed photo is ignored; the calibrated bottle center remains searchable.
+    assert PipelineOrchestratorNode._norm_point_in_roi(0.45, 0.30, exclude)
+    assert not PipelineOrchestratorNode._norm_point_in_roi(0.598, 0.485, exclude)
 
 
 def test_write_run_artifacts_writes_execution_trace_file(tmp_path):

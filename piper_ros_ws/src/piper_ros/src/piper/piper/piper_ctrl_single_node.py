@@ -28,17 +28,28 @@ class PiperRosNode(Node):
         self.declare_parameter('auto_enable', False)
         self.declare_parameter('gripper_exist', True)
         self.declare_parameter('gripper_val_mutiple', 1)
+        self.declare_parameter('can_loss_grace_s', 2.0)
+        self.declare_parameter('can_loss_log_interval_s', 0.5)
 
         self.can_port = self.get_parameter('can_port').get_parameter_value().string_value
         self.auto_enable = self.get_parameter('auto_enable').get_parameter_value().bool_value
         self.gripper_exist = self.get_parameter('gripper_exist').get_parameter_value().bool_value
         self.gripper_val_mutiple = self.get_parameter('gripper_val_mutiple').get_parameter_value().integer_value
         self.gripper_val_mutiple = max(0, min(self.gripper_val_mutiple, 10))
+        self.can_loss_grace_s = max(
+            0.25,
+            self.get_parameter('can_loss_grace_s').get_parameter_value().double_value,
+        )
+        self.can_loss_log_interval_s = max(
+            0.1,
+            self.get_parameter('can_loss_log_interval_s').get_parameter_value().double_value,
+        )
 
         self.get_logger().info(f"can_port is {self.can_port}")
         self.get_logger().info(f"auto_enable is {self.auto_enable}")
         self.get_logger().info(f"gripper_exist is {self.gripper_exist}")
         self.get_logger().info(f"gripper_val_mutiple is {self.gripper_val_mutiple}")
+        self.get_logger().info(f"can_loss_grace_s is {self.can_loss_grace_s}")
         # Publishers
         self.joint_pub = self.create_publisher(JointState, 'joint_states_single', 1)
         self.joint_feedback_pub = self.create_publisher(JointState, 'joint_states_feedback', 1)
@@ -93,6 +104,8 @@ class PiperRosNode(Node):
         # Record the time before entering the loop
         start_time = time.time()
         elapsed_time_flag = False
+        can_loss_started_at = None
+        can_loss_last_log_at = 0.0
         while rclpy.ok():
             if(self.auto_enable):
                 while not (enable_flag):
@@ -118,14 +131,37 @@ class PiperRosNode(Node):
                 rclpy.shutdown()
             
             if self.piper.isOk():
+                if can_loss_started_at is not None:
+                    outage_s = time.monotonic() - can_loss_started_at
+                    self.get_logger().warning(
+                        f"{self.can_port} feedback recovered after {outage_s:.2f}s"
+                    )
+                    can_loss_started_at = None
+                    can_loss_last_log_at = 0.0
                 self.PublishArmState()
                 self.PublishArmJointAndGripper()
                 self.PublishArmCtrlAndGripper()
                 self.PublishArmEndPose()
             else:
-                self.get_logger().error(f"{self.can_port} is loss")
-                self.get_logger().error(f"exit...")
-                rclpy.shutdown() 
+                now = time.monotonic()
+                if can_loss_started_at is None:
+                    can_loss_started_at = now
+                outage_s = now - can_loss_started_at
+                if (
+                    can_loss_last_log_at == 0.0
+                    or now - can_loss_last_log_at >= self.can_loss_log_interval_s
+                ):
+                    can_loss_last_log_at = now
+                    self.get_logger().warning(
+                        f"{self.can_port} feedback paused for {outage_s:.2f}s; "
+                        f"waiting up to {self.can_loss_grace_s:.2f}s before shutdown"
+                    )
+                if outage_s >= self.can_loss_grace_s:
+                    self.get_logger().error(
+                        f"{self.can_port} feedback lost for {outage_s:.2f}s; "
+                        "shutting down the driver for safety"
+                    )
+                    rclpy.shutdown()
 
             rate.sleep()
 
@@ -266,16 +302,18 @@ class PiperRosNode(Node):
         rx = round(pos_data.roll*1000*factor)
         ry = round(pos_data.pitch*1000*factor)
         rz = round(pos_data.yaw*1000*factor)
-        if(self.GetEnableFlag()):
-            self.piper.MotionCtrl_2(0x01, 0x00, 50)
-            self.piper.EndPoseCtrl(x, y, z, rx, ry, rz)
-            gripper = round(pos_data.gripper * 1000 * 1000)
-            if pos_data.gripper > 80000:
-                gripper = 80000
-            if pos_data.gripper < 0:
-                gripper = 0
-            if self.gripper_exist:
-                self.piper.GripperCtrl(abs(gripper), 1000, 0x01, 0)
+        self.__enable_flag = True
+        self.piper.EnableArm(7)
+        self.piper.MotionCtrl_1(0x00, 0x00, 0x02)
+        self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
+        self.piper.EndPoseCtrl(x, y, z, rx, ry, rz)
+        gripper = round(pos_data.gripper * 1000 * 1000)
+        if pos_data.gripper > 80000:
+            gripper = 80000
+        if pos_data.gripper < 0:
+            gripper = 0
+        if self.gripper_exist:
+            self.piper.GripperCtrl(abs(gripper), 1000, 0x01, 0)
 
     def joint_callback(self, joint_data):
         """Callback function for joint angles
@@ -301,46 +339,55 @@ class PiperRosNode(Node):
             joint_6 = round(joint_data.position[6] * 1000 * 1000)
             joint_6 = joint_6 * self.gripper_val_mutiple
 
-        # 控制电机速度
-        if self.GetEnableFlag():
-            if joint_data.velocity != []:
-                all_zeros = all(v == 0 for v in joint_data.velocity)
-            else:
-                all_zeros = True
-            if not all_zeros:
-                lens = len(joint_data.velocity)
-                if lens == 7:
-                    vel_all = clip(round(joint_data.velocity[6]), 1, 100)
-                    self.get_logger().info(f"vel_all: {vel_all}")
-                    self.piper.MotionCtrl_2(0x01, 0x01, vel_all)
-                else:
-                    self.piper.MotionCtrl_2(0x01, 0x01, 100)
-            else:
-                self.piper.MotionCtrl_2(0x01, 0x01, 100)
-
-            # 使用关节名称来动态控制关节
-            self.piper.JointCtrl(
-                joint_positions.get('joint1', 0),
-                joint_positions.get('joint2', 0),
-                joint_positions.get('joint3', 0),
-                joint_positions.get('joint4', 0),
-                joint_positions.get('joint5', 0),
-                joint_positions.get('joint6', 0)
+        # A received joint target means "take over and move". After drag-teach
+        # the software enable flag / ctrl_mode can still be standby, and
+        # skipping JointCtrl leaves the arm frozen at the taught pose.
+        if joint_data.velocity != []:
+            all_zeros = all(v == 0 for v in joint_data.velocity)
+        else:
+            all_zeros = True
+        if not all_zeros:
+            lens = len(joint_data.velocity)
+            vel_all = clip(round(joint_data.velocity[6]), 1, 100) if lens == 7 else 100
+        else:
+            vel_all = 25
+        self.get_logger().info(f"vel_all: {vel_all}")
+        self.__enable_flag = True
+        self.piper.EnableArm(7)
+        now = time.time()
+        try:
+            live = self.piper.GetArmStatus().arm_status
+            need_mode = (
+                int(live.ctrl_mode) != 0x01 or int(live.teach_status) != 0
             )
+        except Exception:
+            need_mode = True
+        if need_mode and now - getattr(self, "_last_mode_fix", 0.0) >= 0.35:
+            self._last_mode_fix = now
+            self.piper.MotionCtrl_1(0x00, 0x00, 0x02)
+            self.piper.MotionCtrl_2(0x01, 0x01, vel_all, 0x00)
+        elif now - getattr(self, "_last_mode_fix", 0.0) >= 1.0:
+            self._last_mode_fix = now
+            self.piper.MotionCtrl_2(0x01, 0x01, vel_all, 0x00)
+        self.piper.JointCtrl(
+            joint_positions.get('joint1', 0),
+            joint_positions.get('joint2', 0),
+            joint_positions.get('joint3', 0),
+            joint_positions.get('joint4', 0),
+            joint_positions.get('joint5', 0),
+            joint_positions.get('joint6', 0)
+        )
 
-            # 夹爪控制
-            if self.gripper_exist:
-                if len(joint_data.effort) >= 7:
-                    gripper_effort = clip(joint_data.effort[6], 0.5, 3)
-                    # self.get_logger().info(f"gripper_effort: {gripper_effort}")
-                    if not math.isnan(gripper_effort):
-                        gripper_effort = round(gripper_effort * 1000)
-                    else:
-                        # self.get_logger().warning("Gripper effort is NaN, using default value.")
-                        gripper_effort = 1000  # 设置默认值
-                    self.piper.GripperCtrl(abs(joint_6), gripper_effort, 0x01, 0)
+        if self.gripper_exist:
+            if len(joint_data.effort) >= 7:
+                gripper_effort = clip(joint_data.effort[6], 0.5, 3)
+                if not math.isnan(gripper_effort):
+                    gripper_effort = round(gripper_effort * 1000)
                 else:
-                    self.piper.GripperCtrl(abs(joint_6), 1000, 0x01, 0)
+                    gripper_effort = 1000
+                self.piper.GripperCtrl(abs(joint_6), gripper_effort, 0x01, 0)
+            else:
+                self.piper.GripperCtrl(abs(joint_6), 1000, 0x01, 0)
 
 
     def enable_callback(self, enable_flag: Bool):
@@ -363,6 +410,18 @@ class PiperRosNode(Node):
             if self.gripper_exist:
                 self.piper.GripperCtrl(0, 1000, 0x02, 0)
 
+    def _hold_current_joints(self) -> None:
+        """Command the measured joints so the arm keeps its pose."""
+        joints = self.piper.GetArmJointMsgs().joint_state
+        self.piper.JointCtrl(
+            joints.joint_1,
+            joints.joint_2,
+            joints.joint_3,
+            joints.joint_4,
+            joints.joint_5,
+            joints.joint_6,
+        )
+
     def handle_enable_service(self, req, resp):
         """Handle enable service for the robotic arm"""
         self.get_logger().info(f"Received request: {req.enable_request}")
@@ -373,23 +432,31 @@ class PiperRosNode(Node):
         # Record the time before entering the loop
         start_time = time.time()
 
-        # After a controller power cycle (especially after drag-teach mode),
-        # the motor feedback can be healthy while motion commands remain
-        # latched in standby.  Follow the Piper SDK reset sequence before the
-        # first enable attempt.  Do not repeat it for an already-enabled arm,
-        # because resetting the control mode would interrupt active motion.
+        # After drag-teach the arm must keep torque. Exiting teach before
+        # CAN MOVE_J + a hold command lets it drop. Order: enable, hold
+        # current joints, then leave teach, then stay in CAN MOVE_J.
         if req.enable_request:
-            initial_enable_list = self.piper.GetArmEnableStatus()
-            controller_is_standby = (
-                int(self.piper.GetArmStatus().arm_status.ctrl_mode) == 0x00
+            arm_status = self.piper.GetArmStatus().arm_status
+            self.get_logger().info(
+                "Preparing CAN MOVE_J after enable request: "
+                f"enabled={all(self.piper.GetArmEnableStatus())} "
+                f"ctrl=0x{int(arm_status.ctrl_mode):02X} "
+                f"motion=0x{int(arm_status.motion_status):02X} "
+                f"teach={int(arm_status.teach_status)}"
             )
-            if not all(initial_enable_list) or controller_is_standby:
-                self.get_logger().info(
-                    "Recovering from standby and restoring position/velocity mode"
-                )
-                self.piper.MotionCtrl_1(0x02, 0x00, 0x00)
-                self.piper.MotionCtrl_2(0x00, 0x00, 0, 0x00)
-                time.sleep(0.2)
+            self.piper.EnableArm(7)
+            if self.gripper_exist:
+                self.piper.GripperCtrl(0, 1000, 0x01, 0)
+            self.piper.MotionCtrl_2(0x01, 0x01, 30, 0x00)
+            self._hold_current_joints()
+            time.sleep(0.08)
+            self.piper.MotionCtrl_1(0x00, 0x00, 0x02)
+            time.sleep(0.08)
+            self.piper.MotionCtrl_1(0x02, 0x00, 0x00)
+            time.sleep(0.08)
+            self.piper.MotionCtrl_2(0x01, 0x01, 30, 0x00)
+            self._hold_current_joints()
+            time.sleep(0.08)
 
         while not loop_flag:
             elapsed_time = time.time() - start_time

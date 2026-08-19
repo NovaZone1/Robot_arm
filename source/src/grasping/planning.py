@@ -589,6 +589,7 @@ class PureGraspPlanner:
         tcp_pose: EndPoseMMDeg,
         base_to_camera: np.ndarray,
         initial_diagnostics: list[str] | None = None,
+        defer_workspace_validation: bool = False,
     ) -> tuple[list[tuple[GraspCandidate, float, float]], list[str], float]:
         def collect_with_max_angle(
             max_angle: float,
@@ -685,7 +686,7 @@ class PureGraspPlanner:
                             if len(candidate_pose_floor_examples) < 2:
                                 candidate_pose_floor_examples.append(pose_floor_violations[0])
                             continue
-                        if not bool(plan_data["within_workspace"]):
+                        if not bool(plan_data["within_workspace"]) and not defer_workspace_validation:
                             if len(candidate_workspace_examples) < 2:
                                 candidate_workspace_examples.append(
                                     f"target={tuple(round(v, 3) for v in plan_data['target_base_m'])} "

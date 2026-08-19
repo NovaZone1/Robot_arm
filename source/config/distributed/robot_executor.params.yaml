@@ -5,6 +5,9 @@ robot_executor:
     disconnect_after_run: false
     poll_interval_s: 0.05
     default_speed_percent: 25.0
+    # Named Home / fold-away transit. Independent of the dashboard grasp slider
+    # and of the 5% final contact descent.
+    home_speed_percent: 25.0
     default_gripper_open_mm: 70.0
     # Increased from 0.6 after objects could slip during transit. Keep this
     # below the gripper's high-force limit while retaining a firm grasp.
@@ -47,6 +50,16 @@ robot_executor:
     center_horizontal_follow_target_azimuth: true
     center_horizontal_reference_azimuth_deg: -90.0
     center_horizontal_max_yaw_adjust_deg: 45.0
+    # Bottles are approached from a clear radial standoff at the target's
+    # grasp height. This prevents the open fingers from descending onto the
+    # shoulder/cap and knocking the bottle over.
+    center_horizontal_pregrasp_distance_mm: 80.0
+    center_horizontal_approach_step_mm: 30.0
+    center_horizontal_final_speed_percent: 5.0
+    # A fully open gripper means the close command never took effect; a nearly
+    # fully closed gripper means it missed the bottle. Abort after retreating.
+    center_horizontal_min_held_opening_mm: 12.0
+    center_horizontal_max_held_opening_mm: 65.0
     # For cube top-down grasps, align yaw with the base-to-target radial
     # direction once at safe height so the wrist does not repeatedly correct
     # above an offset object.
@@ -66,8 +79,8 @@ robot_executor:
     # Keep cube descent close to a vertical Cartesian path. Larger values caused
     # unsafe joint-space arcs during real hardware testing.
     safe_top_down_vertical_step_mm: 80.0
-    # Slow only the final cube contact segment to reduce collision force.
-    safe_top_down_final_speed_percent: 2.0
+    # Slow only the final contact segment (cubes and bottles) to reduce force.
+    safe_top_down_final_speed_percent: 5.0
     # The dashboard speed is the real Piper MotionCtrl_2 percentage.  Keep the
     # configurable guard, but do not silently clamp every request to 5%.
     top_down_max_speed_percent: 100.0
@@ -76,7 +89,10 @@ robot_executor:
     placement_box_size_tolerance_m: 0.005
     placement_min_label_confidence: 0.42
     placement_min_vertical_clearance_mm: 50.0
-    placement_final_speed_percent: 2.0
+    # Free-space place transit (above the box and retreat). The last descent
+    # into the box stays at placement_final_speed_percent.
+    placement_speed_percent: 25.0
+    placement_final_speed_percent: 5.0
     use_handoff_pose: true
     handoff_pose: [200.0, 20.0, 300.0, 10.0, 120.0, 0.0]
     home_pose: [57.0, 0.0, 215.0, 0.0, 85.0, 0.0]

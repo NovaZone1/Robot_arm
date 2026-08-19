@@ -21,7 +21,7 @@ def effective_position_tolerance_mm(
     target: EndPoseMMDeg,
     default_tolerance_mm: float,
     enable_tightening: bool = True,
-    minimum_tolerance_mm: float = 0.5,
+    minimum_tolerance_mm: float = 1.0,
     tightening_ratio: float = 0.5,
     zero_motion_threshold_mm: float = 0.25,
 ) -> float:

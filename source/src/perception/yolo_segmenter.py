@@ -160,6 +160,7 @@ def _segment_color_blocks(
     # label fragments must not become graspable instances.
     min_area = max(900, int(round(image_area * 0.003)))
     max_area = int(round(image_area * 0.35))
+    min_box_side = max(28, int(round(min(height, width) * 0.08)))
     kernel_size = 5 if min(height, width) >= 240 else 3
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -189,6 +190,8 @@ def _segment_color_blocks(
                 int(value) for value in stats[component_index]
             )
             if area < min_area or area > max_area or box_width <= 0 or box_height <= 0:
+                continue
+            if min(box_width, box_height) < min_box_side:
                 continue
             aspect_ratio = box_width / float(box_height)
             if not 0.55 <= aspect_ratio <= 1.80:

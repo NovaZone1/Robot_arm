@@ -80,13 +80,20 @@ def test_distributed_pipeline_defaults_to_photo_card_target_then_base_scan():
         PROJECT_ROOT / "scripts" / "run_grasp_dashboard.py"
     ).read_text(encoding="utf-8")
 
+    red_flag_script = (
+        PROJECT_ROOT / "scripts" / "wait_for_red_flag_start.sh"
+    ).read_text(encoding="utf-8")
+
     assert "auto_target_from_card: true" in yaml_text
     assert "target_card_min_confidence: 0.53" in yaml_text
     assert "target_card_min_margin: 0.08" in yaml_text
     assert "target_card_search_roi_norm: [0.35, 0.01, 0.88, 0.50]" in yaml_text
     assert "target_card_capture_frames: 3" in yaml_text
     assert "target_card_consensus_frames: 2" in yaml_text
-    assert "observation_speed: 10" in yaml_text
+    assert "observation_speed: 25" in yaml_text
+    assert "home_speed: 25" in yaml_text
+    assert "speed_percent: 25.0" in red_flag_script
+    assert "speed_percent: 5.0" not in red_flag_script
     assert "base_grasp_scan_enabled: true" in yaml_text
     assert 'id="autoTargetCardInput" type="checkbox" checked' in dashboard_source
 
@@ -110,16 +117,21 @@ def test_distributed_competition_defaults_use_center_horizontal_grasp():
     assert "use_object_center_contact: true" in pipeline_yaml
     assert "object_center_contact_max_offset_m: 0.08" in pipeline_yaml
     assert 'execution_strategy: "center_horizontal"' in executor_yaml
-    assert "top_down_rpy_deg: [180.0, 85.0, -90.0]" in executor_yaml
+    assert "top_down_rpy_deg: [180.0, 85.0, 90.0]" in executor_yaml
     assert "center_horizontal_follow_target_azimuth: true" in executor_yaml
-    assert "center_horizontal_reference_azimuth_deg: 90.0" in executor_yaml
+    assert "center_horizontal_reference_azimuth_deg: -90.0" in executor_yaml
     assert "top_down_lift_to_safe_z: false" in executor_yaml
     assert "top_down_vertical_step_mm: 80.0" in executor_yaml
     assert "top_down_max_speed_percent: 100.0" in executor_yaml
-    assert "default_speed_percent: 5.0" in executor_yaml
-    assert "speed: 5" in pipeline_yaml
+    assert "default_speed_percent: 25.0" in executor_yaml
+    assert "home_speed_percent: 25.0" in executor_yaml
+    assert "placement_speed_percent: 25.0" in executor_yaml
+    assert "placement_final_speed_percent: 5.0" in executor_yaml
+    assert "safe_top_down_final_speed_percent: 5.0" in executor_yaml
+    assert "speed: 25" in pipeline_yaml
+    assert "home_speed: 25" in pipeline_yaml
     assert 'id="centerContactInput" type="checkbox" checked' in dashboard_source
-    assert 'id="speedRangeInput" type="range" min="1" max="100" step="1" value="5"' in dashboard_source
+    assert 'id="speedRangeInput" type="range" min="1" max="100" step="1" value="25"' in dashboard_source
     assert (
         'data-prompt="red block" data-center-contact="true" '
         'data-execution-strategy="safe_top_down"'

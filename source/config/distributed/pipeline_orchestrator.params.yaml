@@ -37,6 +37,8 @@ grasp_pipeline:
     # The calibrated observation route is in free space. Keep grasp descent at
     # the normal task speed while replaying observation poses more promptly.
     observation_speed: 25
+    # Fold-away / Home replay is also free-space transit, not contact motion.
+    home_speed: 25
     graspnet_checkpoint: "checkpoint.tar"
     hand_eye_config: ""
     apply_npoint_tool_offset: false
@@ -50,9 +52,10 @@ grasp_pipeline:
     manual_target_bias_z_mm: 0.0
     table_z_m: 0.161
     min_gripper_table_clearance_m: 0.03
-    # Grip the fixed 60 mm cubes 15 mm above geometric center to keep the
-    # fingertips safely clear of the table.
-    color_block_center_height_m: 0.045
+    # Keep the known 60 mm cube contact plane at its top edge. The former
+    # 45 mm setting left too little real fingertip/table margin and caused a
+    # yellow-block descent to stall after touching the tabletop.
+    color_block_center_height_m: 0.060
     pregrasp_offset_m: 0.08
     descend_offset_m: 0.015
     grasp_z_offset_m: 0.050
@@ -89,6 +92,13 @@ grasp_pipeline:
     target_card_base_search_max_travel_m: 0.35
     target_card_base_search_speed_mps: 0.03
     target_card_base_search_timeout_s: 18.0
+    # After a failed card/item recognition, return to the observation pose
+    # and try again. Two retries means three attempts, then skip that stage.
+    target_card_max_retries: 2
+    grasp_scan_max_retries: 2
+    # Placement-box search is forward-only until the label is lost. Then the
+    # base reverses to the scan start and tries again instead of walking on.
+    placement_scan_max_retries: 2
     # Active competition setup: table on the arm's right side. Both target-card
     # acquisition and box-label/placement observation must use the same side
     # so their camera-to-base geometry remains consistent.
@@ -148,17 +158,20 @@ grasp_pipeline:
     # vertical references account for the bottle/block height difference.
     base_grasp_bottle_center_norm: [0.598, 0.485]
     base_grasp_block_center_norm: [0.606, 0.619]
-    # Deliberately practical margins: about 64 px horizontally and 82 px
-    # vertically at 640x480, rather than requiring one exact center pixel.
-    base_grasp_center_tolerance_u_norm: 0.10
-    # Relaxed after the right-side mirrored observation trial: the red block
-    # had valid grasps and horizontal alignment at v-error 0.138. Keep a small
-    # margin while still requiring the correct target and a valid grasp.
-    base_grasp_center_tolerance_v_norm: 0.17
+    # Wider than the old ±0.10/±0.17 band. At 640x480 this is about ±115 px
+    # horizontally and ±115 px vertically, so a visible bottle/block that is
+    # not on the taught pixel still stops the scan. Card photos stay excluded
+    # by the printed-photo ROI, not by this window.
+    base_grasp_center_tolerance_u_norm: 0.18
+    base_grasp_center_tolerance_v_norm: 0.24
     # Once the target first appears, switch from 15 cm search steps to a 7 cm
     # approach step. The final center tolerance is calibrated from a standard
     # operator-provided frame and intentionally keeps practical margin.
     base_target_fine_step_m: 0.07
+    # Ignore one transient detector dropout. Reverse only after two successive
+    # missed views, preventing single-frame color proposals from making Scout
+    # shuttle around the scan origin.
+    grasp_scan_lost_frames_before_reverse: 2
     # For any catalog target found by the base grasp scan (bottle or block),
     # advance only after the grasp executor has closed and retreated, before
     # placement observation.

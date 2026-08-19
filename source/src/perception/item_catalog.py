@@ -308,6 +308,59 @@ class ItemCatalog:
                 )
         return typed
 
+    def localize_single_box_from_label(
+        self,
+        *,
+        depth_meters: np.ndarray,
+        camera_k: tuple[float, ...] | list[float],
+        base_to_camera: np.ndarray,
+        detection: LabelDetection,
+        table_z_m: float | None = None,
+    ) -> tuple[float, float, float]:
+        """Estimate one open-box center from an opaque rear-wall label."""
+        matcher = ReferenceLabelMatcher(self)
+        label_centers = matcher.project_label_centers(
+            depth_meters=depth_meters,
+            camera_k=camera_k,
+            base_to_camera=base_to_camera,
+            detections=(detection,),
+        )
+        label_xyz = np.asarray(label_centers[0], dtype=np.float64).reshape(3)
+        transform = np.asarray(base_to_camera, dtype=np.float64).reshape(4, 4)
+        camera_xy = transform[:2, 3]
+        target_xy = label_xyz[:2]
+        toward_camera = camera_xy - target_xy
+        interior_norm = float(np.linalg.norm(toward_camera))
+        if interior_norm < 0.05:
+            raise RuntimeError("cannot determine box interior direction from one label")
+        interior_xy = toward_camera / interior_norm
+        box_depth_m = float(self.box.outer_size_m[1])
+        center_xy = target_xy + (interior_xy * (box_depth_m / 2.0))
+        if table_z_m is None:
+            center_z = float(label_xyz[2])
+        else:
+            center_z = float(table_z_m) + (float(self.box.outer_size_m[2]) / 2.0)
+        return (float(center_xy[0]), float(center_xy[1]), float(center_z))
+
+    def build_vision_place_poses_mm_deg(
+        self,
+        value: str,
+        box_center_base_m: tuple[float, float, float],
+    ) -> dict[str, tuple[float, float, float, float, float, float]]:
+        """Keep the calibrated descent Z/RPY; replace only the live box XY."""
+        item = self.require(value)
+        aligned = self.build_base_aligned_place_poses_mm_deg(value)
+        offset = item.placement.release_offset_mm
+        release_x = (float(box_center_base_m[0]) * 1000.0) + float(offset[0])
+        release_y = (float(box_center_base_m[1]) * 1000.0) + float(offset[1])
+        updated: dict[str, tuple[float, float, float, float, float, float]] = {}
+        for name in ("approach", "release", "retreat"):
+            pose = list(aligned[name])
+            pose[0] = release_x
+            pose[1] = release_y
+            updated[name] = tuple(float(value) for value in pose)
+        return updated
+
     def ensure_place_calibrated(
         self,
         value: str,
@@ -1031,6 +1084,7 @@ class ReferenceLabelMatcher:
         roi_norm: tuple[float, float, float, float] | None = None,
         threshold: float | None = None,
         bottle_proposals: tuple[dict[str, object], ...] | None = None,
+        marker_detection_enabled: bool = True,
     ) -> LabelMatch:
         item = self.catalog.require(expected_item_id)
         detections, search_xywh = self.match_all(
@@ -1038,6 +1092,7 @@ class ReferenceLabelMatcher:
             roi_norm=roi_norm,
             threshold=threshold,
             bottle_proposals=bottle_proposals,
+            marker_detection_enabled=marker_detection_enabled,
         )
         target = next(
             (detection for detection in detections if detection.item_id == item.item_id),

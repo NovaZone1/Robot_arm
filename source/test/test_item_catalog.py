@@ -39,6 +39,19 @@ def test_bottle_prompt_identity_mapping():
     assert bottle_item_id_from_prompt("bottle") is None
 
 
+def test_match_expected_accepts_marker_detection_flag():
+    catalog = ItemCatalog.load(CATALOG_PATH)
+    matcher = ReferenceLabelMatcher(catalog)
+    image = np.full((480, 640, 3), 210, dtype=np.uint8)
+    match = matcher.match_expected(
+        image,
+        "orange_bottle",
+        marker_detection_enabled=False,
+    )
+    assert match.expected_item_id == "orange_bottle"
+    assert match.matched_item_id is None
+
+
 def test_place_pose_builder_is_locked_until_calibrated():
     catalog = ItemCatalog.load(CATALOG_PATH)
 
@@ -59,10 +72,10 @@ def test_all_items_share_the_base_aligned_place_calibration():
     ):
         poses = catalog.build_base_aligned_place_poses_mm_deg(item_id)
         assert poses["approach"] == pytest.approx(
-            (-22.262, 283.822, 491.100, 85.074, 87.787, 179.697)
+            (-22.262, -283.822, 491.100, 85.074, 87.787, -179.697)
         )
         assert poses["release"] == pytest.approx(
-            (-22.262, 283.822, 307.657, 85.074, 87.787, 179.697)
+            (-22.262, -283.822, 307.657, 85.074, 87.787, -179.697)
         )
         assert poses["retreat"] == pytest.approx(poses["approach"])
 
@@ -96,6 +109,42 @@ def test_place_pose_builder_adds_vertical_approach_and_retreat():
     assert poses["release"] == (301.0, 52.0, 280.0, 180.0, 0.0, 0.0)
     assert poses["approach"][2] == 400.0
     assert poses["retreat"][2] == 420.0
+
+
+def test_localize_single_box_offsets_inward_from_label():
+    catalog = ItemCatalog.load(CATALOG_PATH)
+    depth = np.full((480, 640), 0.80, dtype=np.float32)
+    detection = LabelDetection(
+        item_id="blue_block",
+        confidence=0.9,
+        bbox_xywh=(410, 200, 80, 80),
+        method="test",
+    )
+    camera_k = (600.0, 0.0, 320.0, 0.0, 600.0, 240.0, 0.0, 0.0, 1.0)
+    box_center = catalog.localize_single_box_from_label(
+        depth_meters=depth,
+        camera_k=camera_k,
+        base_to_camera=np.eye(4),
+        detection=detection,
+    )
+    label_x = ((410.0 + 40.0) - 320.0) / 600.0 * 0.80
+    assert box_center[0] == pytest.approx(label_x - (0.132 / 2.0), abs=0.02)
+    assert box_center[1] == pytest.approx(0.0, abs=0.05)
+
+
+def test_vision_place_poses_keep_calibrated_height_and_replace_xy():
+    catalog = ItemCatalog.load(CATALOG_PATH)
+    poses = catalog.build_vision_place_poses_mm_deg(
+        "blue_block",
+        (0.250, -0.200, 0.310),
+    )
+    calibrated = catalog.build_base_aligned_place_poses_mm_deg("blue_block")
+    assert poses["release"][0] == pytest.approx(250.0)
+    assert poses["release"][1] == pytest.approx(-200.0)
+    assert poses["release"][2] == pytest.approx(calibrated["release"][2])
+    assert poses["release"][3:] == pytest.approx(calibrated["release"][3:])
+    assert poses["approach"][0] == pytest.approx(250.0)
+    assert poses["approach"][2] == pytest.approx(calibrated["approach"][2])
 
 
 def test_tightly_packed_row_interpolates_180mm_slots():

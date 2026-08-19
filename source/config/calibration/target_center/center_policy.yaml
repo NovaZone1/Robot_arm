@@ -17,9 +17,9 @@ block:
   measurement: "block_20260808_110437/target_measurement.json"
 
 # Practical acceptance band around each reference. At 640x480 this is about
-# +/-51 horizontal pixels and +/-58 vertical pixels.
-tolerance_u_norm: 0.08
-tolerance_v_norm: 0.15
+# +/-115 horizontal pixels and +/-115 vertical pixels.
+tolerance_u_norm: 0.18
+tolerance_v_norm: 0.24
 
 coarse_scan_step_m: 0.15
 fine_scan_step_m: 0.07

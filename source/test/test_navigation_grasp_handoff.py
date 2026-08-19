@@ -167,7 +167,7 @@ def test_navigation_place_handoff_aligns_then_releases_same_target(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "scanning and aligning box for red_block" in result.stdout
-    assert "executing calibrated release for red_block" in result.stdout
+    assert "executing taught-map release for red_block" in result.stdout
     assert "place handoff completed: target=red_block" in result.stdout
 
 
@@ -189,6 +189,56 @@ def test_navigation_route_uses_docking_sequence_and_red_flag_gate_by_default():
     assert "ros2 run scout_navigation_bringup dock_to_indoor_grasp_point.py" in text
     assert '"${RED_FLAG_START_ENABLED:-1}" == "1"' in text
     assert "RED_FLAG_START_ENABLED=0" in text
+
+
+def test_indoor03_python_skips_placement_after_failed_card_recognition():
+    text = (
+        Path(
+            "/home/nvidia/auto/ROS2_FOR_SCOUT_MINI/my_party/navigation_ws/src/"
+            "scout_navigation_bringup/scripts/run_indoor03_recorded_route.py"
+        )
+    ).read_text(encoding="utf-8")
+
+    assert 'self.declare_parameter("recognition_max_retries", 2)' in text
+    assert "skipped_no_target_card" in text
+    assert "run_handoff_limited" in text
+    assert "run_handoff_until_success" not in text
+    assert "Skipping placement because pickup did not acquire a catalog target" in text
+    assert "continuing the route and skipping placement" in text
+
+
+def test_outdoor2_python_continues_route_when_pickup_is_abandoned():
+    text = (
+        Path(
+            "/home/nvidia/auto/ROS2_FOR_SCOUT_MINI/my_party/navigation_ws/src/"
+            "scout_navigation_bringup/scripts/run_outdoor2_recorded_route.py"
+        )
+    ).read_text(encoding="utf-8")
+
+    assert 'self.declare_parameter("recognition_max_retries", 2)' in text
+    assert "skipped_no_target_card" in text
+    assert "_handoff_limited" in text
+    assert "_handoff_until_success" not in text
+    assert "skipping placement because pickup did not acquire a target" in text
+    assert "STAGING_APPROACH_SPEED_MPS = 0.60" in text
+    assert "_set_nav_cruise_speed" in text
+
+
+def test_orchestrator_retries_target_card_then_skips_grasp():
+    yaml_text = (
+        PROJECT_ROOT / "config" / "distributed" / "pipeline_orchestrator.params.yaml"
+    ).read_text(encoding="utf-8")
+    source = (
+        PROJECT_ROOT / "robot_grasp_ros2" / "pipeline_orchestrator_node.py"
+    ).read_text(encoding="utf-8")
+
+    assert "target_card_max_retries: 2" in yaml_text
+    assert "grasp_scan_max_retries: 2" in yaml_text
+    assert "def _identify_target_card_with_retries" in source
+    assert 'status = "skipped_no_target_card"' in source
+    assert "recognition_retry_return" in source
+    assert "def _reverse_scan_travel" in source
+    assert "target_card_base_search_speed_mps" not in source.split("def _reverse_scan_travel", 1)[1].split("def _return_to_observation_for_retry", 1)[0]
 
 
 def test_indoor03_route_preflights_then_hands_off_after_pickup_docking():

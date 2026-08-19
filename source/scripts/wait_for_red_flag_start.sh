@@ -31,7 +31,7 @@ if [[ "${RED_FLAG_MOVE_TO_OBSERVATION:-1}" == "1" ]]; then
     move_output="$(${ros2_cli} service call \
       /robot_executor/execute_named_pose \
       robot_grasp_msgs/srv/ExecuteNamedPose \
-      "{name: 'red_flag_observation', pose: {x_mm: 44.300, y_mm: -3.710, z_mm: 596.805, roll_deg: 3.037, pitch_deg: 72.962, yaw_deg: 0.898}, speed_percent: 5.0, open_gripper_first: false}" \
+      "{name: 'red_flag_observation', pose: {x_mm: 44.300, y_mm: -3.710, z_mm: 596.805, roll_deg: 3.037, pitch_deg: 72.962, yaw_deg: 0.898}, speed_percent: 25.0, open_gripper_first: false}" \
       2>&1)"
     if grep -Eqi 'success[=:][[:space:]]*true' <<<"${move_output}"; then
       move_succeeded=true
@@ -73,7 +73,7 @@ home_log="${bundle_root}/ros_ws/log/red_flag_home_$(date +%Y%m%d_%H%M%S).log"
 nohup "${ros2_cli}" service call \
   /robot_executor/execute_named_pose \
   robot_grasp_msgs/srv/ExecuteNamedPose \
-  "{name: 'home_after_red_flag', pose: {x_mm: 57.0, y_mm: 0.0, z_mm: 215.0, roll_deg: 0.0, pitch_deg: 85.0, yaw_deg: 0.0}, speed_percent: 5.0, open_gripper_first: false}" \
+  "{name: 'home_after_red_flag', pose: {x_mm: 57.0, y_mm: 0.0, z_mm: 215.0, roll_deg: 0.0, pitch_deg: 85.0, yaw_deg: 0.0}, speed_percent: 25.0, open_gripper_first: false}" \
   >"${home_log}" 2>&1 &
 home_pid=$!
 echo "red flag confirmed; Home dispatched in parallel with navigation pid=${home_pid} log=${home_log}"

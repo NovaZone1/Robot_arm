@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Bridge a completed Nav2 unloading-point arrival into target-box alignment and
-# the calibrated fixed-TCP placement sequence. The target identity is the one
-# freshly resolved from the photo card by the preceding grasp run.
+# Bridge a completed Nav2 unloading-point arrival into target-box alignment
+# and the taught (u, v)->XY placement sequence. The target identity is the
+# one freshly resolved from the photo card by the preceding grasp run.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -150,14 +150,14 @@ if ! service_succeeded <<<"${align_output}"; then
   exit 25
 fi
 
-echo "place handoff: box aligned; executing calibrated release for ${target_item_id}"
+echo "place handoff: box aligned; executing taught-map release for ${target_item_id}"
 set_param base_aligned_place_enabled true
 place_output="$(${ros2_cli} service call \
   /grasp_pipeline/execute_aligned_place \
   std_srvs/srv/Trigger "{}" 2>&1)"
 set_param base_aligned_place_enabled false
 if ! service_succeeded <<<"${place_output}"; then
-  echo "place handoff failed: calibrated placement did not complete" >&2
+  echo "place handoff failed: taught-map placement did not complete" >&2
   echo "${place_output}" >&2
   exit 26
 fi

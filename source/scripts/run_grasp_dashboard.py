@@ -826,7 +826,7 @@ def _start_grasp_from_payload(payload: dict[str, object]) -> dict[str, object]:
             "system": status,
         }
 
-    speed = float(payload.get("speed") or 5.0)
+    speed = float(payload.get("speed") or 25.0)
     speed = max(1.0, min(100.0, speed))
     pipeline_speed_text = str(int(round(speed)))
     executor_speed_text = str(speed)
@@ -870,10 +870,15 @@ def _start_grasp_from_payload(payload: dict[str, object]) -> dict[str, object]:
             _bool_text(payload.get("use_object_center_contact", True)),
         ),
         _param_set("/grasp_pipeline", "speed", pipeline_speed_text),
+        _param_set("/grasp_pipeline", "observation_speed", "25"),
+        _param_set("/grasp_pipeline", "home_speed", "25"),
         _param_set("/grasp_pipeline", "manual_target_bias_x_mm", str(float(payload.get("bias_x_mm") or 0.0))),
         _param_set("/grasp_pipeline", "manual_target_bias_y_mm", str(float(payload.get("bias_y_mm") or 0.0))),
         _param_set("/grasp_pipeline", "manual_target_bias_z_mm", str(float(payload.get("bias_z_mm") or 0.0))),
         _param_set("/robot_executor", "default_speed_percent", executor_speed_text),
+        _param_set("/robot_executor", "home_speed_percent", "25.0"),
+        _param_set("/robot_executor", "placement_speed_percent", "25.0"),
+        _param_set("/robot_executor", "placement_final_speed_percent", "5.0"),
         _param_set("/robot_executor", "enable_pregrasp", _bool_text(payload.get("enable_pregrasp", False))),
     ]
     if not auto_target_from_card:
@@ -1179,8 +1184,8 @@ INDEX_HTML = r"""<!doctype html>
         </label>
         <label>速度
           <div class="speed-control">
-            <input id="speedRangeInput" type="range" min="1" max="100" step="1" value="5" />
-            <input id="speedInput" type="number" min="1" max="100" step="1" value="5" />
+            <input id="speedRangeInput" type="range" min="1" max="100" step="1" value="25" />
+            <input id="speedInput" type="number" min="1" max="100" step="1" value="25" />
           </div>
         </label>
       </div>
@@ -1236,6 +1241,7 @@ INDEX_HTML = r"""<!doctype html>
       <button id="rejectBtn" type="button">拒绝</button>
       <button id="stopBtn" type="button">停止任务</button>
       <button id="openGripperBtn" class="danger" type="button">释放夹爪</button>
+      <button id="closeGripperBtn" class="danger" type="button">闭合夹爪</button>
       <button id="probeBtn" type="button">Probe</button>
       <button id="scanPlacementBtn" type="button">扫描放置区</button>
       <button id="scanPlacementMultiBtn" class="danger" type="button">扫描并对准目标盒</button>
@@ -1298,7 +1304,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 const state = { runs: [], selected: "", systemReady: false };
 const stackButtons = ["startStackBtn", "stopStackBtn"];
-const runButtons = ["planConfirmBtn", "directGraspBtn", "confirmBtn", "rejectBtn", "stopBtn", "openGripperBtn", "probeBtn", "scanPlacementBtn", "scanPlacementMultiBtn", "executeAlignedPlaceBtn"];
+const runButtons = ["planConfirmBtn", "directGraspBtn", "confirmBtn", "rejectBtn", "stopBtn", "openGripperBtn", "closeGripperBtn", "probeBtn", "scanPlacementBtn", "scanPlacementMultiBtn", "executeAlignedPlaceBtn"];
 
 function statusClass(status) {
   if (status === "ok" || status === "completed") return "ok";
@@ -1657,15 +1663,15 @@ document.getElementById("flipYBiasBtn").addEventListener("click", () => {
 
 const speedInput = document.getElementById("speedInput");
 const speedRangeInput = document.getElementById("speedRangeInput");
-speedInput.addEventListener("input", () => { speedRangeInput.value = speedInput.value || "5"; });
-speedRangeInput.addEventListener("input", () => { speedInput.value = speedRangeInput.value || "5"; });
+speedInput.addEventListener("input", () => { speedRangeInput.value = speedInput.value || "25"; });
+speedRangeInput.addEventListener("input", () => { speedInput.value = speedRangeInput.value || "25"; });
 
 function buildRunPayload({confirm}) {
   return {
     auto_target_from_card: document.getElementById("autoTargetCardInput").checked,
     prompt: document.getElementById("promptInput").value.trim(),
     target_item_id: document.getElementById("targetItemInput").value,
-    speed: Number(document.getElementById("speedInput").value || 5),
+    speed: Number(document.getElementById("speedInput").value || 25),
     execute: true,
     confirm,
     place_after_grasp: document.getElementById("placeAfterGraspInput").checked,
@@ -1750,6 +1756,12 @@ document.getElementById("openGripperBtn").addEventListener("click", () => {
     return;
   }
   triggerControl("/api/open-gripper", "释放夹爪");
+});
+document.getElementById("closeGripperBtn").addEventListener("click", () => {
+  if (!window.confirm("夹爪将立即闭合，机械臂不会移动。请先把物体放进夹爪并确认手指离开。是否继续？")) {
+    return;
+  }
+  triggerControl("/api/close-gripper", "闭合夹爪");
 });
 document.getElementById("probeBtn").addEventListener("click", () => triggerControl("/api/probe", "probe"));
 document.getElementById("scanPlacementBtn").addEventListener("click", async () => {
@@ -1944,12 +1956,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = _execute_aligned_place_from_payload(payload)
                 self._send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
                 return
-            if path in {"/api/confirm", "/api/reject", "/api/stop", "/api/open-gripper", "/api/probe"}:
+            if path in {"/api/confirm", "/api/reject", "/api/stop", "/api/open-gripper", "/api/close-gripper", "/api/probe"}:
                 service = {
                     "/api/confirm": "/grasp_pipeline/confirm",
                     "/api/reject": "/grasp_pipeline/reject",
                     "/api/stop": "/grasp_pipeline/stop",
                     "/api/open-gripper": "/robot_executor/open_gripper",
+                    "/api/close-gripper": "/robot_executor/close_gripper",
                     "/api/probe": "/grasp_pipeline/probe",
                 }[path]
                 result = _trigger_service(service, timeout_s=30.0)

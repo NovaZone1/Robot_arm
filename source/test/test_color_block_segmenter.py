@@ -75,6 +75,17 @@ def test_blue_block_ignores_smaller_same_hue_bottle_cap():
     assert y2 > 120
 
 
+def test_red_block_rejects_small_wide_bottle_cap():
+    image = np.full((240, 320, 3), 25, dtype=np.uint8)
+    cv2.rectangle(image, (120, 80), (165, 103), (0, 0, 230), thickness=-1)
+
+    result = YOLOSegmenter(device="cpu").segment_text(image, "red block")
+
+    assert result["labels"] == []
+    assert tuple(result["masks"].shape) == (0, 240, 320)
+    assert result["allow_scene_fallback"] is False
+
+
 def test_missing_catalog_bottle_disables_scene_fallback():
     segmenter = YOLOSegmenter(device="cpu")
     segmenter._model = lambda *_args, **_kwargs: [

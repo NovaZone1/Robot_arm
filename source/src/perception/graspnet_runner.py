@@ -134,6 +134,26 @@ class _MinimalGraspGroup:
         self.grasp_group_array[:, 4:13] = np.matmul(rotation, self.rotation_matrices).reshape(-1, 9)
         return self
 
+
+def make_center_contact_grasp_group(
+    translation_m,
+    *,
+    score: float = 1.0,
+    width_m: float = 0.04,
+    height_m: float = 0.02,
+    depth_m: float = 0.02,
+):
+    """Build a single contact-centered grasp without running GraspNet."""
+    center = np.asarray(translation_m, dtype=np.float64).reshape(3)
+    array = np.zeros((1, GRASP_ARRAY_LEN), dtype=np.float64)
+    array[0, 0] = float(score)
+    array[0, 1] = float(width_m)
+    array[0, 2] = float(height_m)
+    array[0, 3] = float(depth_m)
+    array[0, 4:13] = np.eye(3, dtype=np.float64).reshape(9)
+    array[0, 13:16] = center
+    return _MinimalGraspGroup(array)
+
 if not hasattr(np, "maximum_sctype"):
     def _maximum_sctype(t):
         dtype = np.dtype(t)
