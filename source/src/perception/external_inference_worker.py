@@ -25,6 +25,7 @@ from src.perception.geometry import (
     remove_radius_outliers,
     save_segmentation_outputs,
 )
+from src.perception.item_catalog import bottle_item_id_from_prompt
 from src.robot.types import EndPoseMMDeg
 from src.run_grasp_pipeline_ros2 import build_config, build_parser
 from src.utils.calibration import load_camera_to_tcp_transform
@@ -69,6 +70,53 @@ def _point_in_norm_roi(
 ) -> bool:
     x0, y0, x1, y1 = roi
     return x0 <= u_norm <= x1 and y0 <= v_norm <= y1
+
+
+def _robust_bottle_body_center(
+    *,
+    mask: np.ndarray,
+    depth_meters: np.ndarray,
+    intrinsics: SimpleIntrinsics,
+    clip_max_m: float,
+) -> tuple[float, float, float] | None:
+    """Return a stable bottle-body point instead of averaging cap/label glare.
+
+    Transparent PET bottles frequently have invalid or reflected depth near the
+    cap, shoulder and outer silhouette.  A point-cloud centroid over the whole
+    segmentation mask is therefore biased.  The central 60% x 45% body band is
+    normally the liquid/label section the fingers should surround; use robust
+    medians there and reject the depth tails before back-projecting.
+    """
+    mask_np = np.asarray(mask, dtype=bool)
+    rows, cols = np.nonzero(mask_np)
+    if rows.size < 80:
+        return None
+    y0, y1 = int(rows.min()), int(rows.max())
+    x0, x1 = int(cols.min()), int(cols.max())
+    height = max(1, y1 - y0 + 1)
+    width = max(1, x1 - x0 + 1)
+    inner = mask_np.copy()
+    inner &= np.indices(mask_np.shape)[0] >= int(round(y0 + 0.32 * height))
+    inner &= np.indices(mask_np.shape)[0] <= int(round(y0 + 0.77 * height))
+    inner &= np.indices(mask_np.shape)[1] >= int(round(x0 + 0.20 * width))
+    inner &= np.indices(mask_np.shape)[1] <= int(round(x0 + 0.80 * width))
+    valid = inner & np.isfinite(depth_meters) & (depth_meters > 0.0) & (depth_meters < clip_max_m)
+    if int(valid.sum()) < 40:
+        return None
+    depths = np.asarray(depth_meters[valid], dtype=np.float64)
+    low, high = np.percentile(depths, [15.0, 85.0])
+    valid &= (depth_meters >= low) & (depth_meters <= high)
+    rows, cols = np.nonzero(valid)
+    if rows.size < 20:
+        return None
+    u = float(np.median(cols))
+    v = float(np.median(rows))
+    z = float(np.median(depth_meters[valid]))
+    return (
+        z * (u - float(intrinsics.ppx)) / float(intrinsics.fx),
+        z * (v - float(intrinsics.ppy)) / float(intrinsics.fy),
+        z,
+    )
 
 
 def _build_args_from_options(options: dict[str, object]) -> argparse.Namespace:
@@ -705,8 +753,10 @@ class ExternalInferenceEngine:
         object_centers_camera_m: list[tuple[float, float, float] | None] = []
         object_centers_uv: list[tuple[int, int] | None] = []
         object_cloud_paths: list[str | None] = []
+        object_center_sources: list[str] = []
         masks = segmentation["masks"]
         count = self._segmentation_count(segmentation)
+        requested_bottle_id = bottle_item_id_from_prompt(prompt)
 
         for index in range(count):
             mask = masks[index].squeeze()
@@ -737,11 +787,26 @@ class ExternalInferenceEngine:
                 object_points = filtered_points.astype(np.float32, copy=False)
 
             object_point_counts.append(int(len(object_points)) if object_points is not None else 0)
-            if pointclouds[index] is not None and len(pointclouds[index].points) > 0:
+            bottle_center = (
+                _robust_bottle_body_center(
+                    mask=mask_np,
+                    depth_meters=depth_meters,
+                    intrinsics=intrinsics,
+                    clip_max_m=float(config.clip_max_m),
+                )
+                if requested_bottle_id is not None
+                else None
+            )
+            if bottle_center is not None:
+                object_centers_camera_m.append(bottle_center)
+                object_center_sources.append("bottle_body_robust_median")
+            elif pointclouds[index] is not None and len(pointclouds[index].points) > 0:
                 center = np.asarray(pointclouds[index].get_center(), dtype=np.float64).reshape(3)
                 object_centers_camera_m.append((float(center[0]), float(center[1]), float(center[2])))
+                object_center_sources.append("pointcloud_centroid")
             else:
                 object_centers_camera_m.append(None)
+                object_center_sources.append("unavailable")
             object_centers_uv.append(self._mask_centroid_uv(mask_np))
 
             if use_center_candidates:
@@ -782,6 +847,7 @@ class ExternalInferenceEngine:
                     "scene_mask_grasps": int(len(scene_mask_grasps)) if scene_mask_grasps is not None else 0,
                     "merged_grasps": int(len(merged_grasps)) if merged_grasps is not None else 0,
                     "source": source_kind,
+                    "center_source": object_center_sources[-1],
                 }
             )
 

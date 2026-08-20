@@ -2108,6 +2108,18 @@ class PipelineOrchestratorNode(Node):
         advance_base_after_grasp: bool = False,
     ) -> dict[str, object]:
         place_enabled = bool(self.get_parameter("place_after_grasp").value)
+        # A dashboard request may still carry the previous item's UI strategy.
+        # Reassert the catalog-derived strategy immediately before execution
+        # (including confirmed plans), so a bottle can never be executed as a
+        # top-down block grasp.
+        if target_item_id:
+            execution_item = self._item_catalog().resolve(target_item_id)
+            if execution_item is None:
+                raise RuntimeError(f"unknown execution target_item_id: {target_item_id}")
+            selected_strategy = self._set_executor_strategy_for_item(execution_item)
+            self.get_logger().info(
+                f"execution strategy locked: item={target_item_id} strategy={selected_strategy}"
+            )
         execute_req = ExecuteGraspPlan.Request()
         execute_req.run_id = run_id
         execute_req.execute = True
@@ -5376,6 +5388,11 @@ class PipelineOrchestratorNode(Node):
             validation_records: list[dict[str, object]] = []
 
             if execute_enabled:
+                # Lock it again at the validation boundary.  This prevents a
+                # stale dashboard parameter from turning a bottle validation
+                # into safe_top_down before the execution-time lock below.
+                if target_item is not None:
+                    grasp_strategy = self._set_executor_strategy_for_item(target_item)
                 validation_candidate_limit = max(1, int(options.get("robot_validation_candidate_limit", 6)))
                 validation_variant_limit = max(1, int(options.get("robot_validation_variant_limit", 4)))
                 validation_candidates = candidate_pool[:validation_candidate_limit]

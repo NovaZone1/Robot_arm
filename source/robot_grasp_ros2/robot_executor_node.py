@@ -116,6 +116,11 @@ class RobotExecutorNode(Node):
         self.declare_parameter("motion_progress_extends_timeout", False)
         self.declare_parameter("motion_progress_position_epsilon_mm", 0.5)
         self.declare_parameter("motion_progress_rotation_epsilon_deg", 0.25)
+        # A Piper can occasionally report ARRIVED before it has accepted a
+        # newly published joint goal.  Retry that *same* waypoint once, but
+        # never advance to a later waypoint (in particular close_gripper)
+        # after a failed motion.
+        self.declare_parameter("motion_stage_retry_count", 1)
         self.declare_parameter("move_pos_tolerance_mm", 20.0)
         self.declare_parameter("move_rot_tolerance_deg", 10.0)
         self.declare_parameter("reject_degenerate_grasp_waypoints", True)
@@ -935,9 +940,41 @@ class RobotExecutorNode(Node):
             pos_tolerance_mm=effective_pos_tolerance_mm,
             rot_tolerance_deg=rot_tolerance_deg,
         )
-        executed_commands: list[str] = []
-        self._execute_command(cmd, executed_commands)
-        return self._robot_client().read_end_pose_mm_deg()
+        retries = max(0, int(self.get_parameter("motion_stage_retry_count").value))
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            executed_commands: list[str] = []
+            try:
+                self._execute_command(cmd, executed_commands)
+                return self._robot_client().read_end_pose_mm_deg()
+            except Exception as exc:
+                last_error = exc
+                if attempt >= retries:
+                    break
+                # Do not retry an explicit user stop/cancel, a faulted arm,
+                # or a failed teach/enable transition.  Those require human
+                # recovery; repeating a motion command would be unsafe.
+                text = str(exc).lower()
+                if "execution stopped" in text or "execution cancelled" in text:
+                    break
+                try:
+                    status = self._robot_client().get_arm_status_snapshot()
+                    healthy = (
+                        int(status.err_code) == 0
+                        and str(status.arm_status).strip().upper() == "NORMAL"
+                    )
+                except Exception:
+                    healthy = False
+                if not healthy:
+                    break
+                self.get_logger().warning(
+                    f"motion stage '{name}' did not complete; retrying the same "
+                    f"waypoint once ({attempt + 1}/{retries}): {exc}"
+                )
+        assert last_error is not None
+        raise RuntimeError(
+            f"motion stage '{name}' failed before any later action: {last_error}"
+        ) from last_error
 
     def _move_configured_pose(
         self,

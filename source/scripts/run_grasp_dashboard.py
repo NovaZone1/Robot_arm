@@ -36,6 +36,12 @@ LIVE_STACK_COMMAND = [
 CAN_PORT = str(os.environ.get("PIPER_CAN_PORT", "can0")).strip() or "can0"
 CAN_BITRATE = "1000000"
 
+# The six physical props have different approach geometry.  Do not let the
+# previous web-form selection (for example a block's top-down mode) leak into
+# the next explicit catalog item.
+_BOTTLE_ITEM_IDS = {"orange_bottle", "dark_bottle", "green_bottle"}
+_BLOCK_ITEM_IDS = {"red_block", "yellow_block", "blue_block"}
+
 
 def _read_json(path: Path) -> dict:
     try:
@@ -942,7 +948,11 @@ def _start_grasp_from_payload(payload: dict[str, object]) -> dict[str, object]:
     speed = max(1.0, min(100.0, speed))
     pipeline_speed = int(round(speed))
     requested_strategy = str(payload.get("execution_strategy") or "").strip()
-    if requested_strategy not in {"center_horizontal", "safe_top_down"}:
+    if explicit_target_item_id in _BOTTLE_ITEM_IDS:
+        requested_strategy = "center_horizontal"
+    elif explicit_target_item_id in _BLOCK_ITEM_IDS:
+        requested_strategy = "safe_top_down"
+    elif requested_strategy not in {"center_horizontal", "safe_top_down"}:
         requested_strategy = (
             "center_horizontal" if payload.get("use_object_center_contact", True) else "safe_top_down"
         )
