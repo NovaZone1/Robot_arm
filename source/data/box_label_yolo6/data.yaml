@@ -1,0 +1,5 @@
+path: /home/nvidia/auto/Robot_arm/source/data/box_label_yolo6
+train: images/train
+val: images/val
+nc: 6
+names: ['dark_bottle', 'green_bottle', 'yellow_block', 'red_block', 'orange_bottle', 'blue_block']

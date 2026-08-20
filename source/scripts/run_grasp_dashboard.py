@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import time
 from urllib.parse import quote, unquote, urlparse
@@ -310,6 +311,11 @@ def _start_live_stack() -> dict[str, object]:
 
 
 def _stop_live_stack() -> dict[str, object]:
+    # The stack is started in its own session.  During warm-up the shell can be
+    # waiting on a ros2 CLI subprocess, so killing only the named ROS nodes may
+    # leave that parent shell alive and make a later start look permanently
+    # "in progress".  Always terminate the recorded session as well.
+    recorded = _dashboard_stack_process()
     command = ["./scripts/clear_live_grasp_nodes.sh", "--timeout", "8"]
     result = subprocess.run(
         command,
@@ -319,6 +325,16 @@ def _stop_live_stack() -> dict[str, object]:
         check=False,
         timeout=20.0,
     )
+    session_signal = "not_needed"
+    if recorded is not None:
+        pid, _state = recorded
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            session_signal = f"SIGTERM process-group {pid}"
+        except ProcessLookupError:
+            session_signal = "already_exited"
+        except OSError as exc:
+            session_signal = f"failed: {exc}"
     if DASHBOARD_STACK_STATE_FILE.is_file():
         try:
             state = _read_json(DASHBOARD_STACK_STATE_FILE)
@@ -333,27 +349,64 @@ def _stop_live_stack() -> dict[str, object]:
         "message": "真机栈停止完成" if result.returncode == 0 else "真机栈停止脚本返回失败",
         "command": " ".join(command),
         "returncode": result.returncode,
+        "session_signal": session_signal,
         "stdout": result.stdout,
         "stderr": result.stderr,
         "system": _component_status(),
     }
 
 
+_ROS_DAEMON_FAILURE_MARKERS = (
+    "rclpy.ok()",
+    "the given context is not valid",
+    "xmlrpc.client.fault",
+)
+
+
+def _ros_daemon_context_failed(stdout: str, stderr: str) -> bool:
+    text = f"{stdout}\n{stderr}".lower()
+    return any(marker in text for marker in _ROS_DAEMON_FAILURE_MARKERS)
+
+
+def _restart_ros2_daemon() -> bool:
+    """Repair only the ROS CLI discovery daemon, never robot nodes."""
+    command = [str(PROJECT_ROOT / "scripts" / "ros2_system.sh"), "daemon"]
+    try:
+        subprocess.run(
+            [*command, "stop"], cwd=PROJECT_ROOT, capture_output=True,
+            text=True, check=False, timeout=8.0,
+        )
+        started = subprocess.run(
+            [*command, "start"], cwd=PROJECT_ROOT, capture_output=True,
+            text=True, check=False, timeout=8.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return started.returncode == 0
+
+
 def _run_ros2_command(args: list[str], *, timeout_s: float = 15.0) -> dict[str, object]:
-    result = subprocess.run(
-        [str(PROJECT_ROOT / "scripts" / "ros2_system.sh"), *args],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_s,
-    )
+    command = [str(PROJECT_ROOT / "scripts" / "ros2_system.sh"), *args]
+
+    def run_once() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command, cwd=PROJECT_ROOT, capture_output=True, text=True,
+            check=False, timeout=timeout_s,
+        )
+
+    result = run_once()
+    daemon_recovered = False
+    if result.returncode != 0 and _ros_daemon_context_failed(result.stdout, result.stderr):
+        daemon_recovered = _restart_ros2_daemon()
+        if daemon_recovered:
+            result = run_once()
     return {
         "ok": result.returncode == 0,
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
-        "command": " ".join([str(PROJECT_ROOT / "scripts" / "ros2_system.sh"), *args]),
+        "command": " ".join(command),
+        "ros_daemon_recovered": daemon_recovered,
     }
 
 
@@ -378,6 +431,60 @@ def _param_set(
     )
     output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
     if "Setting parameter failed" in output:
+        result["ok"] = False
+    return result
+
+
+def _param_set_batch(node_name: str, values: dict[str, object]) -> dict[str, object]:
+    """Set several ROS parameters in one service request.
+
+    The old dashboard ran one ``ros2 param set`` process per value.  A normal
+    Direct Grasp click configured more than twenty values before it could even
+    call ``/grasp_pipeline/run``.  Using the standard SetParameters service
+    preserves the node's normal parameter validation while removing that
+    avoidable launch delay.
+    """
+    type_and_field = {
+        bool: (1, "bool_value"),
+        int: (2, "integer_value"),
+        float: (3, "double_value"),
+        str: (4, "string_value"),
+    }
+    parameters: list[dict[str, object]] = []
+    for name, raw_value in values.items():
+        value = raw_value
+        # bool is intentionally checked before int because bool subclasses int.
+        kind = bool if isinstance(value, bool) else type(value)
+        if kind not in type_and_field:
+            value = str(value)
+            kind = str
+        value_type, field = type_and_field[kind]
+        parameters.append({"name": name, "value": {"type": value_type, field: value}})
+    result = _run_ros2_command(
+        [
+            "service",
+            "call",
+            f"{node_name}/set_parameters",
+            "rcl_interfaces/srv/SetParameters",
+            json.dumps({"parameters": parameters}),
+        ],
+        timeout_s=12.0,
+    )
+    output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
+    result["node_name"] = node_name
+    result["parameter_names"] = list(values)
+    matches = re.findall(r"successful\s*[=:]\s*(True|False)", output, flags=re.IGNORECASE)
+    failed_names = [
+        name for name, successful in zip(values, matches)
+        if successful.lower() != "true"
+    ]
+    if len(matches) != len(values):
+        failed_names = list(values)
+        result["parameter_response_error"] = (
+            f"expected {len(values)} SetParameters results, received {len(matches)}"
+        )
+    result["failed_parameters"] = failed_names
+    if failed_names:
         result["ok"] = False
     return result
 
@@ -797,7 +904,12 @@ def _bool_text(value: object) -> str:
 
 
 def _start_grasp_from_payload(payload: dict[str, object]) -> dict[str, object]:
-    auto_target_from_card = bool(payload.get("auto_target_from_card", True))
+    # An explicit Dashboard selection is an operator instruction. It must not
+    # be silently overwritten by the optional target-card automation checkbox.
+    explicit_target_item_id = str(payload.get("target_item_id") or "").strip()
+    auto_target_from_card = bool(payload.get("auto_target_from_card", True)) and not bool(
+        explicit_target_item_id
+    )
     prompt = str(payload.get("prompt") or "").strip()
     if not prompt and not auto_target_from_card:
         return {"ok": False, "error": "Prompt 不能为空"}
@@ -828,74 +940,62 @@ def _start_grasp_from_payload(payload: dict[str, object]) -> dict[str, object]:
 
     speed = float(payload.get("speed") or 25.0)
     speed = max(1.0, min(100.0, speed))
-    pipeline_speed_text = str(int(round(speed)))
-    executor_speed_text = str(speed)
+    pipeline_speed = int(round(speed))
     requested_strategy = str(payload.get("execution_strategy") or "").strip()
     if requested_strategy not in {"center_horizontal", "safe_top_down"}:
         requested_strategy = (
             "center_horizontal" if payload.get("use_object_center_contact", True) else "safe_top_down"
         )
-    commands = [
-        _param_set("/grasp_pipeline", "auto_target_from_card", _bool_text(auto_target_from_card)),
-        _param_set("/grasp_pipeline", "prompt", "" if auto_target_from_card else prompt),
-        _param_set(
-            "/grasp_pipeline",
-            "target_item_id",
-            "" if auto_target_from_card else str(payload.get("target_item_id") or ""),
-        ),
-        _param_set("/grasp_pipeline", "execute", _bool_text(payload.get("execute", True))),
-        _param_set(
-            "/grasp_pipeline",
-            "place_after_grasp",
-            _bool_text(payload.get("place_after_grasp", False)),
-        ),
-        _param_set(
-            "/grasp_pipeline",
-            "dynamic_box_localization",
-            _bool_text(payload.get("place_after_grasp", False)),
-        ),
-        _param_set(
-            "/grasp_pipeline",
-            "base_grasp_scan_enabled",
-            _bool_text(base_grasp_scan),
-        ),
-        _param_set("/grasp_pipeline", "confirm", _bool_text(payload.get("confirm", True))),
-        _param_set("/grasp_pipeline", "move_home_after", _bool_text(payload.get("move_home_after", False))),
-        _param_set("/grasp_pipeline", "precenter", _bool_text(payload.get("precenter", False))),
-        _param_set("/grasp_pipeline", "show_pointcloud", _bool_text(payload.get("show_pointcloud", False))),
-        _param_set("/grasp_pipeline", "enable_pregrasp", _bool_text(payload.get("enable_pregrasp", False))),
-        _param_set(
-            "/grasp_pipeline",
-            "use_object_center_contact",
-            _bool_text(payload.get("use_object_center_contact", True)),
-        ),
-        _param_set("/grasp_pipeline", "speed", pipeline_speed_text),
-        _param_set("/grasp_pipeline", "observation_speed", "25"),
-        _param_set("/grasp_pipeline", "home_speed", "25"),
-        _param_set("/grasp_pipeline", "manual_target_bias_x_mm", str(float(payload.get("bias_x_mm") or 0.0))),
-        _param_set("/grasp_pipeline", "manual_target_bias_y_mm", str(float(payload.get("bias_y_mm") or 0.0))),
-        _param_set("/grasp_pipeline", "manual_target_bias_z_mm", str(float(payload.get("bias_z_mm") or 0.0))),
-        _param_set("/robot_executor", "default_speed_percent", executor_speed_text),
-        _param_set("/robot_executor", "home_speed_percent", "25.0"),
-        _param_set("/robot_executor", "placement_speed_percent", "25.0"),
-        _param_set("/robot_executor", "placement_final_speed_percent", "5.0"),
-        _param_set("/robot_executor", "enable_pregrasp", _bool_text(payload.get("enable_pregrasp", False))),
-    ]
+    pipeline_parameters: dict[str, object] = {
+        "auto_target_from_card": auto_target_from_card,
+        "prompt": "" if auto_target_from_card else prompt,
+        "target_item_id": "" if auto_target_from_card else explicit_target_item_id,
+        "execute": bool(payload.get("execute", True)),
+        "place_after_grasp": bool(payload.get("place_after_grasp", False)),
+        "dynamic_box_localization": bool(payload.get("place_after_grasp", False)),
+        "base_grasp_scan_enabled": base_grasp_scan,
+        "confirm": bool(payload.get("confirm", True)),
+        "move_home_after": bool(payload.get("move_home_after", False)),
+        "precenter": bool(payload.get("precenter", False)),
+        "show_pointcloud": bool(payload.get("show_pointcloud", False)),
+        "enable_pregrasp": bool(payload.get("enable_pregrasp", False)),
+        "use_object_center_contact": bool(payload.get("use_object_center_contact", True)),
+        "speed": pipeline_speed,
+        "observation_speed": 25,
+        "home_speed": 25,
+        "manual_target_bias_x_mm": float(payload.get("bias_x_mm") or 0.0),
+        "manual_target_bias_y_mm": float(payload.get("bias_y_mm") or 0.0),
+        "manual_target_bias_z_mm": float(payload.get("bias_z_mm") or 0.0),
+    }
+    executor_parameters: dict[str, object] = {
+        "default_speed_percent": speed,
+        "home_speed_percent": 25.0,
+        "placement_speed_percent": 25.0,
+        "placement_final_speed_percent": 5.0,
+        "enable_pregrasp": bool(payload.get("enable_pregrasp", False)),
+    }
     if not auto_target_from_card:
-        commands.append(
-            _param_set(
-                "/robot_executor",
-                "execution_strategy",
-                requested_strategy,
-            )
-        )
+        executor_parameters["execution_strategy"] = requested_strategy
+    commands = [
+        _param_set_batch("/grasp_pipeline", pipeline_parameters),
+        _param_set_batch("/robot_executor", executor_parameters),
+    ]
     failed = [item for item in commands if not item.get("ok")]
     if failed:
         node_missing = any("Node not found" in str(item.get("stderr") or item.get("stdout") or "") for item in failed)
+        failed_details = []
+        for item in failed:
+            node = str(item.get("node_name") or "unknown_node")
+            names = [str(name) for name in list(item.get("failed_parameters") or [])]
+            failed_details.append(f"{node}: {', '.join(names) if names else 'service request'}")
         return {
             "ok": False,
             "stage": "param_set",
-            "error": "抓取栈未启动：找不到 ROS 节点" if node_missing else "参数下发失败",
+            "error": (
+                "抓取栈未启动：找不到 ROS 节点"
+                if node_missing
+                else "参数下发失败：" + "；".join(failed_details)
+            ),
             "commands": commands,
             "failed_commands": failed,
             "system": status,
@@ -1639,6 +1739,9 @@ document.querySelectorAll("[data-prompt]").forEach(button => {
   button.addEventListener("click", () => {
     document.getElementById("promptInput").value = button.dataset.prompt || "";
     document.getElementById("targetItemInput").value = button.dataset.itemId || "";
+    if (button.dataset.itemId) {
+      document.getElementById("autoTargetCardInput").checked = false;
+    }
     if (button.dataset.centerContact) {
       document.getElementById("centerContactInput").checked =
         button.dataset.centerContact === "true";
@@ -1648,6 +1751,10 @@ document.querySelectorAll("[data-prompt]").forEach(button => {
         button.dataset.executionStrategy;
     }
   });
+});
+
+document.getElementById("targetItemInput").addEventListener("change", e => {
+  if (e.target.value) document.getElementById("autoTargetCardInput").checked = false;
 });
 
 document.getElementById("clearBiasBtn").addEventListener("click", () => {

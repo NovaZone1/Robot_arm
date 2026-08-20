@@ -126,7 +126,15 @@ def _center_sample(
     samples: Iterable[dict[str, object]],
 ) -> dict[str, object] | None:
     tagged = {str(sample.get("tag") or "").strip().lower(): sample for sample in samples}
-    for name in ("center", "normal_center", "near_center", "near_centerer"):
+    for name in (
+        "center",
+        "normal_center",
+        "near_center",
+        "near_centerer",
+        # new_ samples use a prefixed tag (new_near_center / new_normal_center).
+        "new_normal_center",
+        "new_near_center",
+    ):
         if name in tagged:
             return tagged[name]
     return None

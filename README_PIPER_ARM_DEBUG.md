@@ -56,3 +56,8 @@ PIPER_CAN_PORT=can1 PIPER_CAN_LOSS_GRACE_S=3.0 ./scripts/run_grasp_dashboard.py
 ```
 
 不建议将该值设得过大，因为真正断线时机械臂执行器必须及时停止等待。
+
+
+
+cd ~/auto/Robot_arm/source
+./scripts/record_placement_uv_xy.sh --item orange_bottle

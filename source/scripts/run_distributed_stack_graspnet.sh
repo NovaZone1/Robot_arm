@@ -151,6 +151,11 @@ orchestrator_params="${project_root}/config/distributed/pipeline_orchestrator.pa
 base_scan_params="${project_root}/config/distributed/scout_scan_controller.params.yaml"
 
 pids=()
+# Optional dependencies are launched first, then waited for only after the
+# core ROS nodes are already available.  Keeping these flags lets their
+# readiness checks run concurrently instead of serially delaying all nodes.
+wait_for_piper_service=0
+wait_for_moveit_service=0
 
 cleanup() {
   local pid
@@ -223,10 +228,7 @@ if [[ "${with_piper_driver}" -eq 1 ]]; then
       pids+=("${piper_pid}")
       printf '[distributed] started %-24s pid=%s log=%s\n' "piper_driver" "${piper_pid}" "${piper_logfile}"
 
-      # Wait for /enable_srv to appear (up to 30s)
-      if ! wait_for_service "/enable_srv" 30 "/enable_srv"; then
-        echo "[distributed] WARNING: /enable_srv not available after 30s. Check piper_driver.log" >&2
-      fi
+      wait_for_piper_service=1
     fi
   fi
 fi
@@ -251,10 +253,7 @@ if [[ "${with_moveit_ik}" -eq 1 ]]; then
       pids+=("${moveit_pid}")
       printf '[distributed] started %-24s pid=%s log=%s\n' "moveit_ik" "${moveit_pid}" "${moveit_logfile}"
 
-      # Wait for /compute_ik to appear (up to 60s, MoveIt takes a while)
-      if ! wait_for_service "/compute_ik" 60 "/compute_ik"; then
-        echo "[distributed] WARNING: /compute_ik not available after 60s. Check moveit_ik.log" >&2
-      fi
+      wait_for_moveit_service=1
     fi
   fi
 fi
@@ -262,6 +261,13 @@ fi
 # ---------------------------------------------------------------------------
 # Step 3: Start the four distributed nodes
 # ---------------------------------------------------------------------------
+# Keep grasp-time RGB processing consistent with the image set used to train
+# the current object/box classifiers.  Those samples were collected with the
+# D435's auto white-balance and exposure enabled.  A caller may still opt into
+# a separately calibrated fixed profile by explicitly exporting
+# D435_LOCK_COLOR=1 (and D435_WHITE_BALANCE/D435_EXPOSURE) before launch.
+export D435_LOCK_COLOR="${D435_LOCK_COLOR:-0}"
+
 camera_cmd=(
   "${ros_python}" -m robot_grasp_ros2.camera_server_node
   --ros-args
@@ -326,6 +332,32 @@ start_node "robot_executor" "${robot_cmd[@]}"
 start_node "base_scan_controller" "${base_scan_cmd[@]}"
 start_node "grasp_pipeline" "${orchestrator_cmd[@]}"
 
+# Piper and MoveIt were launched above and have been initializing while the
+# camera/vision/executor/pipeline nodes came up.  Check both in parallel here;
+# this replaces the former 30s + 60s serial startup delay.
+dependency_wait_pids=()
+if [[ "${wait_for_piper_service}" -eq 1 ]]; then
+  (
+    if ! wait_for_service "/enable_srv" 30 "/enable_srv"; then
+      echo "[distributed] WARNING: /enable_srv not available after 30s. Check piper_driver.log" >&2
+    fi
+  ) &
+  dependency_wait_pids+=("$!")
+fi
+if [[ "${wait_for_moveit_service}" -eq 1 ]]; then
+  (
+    if ! wait_for_service "/compute_ik" 60 "/compute_ik"; then
+      echo "[distributed] WARNING: /compute_ik not available after 60s. Check moveit_ik.log" >&2
+    fi
+  ) &
+  dependency_wait_pids+=("$!")
+fi
+if [[ "${#dependency_wait_pids[@]}" -gt 0 ]]; then
+  for dependency_wait_pid in "${dependency_wait_pids[@]}"; do
+    wait "${dependency_wait_pid}" || true
+  done
+fi
+
 # ---------------------------------------------------------------------------
 # Step 4: Optional warmup
 # ---------------------------------------------------------------------------
@@ -339,7 +371,9 @@ if [[ "${warmup_flag}" -eq 1 ]]; then
 
   echo "[distributed] Warming up vision daemon (loads YOLOv8-seg + GraspNet before navigation handoff)..."
   warmup_start="$(date +%s)"
-  "${project_root}/scripts/ros2_system.sh" service call /vision_worker/warmup std_srvs/srv/Trigger \
+  # Do not let an unavailable accelerator/model daemon leave the whole stack
+  # stuck in "starting" forever.  A later real request can still initialize it.
+  timeout 120 "${project_root}/scripts/ros2_system.sh" service call /vision_worker/warmup std_srvs/srv/Trigger \
     "{}" \
     >/dev/null 2>&1 || echo "[distributed] vision warmup skipped (service not ready yet)"
   warmup_end="$(date +%s)"

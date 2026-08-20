@@ -61,6 +61,7 @@
 | `docs/ENGINEERING_SPEC.md` | 代码规范、API 规范、运行约束 |
 | `docs/MIGRATION_TODO.md` | 迁移 backlog、遗留项、参考记录 |
 | `docs/ROBOT_COUPLING_MAP.md` | 旧工程机器人耦合点梳理 |
+| `docs/DATA_COLLECTION.md` | D435 实时画面与新物品/盒标训练数据采集 |
 | `docs/PIPER_LOCAL_SIM.md` | 本机 Piper 非硬件仿真 / 模型调试说明 |
 | `AGENTS.md` | AI / 工程师接手本仓库的读文件顺序与工作约定 |
 

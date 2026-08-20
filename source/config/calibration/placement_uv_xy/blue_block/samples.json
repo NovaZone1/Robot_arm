@@ -1,0 +1,310 @@
+{
+  "item_id": "blue_block",
+  "observe_pose_mm_deg": [
+    0.0,
+    -35.5,
+    491.1,
+    180.0,
+    67.77,
+    89.97
+  ],
+  "sample_count": 8,
+  "samples": [
+    {
+      "item_id": "blue_block",
+      "u_px": 421.0,
+      "v_px": 91.0,
+      "u_norm": 0.6578125,
+      "v_norm": 0.18958333333333333,
+      "bbox_xywh": [
+        350,
+        30,
+        142,
+        122
+      ],
+      "confidence": 0.6112315058708191,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_01_color.png",
+      "overlay_image": "sample_01_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.032,
+        "y_mm": -35.488,
+        "z_mm": 491.436,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.80200000000004,
+        "yaw_deg": 89.94699999999999
+      },
+      "captured_at": "2026-08-20 05:48:44",
+      "tag": "normal_center",
+      "release_pose_mm_deg": {
+        "x_mm": -25.099,
+        "y_mm": -280.51599999999996,
+        "z_mm": 353.92699999999996,
+        "roll_deg": -30.88300000000005,
+        "pitch_deg": 86.71499999999993,
+        "yaw_deg": -125.62799999999997
+      },
+      "recorded_at": "2026-08-20 05:49:00"
+    },
+    {
+      "item_id": "blue_block",
+      "u_px": 481.0,
+      "v_px": 197.0,
+      "u_norm": 0.7515625,
+      "v_norm": 0.41041666666666665,
+      "bbox_xywh": [
+        418,
+        142,
+        126,
+        110
+      ],
+      "confidence": 0.6388775706291199,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_02_color.png",
+      "overlay_image": "sample_02_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.030000000000000002,
+        "y_mm": -35.403,
+        "z_mm": 491.436,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.826,
+        "yaw_deg": 89.94999999999999
+      },
+      "captured_at": "2026-08-20 05:50:13",
+      "tag": "normal_left",
+      "release_pose_mm_deg": {
+        "x_mm": -59.75,
+        "y_mm": -274.144,
+        "z_mm": 301.73,
+        "roll_deg": -155.55399999999997,
+        "pitch_deg": 83.44099999999995,
+        "yaw_deg": 103.02799999999998
+      },
+      "recorded_at": "2026-08-20 05:50:25"
+    },
+    {
+      "item_id": "blue_block",
+      "u_px": 331.0,
+      "v_px": 203.0,
+      "u_norm": 0.5171875,
+      "v_norm": 0.42291666666666666,
+      "bbox_xywh": [
+        268,
+        148,
+        126,
+        110
+      ],
+      "confidence": 0.7116712927818298,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_03_color.png",
+      "overlay_image": "sample_03_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.092,
+        "y_mm": -35.048,
+        "z_mm": 491.392,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.80400000000002,
+        "yaw_deg": 89.84800000000001
+      },
+      "captured_at": "2026-08-20 05:50:45",
+      "tag": "normal_right",
+      "release_pose_mm_deg": {
+        "x_mm": 25.378999999999998,
+        "y_mm": -266.093,
+        "z_mm": 300.526,
+        "roll_deg": -171.922,
+        "pitch_deg": 81.37700000000001,
+        "yaw_deg": 103.87700000000002
+      },
+      "recorded_at": "2026-08-20 05:51:01"
+    },
+    {
+      "item_id": "blue_block",
+      "u_px": 391.0,
+      "v_px": 237.0,
+      "u_norm": 0.6109375,
+      "v_norm": 0.49375,
+      "bbox_xywh": [
+        320,
+        176,
+        142,
+        122
+      ],
+      "confidence": 0.726175844669342,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_04_color.png",
+      "overlay_image": "sample_04_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.037,
+        "y_mm": -35.617999999999995,
+        "z_mm": 491.32599999999996,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.78199999999998,
+        "yaw_deg": 89.93899999999995
+      },
+      "captured_at": "2026-08-20 05:51:28",
+      "tag": "near_center",
+      "release_pose_mm_deg": {
+        "x_mm": -0.060000000000000005,
+        "y_mm": -221.71099999999998,
+        "z_mm": 327.083,
+        "roll_deg": -169.81500000000003,
+        "pitch_deg": 79.01500000000001,
+        "yaw_deg": 100.42000000000002
+      },
+      "recorded_at": "2026-08-20 05:51:37"
+    },
+    {
+      "item_id": "blue_block",
+      "u_px": 467.0,
+      "v_px": 235.0,
+      "u_norm": 0.7296875,
+      "v_norm": 0.4895833333333333,
+      "bbox_xywh": [
+        396,
+        174,
+        142,
+        122
+      ],
+      "confidence": 0.7089809775352478,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_05_color.png",
+      "overlay_image": "sample_05_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.06999999999999999,
+        "y_mm": -35.708,
+        "z_mm": 491.23,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.712,
+        "yaw_deg": 89.88599999999997
+      },
+      "captured_at": "2026-08-20 05:51:51",
+      "tag": "near_left\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D",
+      "release_pose_mm_deg": {
+        "x_mm": -36.028,
+        "y_mm": -209.4,
+        "z_mm": 308.865,
+        "roll_deg": -162.336,
+        "pitch_deg": 77.84399999999997,
+        "yaw_deg": 98.503
+      },
+      "recorded_at": "2026-08-20 05:52:05"
+    },
+    {
+      "item_id": "blue_block",
+      "u_px": 351.0,
+      "v_px": 169.0,
+      "u_norm": 0.5484375,
+      "v_norm": 0.35208333333333336,
+      "bbox_xywh": [
+        294,
+        120,
+        114,
+        98
+      ],
+      "confidence": 0.7000226974487305,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_06_color.png",
+      "overlay_image": "sample_06_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.046,
+        "y_mm": -35.199,
+        "z_mm": 491.405,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.80499999999999,
+        "yaw_deg": 89.92399999999998
+      },
+      "captured_at": "2026-08-20 05:54:22",
+      "tag": "far_center",
+      "release_pose_mm_deg": {
+        "x_mm": 13.195,
+        "y_mm": -341.377,
+        "z_mm": 295.717,
+        "roll_deg": -166.472,
+        "pitch_deg": 80.04799999999996,
+        "yaw_deg": 106.53899999999996
+      },
+      "recorded_at": "2026-08-20 05:54:31"
+    },
+    {
+      "item_id": "blue_block",
+      "u_px": 439.0,
+      "v_px": 53.0,
+      "u_norm": 0.6859375,
+      "v_norm": 0.11041666666666666,
+      "bbox_xywh": [
+        382,
+        4,
+        114,
+        98
+      ],
+      "confidence": 0.5177719593048096,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_07_color.png",
+      "overlay_image": "sample_07_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.067,
+        "y_mm": -35.677,
+        "z_mm": 491.17499999999995,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.706,
+        "yaw_deg": 89.89
+      },
+      "captured_at": "2026-08-20 05:55:11",
+      "tag": "far_left",
+      "release_pose_mm_deg": {
+        "x_mm": -35.757999999999996,
+        "y_mm": -342.626,
+        "z_mm": 344.937,
+        "roll_deg": -37.77399999999992,
+        "pitch_deg": 88.7229999999998,
+        "yaw_deg": -133.5209999999996
+      },
+      "recorded_at": "2026-08-20 05:55:25"
+    },
+    {
+      "item_id": "blue_block",
+      "u_px": 305.0,
+      "v_px": 55.0,
+      "u_norm": 0.4765625,
+      "v_norm": 0.11458333333333333,
+      "bbox_xywh": [
+        242,
+        0,
+        126,
+        110
+      ],
+      "confidence": 0.5798366069793701,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_08_color.png",
+      "overlay_image": "sample_08_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.07200000000000001,
+        "y_mm": -35.768,
+        "z_mm": 491.039,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.66600000000003,
+        "yaw_deg": 89.88299999999998
+      },
+      "captured_at": "2026-08-20 05:55:37",
+      "tag": "far_right",
+      "release_pose_mm_deg": {
+        "x_mm": 42.047000000000004,
+        "y_mm": -354.30899999999997,
+        "z_mm": 346.65000000000003,
+        "roll_deg": -44.50899999999974,
+        "pitch_deg": 87.62299999999975,
+        "yaw_deg": -127.28799999999961
+      },
+      "recorded_at": "2026-08-20 05:55:51"
+    }
+  ]
+}

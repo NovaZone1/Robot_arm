@@ -8,7 +8,7 @@
     67.77,
     89.97
   ],
-  "sample_count": 25,
+  "sample_count": 32,
   "samples": [
     {
       "item_id": "orange_bottle",
@@ -934,6 +934,265 @@
         "yaw_deg": -169.13799999999992
       },
       "recorded_at": "2026-08-19 18:21:34"
+    },
+    {
+      "item_id": "orange_bottle",
+      "u_px": 418.0,
+      "v_px": 108.0,
+      "u_norm": 0.653125,
+      "v_norm": 0.225,
+      "bbox_xywh": [
+        338,
+        36,
+        160,
+        144
+      ],
+      "confidence": 0.5869142413139343,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_26_color.png",
+      "overlay_image": "sample_26_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.060000000000000005,
+        "y_mm": -35.509,
+        "z_mm": 491.321,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.80400000000002,
+        "yaw_deg": 89.902
+      },
+      "captured_at": "2026-08-20 04:03:18",
+      "tag": "new_near_center",
+      "release_pose_mm_deg": {
+        "x_mm": -2.415,
+        "y_mm": -245.32000000000002,
+        "z_mm": 338.27299999999997,
+        "roll_deg": 39.28299999999999,
+        "pitch_deg": 86.85600000000004,
+        "yaw_deg": -51.71200000000014
+      },
+      "recorded_at": "2026-08-20 04:03:41"
+    },
+    {
+      "item_id": "orange_bottle",
+      "u_px": 497.0,
+      "v_px": 218.0,
+      "u_norm": 0.7765625,
+      "v_norm": 0.45416666666666666,
+      "bbox_xywh": [
+        426,
+        154,
+        142,
+        128
+      ],
+      "confidence": 0.5191791653633118,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_27_color.png",
+      "overlay_image": "sample_27_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.085,
+        "y_mm": -35.505,
+        "z_mm": 491.333,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.74499999999999,
+        "yaw_deg": 89.86199999999997
+      },
+      "captured_at": "2026-08-20 04:04:02",
+      "tag": "new_near_left",
+      "release_pose_mm_deg": {
+        "x_mm": -51.348,
+        "y_mm": -231.44600000000003,
+        "z_mm": 300.392,
+        "roll_deg": -172.246,
+        "pitch_deg": 80.91000000000001,
+        "yaw_deg": 85.54399999999995
+      },
+      "recorded_at": "2026-08-20 04:04:15"
+    },
+    {
+      "item_id": "orange_bottle",
+      "u_px": 341.0,
+      "v_px": 221.0,
+      "u_norm": 0.5328125,
+      "v_norm": 0.46041666666666664,
+      "bbox_xywh": [
+        278,
+        164,
+        126,
+        114
+      ],
+      "confidence": 0.5799545645713806,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_28_color.png",
+      "overlay_image": "sample_28_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.057,
+        "y_mm": -35.366,
+        "z_mm": 491.452,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.76100000000002,
+        "yaw_deg": 89.90600000000002
+      },
+      "captured_at": "2026-08-20 04:04:45",
+      "tag": "new_near_right",
+      "release_pose_mm_deg": {
+        "x_mm": 28.718,
+        "y_mm": -235.876,
+        "z_mm": 305.23,
+        "roll_deg": -155.16999999999993,
+        "pitch_deg": 83.373,
+        "yaw_deg": 122.46800000000002
+      },
+      "recorded_at": "2026-08-20 04:04:58"
+    },
+    {
+      "item_id": "orange_bottle",
+      "u_px": 377.0,
+      "v_px": 187.0,
+      "u_norm": 0.5890625,
+      "v_norm": 0.38958333333333334,
+      "bbox_xywh": [
+        314,
+        130,
+        126,
+        114
+      ],
+      "confidence": 0.6359437108039856,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_29_color.png",
+      "overlay_image": "sample_29_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.018000000000000002,
+        "y_mm": -35.315,
+        "z_mm": 491.439,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.83499999999998,
+        "yaw_deg": 89.97
+      },
+      "captured_at": "2026-08-20 04:05:28",
+      "tag": "new_normal_center",
+      "release_pose_mm_deg": {
+        "x_mm": 0.7060000000000001,
+        "y_mm": -287.122,
+        "z_mm": 303.722,
+        "roll_deg": -168.658,
+        "pitch_deg": 81.88699999999996,
+        "yaw_deg": 101.96800000000006
+      },
+      "recorded_at": "2026-08-20 04:05:41"
+    },
+    {
+      "item_id": "orange_bottle",
+      "u_px": 315.0,
+      "v_px": 66.0,
+      "u_norm": 0.4921875,
+      "v_norm": 0.1375,
+      "bbox_xywh": [
+        244,
+        2,
+        142,
+        128
+      ],
+      "confidence": 0.6017756462097168,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_30_color.png",
+      "overlay_image": "sample_30_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.102,
+        "y_mm": -35.109,
+        "z_mm": 491.433,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.847,
+        "yaw_deg": 89.83199999999998
+      },
+      "captured_at": "2026-08-20 04:06:40",
+      "tag": "new_normal_right",
+      "release_pose_mm_deg": {
+        "x_mm": 36.451,
+        "y_mm": -303.79200000000003,
+        "z_mm": 350.76800000000003,
+        "roll_deg": -142.30899999999997,
+        "pitch_deg": 87.09200000000017,
+        "yaw_deg": 134.89700000000013
+      },
+      "recorded_at": "2026-08-20 04:06:54"
+    },
+    {
+      "item_id": "orange_bottle",
+      "u_px": 450.0,
+      "v_px": 66.5,
+      "u_norm": 0.703125,
+      "v_norm": 0.13854166666666667,
+      "bbox_xywh": [
+        427,
+        7,
+        46,
+        119
+      ],
+      "confidence": 0.5796599776848503,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_31_color.png",
+      "overlay_image": "sample_31_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.095,
+        "y_mm": -35.329,
+        "z_mm": 491.305,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.75000000000001,
+        "yaw_deg": 89.845
+      },
+      "captured_at": "2026-08-20 04:07:09",
+      "tag": "new_normal_left",
+      "release_pose_mm_deg": {
+        "x_mm": -39.272,
+        "y_mm": -304.907,
+        "z_mm": 336.549,
+        "roll_deg": -42.34900000000002,
+        "pitch_deg": 87.661,
+        "yaw_deg": -139.23299999999992
+      },
+      "recorded_at": "2026-08-20 04:07:22"
+    },
+    {
+      "item_id": "orange_bottle",
+      "u_px": 406.5,
+      "v_px": 46.5,
+      "u_norm": 0.63515625,
+      "v_norm": 0.096875,
+      "bbox_xywh": [
+        386,
+        0,
+        41,
+        93
+      ],
+      "confidence": 0.5879034069076366,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_32_color.png",
+      "overlay_image": "sample_32_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.015000000000000001,
+        "y_mm": -35.603,
+        "z_mm": 491.317,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.727,
+        "yaw_deg": 89.975
+      },
+      "captured_at": "2026-08-20 04:08:01",
+      "tag": "new_far_center",
+      "release_pose_mm_deg": {
+        "x_mm": -13.892,
+        "y_mm": -358.909,
+        "z_mm": 348.223,
+        "roll_deg": -171.17999999999972,
+        "pitch_deg": 87.30099999999986,
+        "yaw_deg": 96.69599999999996
+      },
+      "recorded_at": "2026-08-20 04:08:11"
     }
   ]
 }

@@ -671,13 +671,15 @@ class ReferenceLabelMatcher:
                 ):
                     continue
                 if shape == "block":
+                    # Loosened minimum so a red_block label seen farther or at
+                    # an oblique angle during the base scan still passes.
                     minimum_width = max(
                         32,
-                        int(round(search.shape[1] * 0.07)),
+                        int(round(search.shape[1] * 0.05)),
                     )
                     minimum_height = max(
                         30,
-                        int(round(search.shape[0] * 0.06)),
+                        int(round(search.shape[0] * 0.04)),
                     )
                     if w < minimum_width or h < minimum_height:
                         continue
@@ -880,6 +882,103 @@ class ReferenceLabelMatcher:
             )
         return tuple(detections)
 
+    _LABEL_HSV_RANGES: dict[str, tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...]] = {
+        "red_block": (((0, 65, 45), (10, 255, 255)), ((168, 65, 45), (179, 255, 255))),
+        "yellow_block": (((8, 55, 45), (42, 255, 255)),),
+        "blue_block": (((90, 50, 35), (138, 255, 255)),),
+        "orange_bottle": (((8, 55, 45), (25, 255, 255)),),
+        "green_bottle": (((35, 40, 30), (90, 255, 255)),),
+        "dark_bottle": (((90, 10, 10), (179, 80, 120)), ((0, 10, 10), (30, 80, 120))),
+    }
+
+    def _hsv_classify_roi(
+        self,
+        roi_bgr: np.ndarray,
+        *,
+        min_fraction: float = 0.20,
+    ) -> tuple[str | None, float]:
+        """Classify the dominant printed label colour inside a YOLO box by HSV.
+
+        YOLO detects boxes reliably but confuses orange/red and dark labels;
+        the printed label colour is more discriminative in HSV. Returns the
+        item id whose colour covers the largest fraction of the box (above the
+        threshold) and that fraction.
+        """
+        if roi_bgr is None or roi_bgr.size == 0:
+            return None, 0.0
+        hsv = cv2.cvtColor(np.asarray(roi_bgr), cv2.COLOR_BGR2HSV)
+        height, width = hsv.shape[:2]
+        total = float(height * width)
+        if total <= 1.0:
+            return None, 0.0
+        best_id: str | None = None
+        best_fraction = 0.0
+        for item_id, item_ranges in self._LABEL_HSV_RANGES.items():
+            mask = np.zeros((height, width), dtype=np.uint8)
+            for lower, upper in item_ranges:
+                mask = cv2.bitwise_or(
+                    mask,
+                    cv2.inRange(
+                        hsv,
+                        np.asarray(lower, dtype=np.uint8),
+                        np.asarray(upper, dtype=np.uint8),
+                    ),
+                )
+            fraction = float(cv2.countNonZero(mask)) / total
+            if fraction > best_fraction:
+                best_fraction = fraction
+                best_id = item_id
+        if best_id is None or best_fraction < min_fraction:
+            return None, best_fraction
+        return best_id, best_fraction
+
+    def match_yolo6_hsv(
+        self,
+        color_bgr: np.ndarray,
+        yolo6_detections: tuple[dict[str, object], ...],
+        *,
+        roi_xywh: tuple[int, int, int, int],
+        min_fraction: float = 0.20,
+    ) -> tuple[LabelDetection, ...]:
+        """Train a 6-class YOLO for boxes, then HSV for the exact colour.
+
+        The trained model is strong at finding every label box (and its rough
+        class) but confuses orange/red and struggles with the dark bottle
+        label. Inside each YOLO box, HSV selects the definitive colour class.
+        """
+        image = np.asarray(color_bgr)
+        height, width = image.shape[:2]
+        roi_x, roi_y, roi_w, roi_h = roi_xywh
+        detections: list[LabelDetection] = []
+        for proposal in yolo6_detections:
+            raw_bbox = list(proposal.get("bbox_xywh") or [])
+            if len(raw_bbox) != 4:
+                continue
+            x, y, box_w, box_h = (int(round(float(v))) for v in raw_bbox)
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(width, x + box_w), min(height, y + box_h)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            cx = (x0 + x1) / 2.0
+            cy = (y0 + y1) / 2.0
+            if not (roi_x <= cx <= roi_x + roi_w and roi_y <= cy <= roi_y + roi_h):
+                continue
+            roi_bgr = image[y0:y1, x0:x1]
+            item_id, fraction = self._hsv_classify_roi(roi_bgr, min_fraction=min_fraction)
+            if item_id is None:
+                continue
+            yolo_score = float(proposal.get("confidence") or 0.0)
+            confidence = min(0.99, (0.55 * yolo_score) + (0.45 * fraction))
+            detections.append(
+                LabelDetection(
+                    item_id=item_id,
+                    confidence=confidence,
+                    bbox_xywh=(x0, y0, x1 - x0, y1 - y0),
+                    method="yolo6_hsv",
+                )
+            )
+        return tuple(detections)
+
     @staticmethod
     def _roi(image: np.ndarray, roi_norm: tuple[float, float, float, float]) -> tuple[np.ndarray, tuple[int, int, int, int]]:
         height, width = image.shape[:2]
@@ -899,11 +998,21 @@ class ReferenceLabelMatcher:
         threshold: float | None = None,
         bottle_proposals: tuple[dict[str, object], ...] | None = None,
         marker_detection_enabled: bool = True,
+        yolo6_detections: tuple[dict[str, object], ...] | None = None,
     ) -> tuple[tuple[LabelDetection, ...], tuple[int, int, int, int]]:
         roi_values = roi_norm or self.catalog.box.label_search_roi_norm
         search, search_xywh = self._roi(np.asarray(color_bgr), roi_values)
         required = float(
             threshold if threshold is not None else self.catalog.box.label_match_threshold
+        )
+        yolo6_hsv_detections = (
+            self.match_yolo6_hsv(
+                np.asarray(color_bgr),
+                yolo6_detections,
+                roi_xywh=search_xywh,
+            )
+            if yolo6_detections
+            else ()
         )
         marker_detections = (
             self._match_color_markers(
@@ -1034,7 +1143,12 @@ class ReferenceLabelMatcher:
         # because fewer than six unique labels remain.
         unique: list[LabelDetection] = []
         seen_item_ids: set[str] = set()
-        fused_candidates = [*marker_detections, *yolo_detections, *candidates]
+        fused_candidates = [
+            *marker_detections,
+            *yolo_detections,
+            *yolo6_hsv_detections,
+            *candidates,
+        ]
         for candidate in sorted(
             fused_candidates,
             key=lambda value: value.confidence,
@@ -1085,6 +1199,7 @@ class ReferenceLabelMatcher:
         threshold: float | None = None,
         bottle_proposals: tuple[dict[str, object], ...] | None = None,
         marker_detection_enabled: bool = True,
+        yolo6_detections: tuple[dict[str, object], ...] | None = None,
     ) -> LabelMatch:
         item = self.catalog.require(expected_item_id)
         detections, search_xywh = self.match_all(
@@ -1093,6 +1208,7 @@ class ReferenceLabelMatcher:
             threshold=threshold,
             bottle_proposals=bottle_proposals,
             marker_detection_enabled=marker_detection_enabled,
+            yolo6_detections=yolo6_detections,
         )
         target = next(
             (detection for detection in detections if detection.item_id == item.item_id),

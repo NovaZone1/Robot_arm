@@ -8,7 +8,7 @@
     67.77,
     89.97
   ],
-  "sample_count": 21,
+  "sample_count": 30,
   "samples": [
     {
       "item_id": "red_block",
@@ -786,6 +786,339 @@
         "yaw_deg": -110.16199999999992
       },
       "recorded_at": "2026-08-19 17:07:59"
+    },
+    {
+      "item_id": "red_block",
+      "u_px": 404.0,
+      "v_px": 145.0,
+      "u_norm": 0.63125,
+      "v_norm": 0.3020833333333333,
+      "bbox_xywh": [
+        324,
+        78,
+        160,
+        134
+      ],
+      "confidence": 0.5852707624435425,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_22_color.png",
+      "overlay_image": "sample_22_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.079,
+        "y_mm": -35.259,
+        "z_mm": 491.192,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.73799999999999,
+        "yaw_deg": 89.86999999999996
+      },
+      "captured_at": "2026-08-20 03:54:52",
+      "tag": "new_near_center",
+      "release_pose_mm_deg": {
+        "x_mm": 0.255,
+        "y_mm": -212.43400000000003,
+        "z_mm": 345.019,
+        "roll_deg": -61.82500000000016,
+        "pitch_deg": 86.90900000000009,
+        "yaw_deg": -151.3910000000001
+      },
+      "recorded_at": "2026-08-20 03:55:18"
+    },
+    {
+      "item_id": "red_block",
+      "u_px": 504.0,
+      "v_px": 135.0,
+      "u_norm": 0.7875,
+      "v_norm": 0.28125,
+      "bbox_xywh": [
+        424,
+        68,
+        160,
+        134
+      ],
+      "confidence": 0.5802366733551025,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_23_color.png",
+      "overlay_image": "sample_23_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.06499999999999999,
+        "y_mm": -35.134,
+        "z_mm": 491.426,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.84500000000003,
+        "yaw_deg": 89.893
+      },
+      "captured_at": "2026-08-20 03:56:26",
+      "tag": "new_near_left",
+      "release_pose_mm_deg": {
+        "x_mm": -45.633,
+        "y_mm": -215.644,
+        "z_mm": 349.36400000000003,
+        "roll_deg": -6.515000000000115,
+        "pitch_deg": 86.34800000000008,
+        "yaw_deg": -108.40200000000016
+      },
+      "recorded_at": "2026-08-20 03:56:44"
+    },
+    {
+      "item_id": "red_block",
+      "u_px": 319.0,
+      "v_px": 253.0,
+      "u_norm": 0.4984375,
+      "v_norm": 0.5270833333333333,
+      "bbox_xywh": [
+        248,
+        194,
+        142,
+        118
+      ],
+      "confidence": 0.6607028245925903,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_24_color.png",
+      "overlay_image": "sample_24_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.049,
+        "y_mm": -35.062999999999995,
+        "z_mm": 491.41499999999996,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.85100000000001,
+        "yaw_deg": 89.91899999999995
+      },
+      "captured_at": "2026-08-20 03:57:03",
+      "tag": "new_near_right",
+      "release_pose_mm_deg": {
+        "x_mm": 43.083000000000006,
+        "y_mm": -198.375,
+        "z_mm": 318.02799999999996,
+        "roll_deg": 166.56600000000006,
+        "pitch_deg": 85.2059999999999,
+        "yaw_deg": 88.64599999999999
+      },
+      "recorded_at": "2026-08-20 03:57:16"
+    },
+    {
+      "item_id": "red_block",
+      "u_px": 403.0,
+      "v_px": 208.0,
+      "u_norm": 0.6296875,
+      "v_norm": 0.43333333333333335,
+      "bbox_xywh": [
+        340,
+        156,
+        126,
+        104
+      ],
+      "confidence": 0.608676016330719,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_25_color.png",
+      "overlay_image": "sample_25_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.044,
+        "y_mm": -35.055,
+        "z_mm": 491.428,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.84100000000001,
+        "yaw_deg": 89.92599999999999
+      },
+      "captured_at": "2026-08-20 03:57:46",
+      "tag": "new_normal_center",
+      "release_pose_mm_deg": {
+        "x_mm": -7.962999999999999,
+        "y_mm": -263.048,
+        "z_mm": 318.035,
+        "roll_deg": -159.43700000000004,
+        "pitch_deg": 81.691,
+        "yaw_deg": 109.5
+      },
+      "recorded_at": "2026-08-20 03:58:01"
+    },
+    {
+      "item_id": "red_block",
+      "u_px": 463.0,
+      "v_px": 206.0,
+      "u_norm": 0.7234375,
+      "v_norm": 0.42916666666666664,
+      "bbox_xywh": [
+        400,
+        154,
+        126,
+        104
+      ],
+      "confidence": 0.6167877912521362,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_26_color.png",
+      "overlay_image": "sample_26_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.09899999999999999,
+        "y_mm": -35.794,
+        "z_mm": 491.30899999999997,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.749,
+        "yaw_deg": 89.84099999999995
+      },
+      "captured_at": "2026-08-20 03:58:27",
+      "tag": "new_normal_left",
+      "release_pose_mm_deg": {
+        "x_mm": -43.115,
+        "y_mm": -270.428,
+        "z_mm": 318.844,
+        "roll_deg": -175.071,
+        "pitch_deg": 82.80399999999995,
+        "yaw_deg": 85.56099999999999
+      },
+      "recorded_at": "2026-08-20 03:58:57"
+    },
+    {
+      "item_id": "red_block",
+      "u_px": 325.0,
+      "v_px": 208.0,
+      "u_norm": 0.5078125,
+      "v_norm": 0.43333333333333335,
+      "bbox_xywh": [
+        262,
+        156,
+        126,
+        104
+      ],
+      "confidence": 0.6571648120880127,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_27_color.png",
+      "overlay_image": "sample_27_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.046,
+        "y_mm": -35.589000000000006,
+        "z_mm": 491.44300000000004,
+        "roll_deg": 179.99999999999997,
+        "pitch_deg": 67.75299999999999,
+        "yaw_deg": 89.92499999999998
+      },
+      "captured_at": "2026-08-20 03:59:16",
+      "tag": "new_normal_right",
+      "release_pose_mm_deg": {
+        "x_mm": 32.065000000000005,
+        "y_mm": -264.67400000000004,
+        "z_mm": 289.528,
+        "roll_deg": -171.231,
+        "pitch_deg": 82.41299999999998,
+        "yaw_deg": 106.07100000000003
+      },
+      "recorded_at": "2026-08-20 03:59:37"
+    },
+    {
+      "item_id": "red_block",
+      "u_px": 381.0,
+      "v_px": 171.0,
+      "u_norm": 0.5953125,
+      "v_norm": 0.35625,
+      "bbox_xywh": [
+        324,
+        124,
+        114,
+        94
+      ],
+      "confidence": 0.661179780960083,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_28_color.png",
+      "overlay_image": "sample_28_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.082,
+        "y_mm": -35.53,
+        "z_mm": 491.48199999999997,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.82400000000003,
+        "yaw_deg": 89.86699999999999
+      },
+      "captured_at": "2026-08-20 04:00:05",
+      "tag": "new_far_center",
+      "release_pose_mm_deg": {
+        "x_mm": -1.36,
+        "y_mm": -342.217,
+        "z_mm": 299.911,
+        "roll_deg": -177.72199999999998,
+        "pitch_deg": 80.79400000000003,
+        "yaw_deg": 92.17100000000006
+      },
+      "recorded_at": "2026-08-20 04:00:15"
+    },
+    {
+      "item_id": "red_block",
+      "u_px": 475.0,
+      "v_px": 54.0,
+      "u_norm": 0.7421875,
+      "v_norm": 0.1125,
+      "bbox_xywh": [
+        412,
+        2,
+        126,
+        104
+      ],
+      "confidence": 0.5135943293571472,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_29_color.png",
+      "overlay_image": "sample_29_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.066,
+        "y_mm": -35.181,
+        "z_mm": 491.29699999999997,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.823,
+        "yaw_deg": 89.89099999999999
+      },
+      "captured_at": "2026-08-20 04:00:31",
+      "tag": "new_far_left",
+      "release_pose_mm_deg": {
+        "x_mm": -53.004000000000005,
+        "y_mm": -339.343,
+        "z_mm": 334.712,
+        "roll_deg": -81.09599999999921,
+        "pitch_deg": 89.15499999999948,
+        "yaw_deg": -179.72599999999932
+      },
+      "recorded_at": "2026-08-20 04:00:57"
+    },
+    {
+      "item_id": "red_block",
+      "u_px": 313.0,
+      "v_px": 58.0,
+      "u_norm": 0.4890625,
+      "v_norm": 0.12083333333333333,
+      "bbox_xywh": [
+        250,
+        6,
+        126,
+        104
+      ],
+      "confidence": 0.5572986602783203,
+      "image_width": 640,
+      "image_height": 480,
+      "color_image": "sample_30_color.png",
+      "overlay_image": "sample_30_overlay.png",
+      "observe_pose_mm_deg": {
+        "x_mm": -0.02,
+        "y_mm": -35.345,
+        "z_mm": 491.21,
+        "roll_deg": 180.0,
+        "pitch_deg": 67.74499999999999,
+        "yaw_deg": 89.966
+      },
+      "captured_at": "2026-08-20 04:01:19",
+      "tag": "new_far_right",
+      "release_pose_mm_deg": {
+        "x_mm": 42.757000000000005,
+        "y_mm": -358.325,
+        "z_mm": 333.8,
+        "roll_deg": -152.009,
+        "pitch_deg": 86.4179999999999,
+        "yaw_deg": 125.24599999999995
+      },
+      "recorded_at": "2026-08-20 04:01:33"
     }
   ]
 }

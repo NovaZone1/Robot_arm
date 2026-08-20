@@ -8,6 +8,11 @@ import numpy as np
 import torch
 
 from src.perception.item_catalog import bottle_item_id_from_prompt, filter_bottle_instances
+from src.perception.object_crop_classifier import (
+    CLASS_NAMES as CROP_CLASS_NAMES,
+    ObjectCropClassifier,
+    filter_instances_by_crop_classifier,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -106,9 +111,24 @@ _BLOCK_HSV_RANGES: dict[str, tuple[tuple[tuple[int, int, int], tuple[int, int, i
         ((0, 70, 45), (12, 255, 255)),
         ((168, 70, 45), (179, 255, 255)),
     ),
-    "yellow": (((16, 70, 55), (40, 255, 255)),),
+    # The yellow cube in the current D435 auto-colour profile is centred near
+    # H=23.  The former upper bound of 40 admitted the lime-green drink (and
+    # its reflections), which then looked like a valid yellow grasp target.
+    "yellow": (((17, 80, 65), (32, 255, 255)),),
     "blue": (((88, 65, 40), (138, 255, 255)),),
 }
+
+
+def _catalog_item_id_from_prompt(text_prompt: str) -> str | None:
+    """Resolve only the six trained-object prompts without loading YAML."""
+    prompt = text_prompt.lower().replace("_", " ")
+    bottle = bottle_item_id_from_prompt(prompt)
+    if bottle is not None:
+        return bottle
+    for color in ("red", "yellow", "blue"):
+        if color in prompt and any(keyword in prompt for keyword in _BLOCK_KEYWORDS):
+            return f"{color}_block"
+    return None
 
 
 def _build_empty_result(
@@ -194,7 +214,10 @@ def _segment_color_blocks(
             if min(box_width, box_height) < min_box_side:
                 continue
             aspect_ratio = box_width / float(box_height)
-            if not 0.55 <= aspect_ratio <= 1.80:
+            # A bottle body can be tall but still pass the old 0.55 limit.
+            # The three competition cubes remain close to square even with
+            # perspective, so reject vertical bottle-shaped colour patches.
+            if not 0.72 <= aspect_ratio <= 1.65:
                 continue
 
             component = component_map == component_index
@@ -289,6 +312,7 @@ class YOLOSegmenter:
         self._model_name = model_name
         self._conf_threshold = float(conf_threshold)
         self._model = None  # lazy load
+        self._crop_classifier: ObjectCropClassifier | None = None
 
     @property
     def model(self):
@@ -298,12 +322,41 @@ class YOLOSegmenter:
             self._model = YOLO(self._model_name, verbose=False)
         return self._model
 
+    @property
+    def crop_classifier(self) -> ObjectCropClassifier:
+        if self._crop_classifier is None:
+            self._crop_classifier = ObjectCropClassifier()
+        return self._crop_classifier
+
+    def _prefer_crop_classifier(
+        self,
+        segmentation: dict[str, Any],
+        color_bgr: np.ndarray,
+        requested_item_id: str | None,
+    ) -> dict[str, Any]:
+        if requested_item_id not in CROP_CLASS_NAMES:
+            return segmentation
+        try:
+            classified = filter_instances_by_crop_classifier(
+                segmentation,
+                np.asarray(color_bgr),
+                requested_item_id,
+                classifier=self.crop_classifier,
+            )
+        except Exception as exc:
+            _log.warning("object crop classifier unavailable; using legacy filter: %s", exc)
+            return segmentation
+        return classified if classified is not None else segmentation
+
     def segment_text(self, color_bgr, text_prompt: str) -> dict[str, Any]:
         """Segment a target with color blocks first, otherwise YOLOv8 COCO."""
         device = torch.device(self.device_str)
         block_colors = _match_block_colors(text_prompt)
         if block_colors is not None:
-            return _segment_color_blocks(color_bgr, block_colors, device=device)
+            segmented = _segment_color_blocks(color_bgr, block_colors, device=device)
+            return self._prefer_crop_classifier(
+                segmented, color_bgr, _catalog_item_id_from_prompt(text_prompt)
+            )
 
         bottle_item_id = bottle_item_id_from_prompt(text_prompt)
 
@@ -365,9 +418,16 @@ class YOLOSegmenter:
             "allow_scene_fallback": True,
         }
         if bottle_item_id is not None:
-            segmentation = filter_bottle_instances(
-                segmentation,
-                np.asarray(color_bgr),
-                bottle_item_id,
+            classified = self._prefer_crop_classifier(segmentation, color_bgr, bottle_item_id)
+            # The old liquid-colour rule is retained when the learned classifier
+            # has no confident target, e.g. under an unseen illumination.
+            segmentation = (
+                classified
+                if classified.get("backend", "").endswith("+crop_classifier")
+                else filter_bottle_instances(
+                    segmentation,
+                    np.asarray(color_bgr),
+                    bottle_item_id,
+                )
             )
         return segmentation

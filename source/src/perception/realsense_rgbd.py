@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-import pyrealsense2 as rs
+import os
+import logging
+
 import numpy as np
+import pyrealsense2 as rs
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class RealSenseRGBDCamera:
@@ -60,6 +66,43 @@ class RealSenseRGBDCamera:
                 depth_sensor = profile.get_device().first_depth_sensor()
                 self.depth_scale = depth_sensor.get_depth_scale()
                 self.align = rs.align(rs.stream.color)
+
+                # The deployed recognition stack can request fixed colour
+                # controls for repeatability. Dataset collection instead
+                # leaves the camera in auto mode for the actual illumination.
+                try:
+                    color_sensor = profile.get_device().query_sensors()[1]
+                    lock_color = os.environ.get("D435_LOCK_COLOR", "1").lower() not in {
+                        "0", "false", "no", "off",
+                    }
+                    if lock_color:
+                        if color_sensor.supports(rs.option.enable_auto_white_balance):
+                            color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
+                        if color_sensor.supports(rs.option.white_balance):
+                            color_sensor.set_option(rs.option.white_balance, float(
+                                os.environ.get("D435_WHITE_BALANCE", "4700")
+                            ))
+                        if color_sensor.supports(rs.option.enable_auto_exposure):
+                            color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+                        if color_sensor.supports(rs.option.exposure):
+                            color_sensor.set_option(rs.option.exposure, float(
+                                os.environ.get("D435_EXPOSURE", "80")
+                            ))
+                        LOGGER.info(
+                            "D435 white balance locked at %sK, exposure %s",
+                            os.environ.get("D435_WHITE_BALANCE", "4700"),
+                            os.environ.get("D435_EXPOSURE", "80"),
+                        )
+                    else:
+                        if color_sensor.supports(rs.option.enable_auto_white_balance):
+                            color_sensor.set_option(rs.option.enable_auto_white_balance, 1)
+                        if color_sensor.supports(rs.option.enable_auto_exposure):
+                            color_sensor.set_option(rs.option.enable_auto_exposure, 1)
+                        LOGGER.info("D435 colour controls set to automatic")
+                except Exception as exc:
+                    # This wrapper is deliberately independent of ROS nodes;
+                    # using a node logger here made camera startup fail.
+                    LOGGER.warning("D435 colour control unavailable: %s", exc)
 
                 for _ in range(30):
                     self.pipeline.wait_for_frames()

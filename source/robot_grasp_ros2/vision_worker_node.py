@@ -213,6 +213,32 @@ class ExternalVisionWorkerBridge:
                 for item in list(result.get("bottle_proposals") or [])
             )
 
+    def detect_label_yolo6(
+        self,
+        color_bgr: np.ndarray,
+    ) -> tuple[dict[str, object], ...]:
+        """Run the trained 6-class box-label detector in the external runtime."""
+        with tempfile.TemporaryDirectory(prefix="label_yolo6_worker_") as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            color_path = tmp_dir / "color.npy"
+            np.save(color_path, np.asarray(color_bgr))
+            request_payload = {
+                "type": "detect_label_yolo6",
+                "work_dir": str(tmp_dir),
+                "color_npy": color_path.name,
+            }
+            with self._daemon_lock:
+                payload = self._call_daemon(request_payload)
+            if not bool(payload.get("success")):
+                raise RuntimeError(
+                    str(payload.get("message") or "label yolo6 detection failed")
+                )
+            result = dict(payload.get("result") or {})
+            return tuple(
+                dict(item)
+                for item in list(result.get("yolo6_detections") or [])
+            )
+
     @staticmethod
     def _candidate_from_dict(payload: dict[str, object]) -> GraspCandidate:
         object_center = payload.get("object_center_camera_m")
@@ -539,6 +565,17 @@ class VisionWorkerNode(Node):
                 self.get_logger().warning(
                     f"YOLO label bottle proposals unavailable; using local fallback: {exc}"
                 )
+            # Trained 6-class YOLO finds every label box; HSV resolves the
+            # exact colour (orange/red and the dark label are confusable in
+            # the network alone). If available, these detections augment the
+            # existing marker/bottle/template pipeline.
+            yolo6_detections: tuple[dict[str, object], ...] = ()
+            try:
+                yolo6_detections = self._bridge.detect_label_yolo6(color_bgr)
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"yolo6 label detection unavailable; skipping: {exc}"
+                )
             match = matcher.match_expected(
                 color_bgr,
                 request.expected_item_id,
@@ -546,6 +583,7 @@ class VisionWorkerNode(Node):
                 threshold=(float(threshold) if threshold is not None else None),
                 bottle_proposals=bottle_proposals,
                 marker_detection_enabled=marker_detection_enabled,
+                yolo6_detections=yolo6_detections,
             )
             partial_label_observations: list[dict[str, object]] = []
             partial_projection_errors: list[str] = []

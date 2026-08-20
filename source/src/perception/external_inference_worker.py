@@ -239,6 +239,7 @@ class ExternalInferenceEngine:
         self._graspnet = None
         self._runtime_key: tuple[str, str] | None = None
         self._planner: PureGraspPlanner | None = None
+        self._label_yolo6 = None
         self._config = None
         self._graspnet_checkpoint: str | None = None
 
@@ -338,7 +339,17 @@ class ExternalInferenceEngine:
                 device=str(os.environ.get("ROBOT_GRASP_LABEL_DEVICE") or "cuda"),
                 model_name="yolov8n-seg.pt",
             )
-        segmentation = self._segmenter.segment_text(np.asarray(color_bgr), prompt)
+        # This check runs while the base is moving and decides whether to stop
+        # early.  HSV block proposals alone are not enough here: a red bottle
+        # cap can satisfy the red HSV range even though it is not a red block.
+        # Final 3-D perception already has crop-class verification; apply the
+        # same identity gate to this inexpensive 2-D stop decision so a false
+        # colour patch cannot make Scout repeatedly scan and reverse.
+        from src.perception.yolo_segmenter import _catalog_item_id_from_prompt
+
+        image = np.asarray(color_bgr)
+        requested_item_id = _catalog_item_id_from_prompt(prompt)
+        segmentation = self._segmenter.segment_text(image, prompt)
         masks = segmentation.get("masks")
         scores = segmentation.get("scores")
         count = self._segmentation_count(segmentation)
@@ -356,7 +367,7 @@ class ExternalInferenceEngine:
             float(value.detach().cpu().item()) if hasattr(value, "detach") else float(value)
             for value in list(scores)[:count]
         ]
-        height, width = np.asarray(color_bgr).shape[:2]
+        height, width = image.shape[:2]
         if width <= 0 or height <= 0:
             return empty
         ranked = sorted(range(count), key=lambda index: score_values[index], reverse=True)
@@ -380,6 +391,39 @@ class ExternalInferenceEngine:
                 center_u, center_v, exclude_roi_norm
             ):
                 continue
+
+            # The trained six-class crop classifier is optional during
+            # deployment; retain the legacy path only if its weights are not
+            # present.  If it is available, it is authoritative for the
+            # early-stop signal.
+            classifier = getattr(self._segmenter, "crop_classifier", None)
+            # Crop-classification is mandatory only for the HSV-derived
+            # coloured blocks, where bottle caps/liquid can mimic a block
+            # colour.  Bottles already have a dedicated shape + liquid-colour
+            # identity path; requiring the young crop classifier there made
+            # orange bottles intermittently invisible during a moving scan.
+            if (
+                requested_item_id is not None
+                and requested_item_id.endswith("_block")
+                and classifier is not None
+                and classifier.available
+            ):
+                raw_box = segmentation.get("boxes")[selected_index]
+                values = (
+                    raw_box.detach().cpu().tolist()
+                    if hasattr(raw_box, "detach")
+                    else list(raw_box)
+                )
+                x0, y0, x1, y1 = (float(value) for value in values)
+                pad_x = (x1 - x0) * 0.12
+                pad_y = (y1 - y0) * 0.12
+                xa = max(0, int(np.floor(x0 - pad_x)))
+                ya = max(0, int(np.floor(y0 - pad_y)))
+                xb = min(width, int(np.ceil(x1 + pad_x)))
+                yb = min(height, int(np.ceil(y1 + pad_y)))
+                predicted, identity_confidence, _ = classifier.predict(image[ya:yb, xa:xb])
+                if predicted != requested_item_id or identity_confidence < 0.58:
+                    continue
             return {
                 "found": True,
                 "center_u_norm": center_u,
@@ -438,6 +482,52 @@ class ExternalInferenceEngine:
                 }
             )
         return proposals
+
+    def detect_label_yolo6(
+        self,
+        color_bgr: np.ndarray,
+    ) -> list[dict[str, object]]:
+        """6-class trained box-label detection (dark/green/yellow/red/orange/blue).
+
+        The trained YOLO finds every label box reliably; the exact colour is
+        resolved downstream by HSV (match_yolo6_hsv), because orange/red and
+        the dark bottle label are confusable in the network alone.
+        """
+        if self._label_yolo6 is None:
+            from ultralytics import YOLO
+
+            model_path = str(
+                os.environ.get(
+                    "ROBOT_GRASP_LABEL_YOLO6",
+                    "/home/nvidia/auto/Robot_arm/source/models/box_label_yolo6/train/weights/best.pt",
+                )
+            )
+            self._label_yolo6 = YOLO(model_path)
+        results = self._label_yolo6.predict(
+            np.asarray(color_bgr),
+            conf=0.25,
+            imgsz=640,
+            verbose=False,
+        )
+        detections: list[dict[str, object]] = []
+        for result in results:
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
+                detections.append(
+                    {
+                        "class_id": int(box.cls[0].item()),
+                        "confidence": float(box.conf[0].item()),
+                        "bbox_xywh": [
+                            x1,
+                            y1,
+                            max(0.0, x2 - x1),
+                            max(0.0, y2 - y1),
+                        ],
+                    }
+                )
+        return detections
 
     @property
     def config(self):
@@ -859,6 +949,13 @@ def _handle_one_request(engine: ExternalInferenceEngine, request: dict[str, obje
             "success": True,
             "message": f"detected {len(proposals)} bottle proposals",
             "result": {"bottle_proposals": proposals},
+        }
+    if str(request.get("type") or "") == "detect_label_yolo6":
+        detections = engine.detect_label_yolo6(color_bgr)
+        return {
+            "success": True,
+            "message": f"detected {len(detections)} yolo6 label boxes",
+            "result": {"yolo6_detections": detections},
         }
     depth_meters = np.load(work_dir / str(request["depth_npy"]))
     camera_info = dict(request["camera_info"])
