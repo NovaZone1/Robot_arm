@@ -890,6 +890,15 @@ class ReferenceLabelMatcher:
         "green_bottle": (((35, 40, 30), (90, 255, 255)),),
         "dark_bottle": (((90, 10, 10), (179, 80, 120)), ((0, 10, 10), (30, 80, 120))),
     }
+    # Must stay in the exact order used by data/box_label_yolo6/data.yaml.
+    _LABEL_YOLO6_CLASS_IDS: dict[int, str] = {
+        0: "dark_bottle",
+        1: "green_bottle",
+        2: "yellow_block",
+        3: "red_block",
+        4: "orange_bottle",
+        5: "blue_block",
+    }
 
     def _hsv_classify_roi(
         self,
@@ -963,18 +972,39 @@ class ReferenceLabelMatcher:
             cy = (y0 + y1) / 2.0
             if not (roi_x <= cx <= roi_x + roi_w and roi_y <= cy <= roi_y + roi_h):
                 continue
+            yolo_score = float(proposal.get("confidence") or 0.0)
             roi_bgr = image[y0:y1, x0:x1]
             item_id, fraction = self._hsv_classify_roi(roi_bgr, min_fraction=min_fraction)
+            method = "yolo6_hsv"
+            # Green remains visually distinct to the trained detector, but a
+            # warm/red camera cast can suppress its HSV support below 20%.
+            # Keep only a strong *green* YOLO prediction in that case.  Do
+            # not apply this exception to red/orange/dark, which are known to
+            # be mutually confusable under the same lighting.
+            yolo_item_id = self._LABEL_YOLO6_CLASS_IDS.get(
+                int(proposal.get("class_id", -1))
+            )
+            if (
+                item_id is None
+                and yolo_item_id == "green_bottle"
+                and yolo_score >= 0.70
+            ):
+                item_id = yolo_item_id
+                fraction = 0.0
+                method = "yolo6_green_fallback"
             if item_id is None:
                 continue
-            yolo_score = float(proposal.get("confidence") or 0.0)
-            confidence = min(0.99, (0.55 * yolo_score) + (0.45 * fraction))
+            confidence = (
+                min(0.99, yolo_score)
+                if method == "yolo6_green_fallback"
+                else min(0.99, (0.55 * yolo_score) + (0.45 * fraction))
+            )
             detections.append(
                 LabelDetection(
                     item_id=item_id,
                     confidence=confidence,
                     bbox_xywh=(x0, y0, x1 - x0, y1 - y0),
-                    method="yolo6_hsv",
+                    method=method,
                 )
             )
         return tuple(detections)

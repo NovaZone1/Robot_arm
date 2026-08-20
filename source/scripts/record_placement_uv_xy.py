@@ -200,6 +200,7 @@ class PlacementUvRecorder(Node):
         capture = self._call(self._capture, capture_req, timeout_s=30.0)
         if not capture.success:
             raise RuntimeError(capture.message)
+        color = color_msg_to_bgr(capture.color_image)
         match_req = MatchItemLabel.Request()
         match_req.run_id = capture_req.run_id
         match_req.scene_id = str(capture.scene_id)
@@ -223,15 +224,24 @@ class PlacementUvRecorder(Node):
             int(match.bbox_height),
         ]
         if str(match.matched_item_id or "") != self._item_id or min(bbox[2], bbox[3]) <= 1:
+            debug_name = f"capture_failed_{int(time.time() * 1000)}"
+            debug_image = self._output_dir / f"{debug_name}_color.png"
+            debug_json = self._output_dir / f"{debug_name}_match.json"
+            if cv2 is not None:
+                cv2.imwrite(str(debug_image), color)
+            debug_json.write_text(
+                str(getattr(match, "diagnostics_json", "") or match.message or ""),
+                encoding="utf-8",
+            )
             raise RuntimeError(
-                match.message or f"did not detect {self._item_id} in this view"
+                f"{match.message or f'did not detect {self._item_id} in this view'} "
+                f"(saved diagnostic: {debug_image.name}, {debug_json.name})"
             )
         u_px = float(bbox[0]) + (0.5 * float(bbox[2]))
         v_px = float(bbox[1]) + (0.5 * float(bbox[3]))
         width = int(capture.camera_info.width or capture.color_image.width)
         height = int(capture.camera_info.height or capture.color_image.height)
         sample_index = len(self._samples) + 1
-        color = color_msg_to_bgr(capture.color_image)
         color_name = f"sample_{sample_index:02d}_color.png"
         overlay_name = f"sample_{sample_index:02d}_overlay.png"
         if cv2 is not None:
@@ -279,6 +289,10 @@ class PlacementUvRecorder(Node):
         self._save()
 
     def _save(self) -> None:
+        # A calibration set may be cleared while an interactive recorder is
+        # still open.  Keep the pending capture usable instead of losing it on
+        # the first `record` command.
+        self._output_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "item_id": self._item_id,
             "observe_pose_mm_deg": list(self._observe),

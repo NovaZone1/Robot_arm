@@ -4270,11 +4270,15 @@ class PipelineOrchestratorNode(Node):
                     )
 
             selected_view: dict[str, object] | None = None
+            best_target_view: dict[str, object] | None = None
+            best_target_error = float("inf")
             attempt_records: list[dict[str, object]] = []
             for attempt in range(1 + max_retries):
                 scan_sign = 1.0
                 last_center_error: float | None = None
                 had_target = False
+                worsening_streak = 0
+                target_miss_streak = 0
                 selected_view = None
                 for view_index in range(max_views):
                     view_name = (
@@ -4311,16 +4315,34 @@ class PipelineOrchestratorNode(Node):
                     )
                     if target_seen:
                         had_target = True
+                        target_miss_streak = 0
+                        if center_error_norm < best_target_error:
+                            best_target_error = float(center_error_norm)
+                            best_target_view = view
                         if (
+                            scan_sign > 0.0
+                            and
                             last_center_error is not None
                             and center_error_norm > last_center_error + 0.02
                         ):
+                            worsening_streak += 1
+                        else:
+                            worsening_streak = 0
+                        # A single label-box jump is common with glossy box
+                        # covers.  Only reverse after two consecutive views
+                        # confirm that forward motion is making alignment worse.
+                        if worsening_streak >= 2:
                             scan_sign = -1.0
                         last_center_error = center_error_norm
                         next_step_m = scan_sign * fine_step_m
                     elif had_target:
-                        scan_sign = -1.0
-                        next_step_m = -fine_step_m
+                        target_miss_streak += 1
+                        # Do not react to one missed frame.  If the target is
+                        # genuinely lost after being seen, make one controlled
+                        # reverse search rather than oscillating every frame.
+                        if scan_sign > 0.0 and target_miss_streak >= 2:
+                            scan_sign = -1.0
+                        next_step_m = scan_sign * fine_step_m
                     else:
                         next_step_m = step_m
                     if next_step_m > 0.0:
@@ -4362,14 +4384,31 @@ class PipelineOrchestratorNode(Node):
                         "had_target": had_target,
                     }
                 )
-                if attempt < max_retries:
+                # If the target was seen, its best view is more useful than
+                # restarting the entire lane from zero.  Stop there below and
+                # fail closed if it still is not inside the alignment window.
+                if attempt < max_retries and not had_target:
                     current_offset = reverse_to_start(
                         current_offset,
                         reason=f"placement_retry_{attempt + 1}",
                     )
                     restore_placement_observe()
+            if selected_view is None and best_target_view is not None:
+                best_offset = float(best_target_view.get("offset_from_start_m") or 0.0)
+                return_delta = best_offset - current_offset
+                if abs(return_delta) > 0.02:
+                    self._publish_status(
+                        "placement_scan_best_view_return: "
+                        f"delta_m={return_delta:.3f} error={best_target_error:.3f}"
+                    )
+                    movement = self._move_base_for_scan(return_delta)
+                    current_offset += float(movement["traveled_m"])
+                    current_offset = max(0.0, float(current_offset))
+                    movement["offset_after_move_m"] = float(current_offset)
+                    movement["target_alignment_best_view_return"] = True
+                    movements.append(movement)
             self._last_placement_scan_travel_m = float(current_offset)
-            if selected_view is None and current_offset > 0.02:
+            if selected_view is None and best_target_view is None and current_offset > 0.02:
                 current_offset = reverse_to_start(
                     current_offset,
                     reason="placement_scan_failed",
@@ -4430,7 +4469,7 @@ class PipelineOrchestratorNode(Node):
                 "base_odom_origin": {
                     "x_m": aligned_odom[0], "y_m": aligned_odom[1], "yaw_rad": aligned_odom[2],
                 },
-                "base_returned_to_start": selected_view is None,
+                "base_returned_to_start": current_offset <= 0.02,
                 "placement_scan_attempts": attempt_records,
                 "views": views,
                 "movements": movements,
