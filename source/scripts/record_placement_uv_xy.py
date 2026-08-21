@@ -44,6 +44,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = PROJECT / "config" / "calibration" / "placement_uv_xy"
 DEFAULT_OBSERVE_POSE = (0.0, -35.5, 491.1, 180.0, 67.77, 89.97)
 SUGGESTED_TAGS = ("left", "center", "right", "near", "far", "diagonal")
+DEFAULT_ORIENTATION_TOLERANCE_DEG = 15.0
 VALID_ITEMS = (
     "red_block",
     "yellow_block",
@@ -76,6 +77,11 @@ def _pose_to_dict(pose: Pose6D) -> dict[str, float]:
     }
 
 
+def _angle_delta_deg(first: float, second: float) -> float:
+    """Smallest signed angular difference, robust at the +/-180 boundary."""
+    return ((float(first) - float(second) + 180.0) % 360.0) - 180.0
+
+
 class PlacementUvRecorder(Node):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__("placement_uv_xy_recorder")
@@ -84,6 +90,7 @@ class PlacementUvRecorder(Node):
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._observe = tuple(float(value) for value in args.observe_pose)
         self._speed = float(args.speed_percent)
+        self._orientation_tolerance_deg = float(args.orientation_tolerance_deg)
         self._samples_path = self._output_dir / "samples.json"
         self._samples: list[dict[str, object]] = []
         if self._samples_path.is_file() and not bool(args.reset):
@@ -274,7 +281,28 @@ class PlacementUvRecorder(Node):
             raise RuntimeError("capture a label view first")
         sample = dict(self._pending_view)
         sample["tag"] = str(tag or f"sample_{len(self._samples) + 1:02d}")
-        sample["release_pose_mm_deg"] = self.get_tcp()
+        release_pose = self.get_tcp()
+        # A UV->XY fit assumes one repeatable tool attitude.  A manually
+        # rotated wrist may still look like a valid release point, but mixing
+        # it into the fit produces an approach that sweeps into the label
+        # baffle.  Use the first taught sample as the reference and reject
+        # accidental changes of orientation before they poison the map.
+        if self._samples and self._orientation_tolerance_deg > 0.0:
+            reference = dict(self._samples[0].get("release_pose_mm_deg") or {})
+            deltas = {
+                axis: abs(_angle_delta_deg(release_pose[axis], float(reference.get(axis) or 0.0)))
+                for axis in ("roll_deg", "pitch_deg", "yaw_deg")
+            }
+            worst_axis, worst_delta = max(deltas.items(), key=lambda pair: pair[1])
+            if worst_delta > self._orientation_tolerance_deg:
+                raise RuntimeError(
+                    "放下姿态与首个样本不一致 "
+                    f"({worst_axis} 相差 {worst_delta:.1f}°, "
+                    f"限值 {self._orientation_tolerance_deg:.1f}°)。"
+                    "请只平移末端到盒内安全释放点，不要扭转腕部；"
+                    "若首样本本身不对，请 reset 后从正确中心样本重新采集。"
+                )
+        sample["release_pose_mm_deg"] = release_pose
         sample["recorded_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self._samples.append(sample)
         self._pending_view = None
@@ -336,6 +364,12 @@ def parse_args() -> argparse.Namespace:
         help="Observation pose in mm/deg. Default is the current right-side view.",
     )
     parser.add_argument("--speed-percent", type=float, default=25.0)
+    parser.add_argument(
+        "--orientation-tolerance-deg",
+        type=float,
+        default=DEFAULT_ORIENTATION_TOLERANCE_DEG,
+        help="Maximum roll/pitch/yaw deviation from the first release sample; 0 disables it.",
+    )
     parser.add_argument(
         "--reset",
         action="store_true",

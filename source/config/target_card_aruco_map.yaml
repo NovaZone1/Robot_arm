@@ -1,0 +1,12 @@
+# Physical target-card ArUco IDs, taught on 2026-08-21.
+# The cards use OpenCV's DICT_6X6_50 dictionary.  These IDs determine the
+# requested pickup item; they are deliberately independent of the printed
+# item photograph and its illumination.
+aruco_dictionary: DICT_6X6_50
+mapping:
+  1: green_bottle
+  2: dark_bottle
+  3: orange_bottle
+  4: blue_block
+  5: yellow_block
+  6: red_block

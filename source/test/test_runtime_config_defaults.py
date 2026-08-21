@@ -87,7 +87,7 @@ def test_distributed_pipeline_defaults_to_photo_card_target_then_base_scan():
     assert "auto_target_from_card: true" in yaml_text
     assert "target_card_min_confidence: 0.53" in yaml_text
     assert "target_card_min_margin: 0.08" in yaml_text
-    assert "target_card_search_roi_norm: [0.35, 0.01, 0.88, 0.50]" in yaml_text
+    assert "target_card_search_roi_norm: [0.05, 0.05, 0.55, 0.85]" in yaml_text
     assert "target_card_capture_frames: 3" in yaml_text
     assert "target_card_consensus_frames: 2" in yaml_text
     assert "observation_speed: 25" in yaml_text

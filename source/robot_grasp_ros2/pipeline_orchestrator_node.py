@@ -11,6 +11,7 @@ import traceback
 import cv2
 import numpy as np
 import rclpy
+import yaml
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -288,6 +289,11 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("auto_start", False)
         self.declare_parameter("skip_observation_move", False)
         self.declare_parameter("auto_target_from_card", False)
+        # The physical target cards carry unique ArUco codes.  Prefer this
+        # deterministic identity source over matching the printed item photo;
+        # the latter is sensitive to perspective, glare and print colours.
+        self.declare_parameter("target_card_aruco_enabled", True)
+        self.declare_parameter("target_card_aruco_map_path", "")
         self.declare_parameter("target_card_search_roi_norm", [0.0, 0.0, 1.0, 1.0])
         self.declare_parameter("target_card_match_threshold", 0.50)
         self.declare_parameter("target_card_min_confidence", 0.55)
@@ -346,18 +352,31 @@ class PipelineOrchestratorNode(Node):
         self.declare_parameter("base_multiview_move_timeout_s", 22.0)
         self.declare_parameter("base_multiview_settle_s", 0.8)
         self.declare_parameter("base_target_center_tolerance_norm", 0.18)
+        self.declare_parameter("base_target_taught_u_margin_px", 45.0)
         self.declare_parameter("base_grasp_bottle_center_norm", [0.598, 0.485])
         self.declare_parameter("base_grasp_block_center_norm", [0.606, 0.619])
         self.declare_parameter("base_grasp_center_tolerance_u_norm", 0.18)
         self.declare_parameter("base_grasp_center_tolerance_v_norm", 0.24)
         self.declare_parameter("base_target_fine_step_m", 0.07)
         self.declare_parameter("grasp_scan_lost_frames_before_reverse", 2)
+        # The navigation route stops at a safe pickup pre-stop.  Once the
+        # photo card has selected the requested object, the arm pipeline owns
+        # this short odometry-closed-loop advance before it begins object
+        # scanning.  Keeping it here prevents Nav2 and the scan controller
+        # from publishing competing base commands.
+        self.declare_parameter("base_grasp_pre_scan_advance_m", 0.0)
+        self.declare_parameter("base_grasp_pre_scan_speed_mps", 0.10)
+        self.declare_parameter("base_grasp_pre_scan_timeout_s", 20.0)
         self.declare_parameter("post_grasp_base_advance_m", 1.50)
         self.declare_parameter("post_grasp_base_advance_speed_mps", 0.10)
         self.declare_parameter("post_grasp_base_advance_timeout_s", 50.0)
         self.declare_parameter("post_place_base_advance_m", 1.50)
         self.declare_parameter("post_place_base_advance_speed_mps", 0.10)
         self.declare_parameter("post_place_base_advance_timeout_s", 50.0)
+        # Navigation handoff routes set this false: after a release they
+        # resume their recorded route themselves rather than competing with a
+        # fixed-distance scan-controller advance.
+        self.declare_parameter("post_place_base_advance_enabled", True)
         self.declare_parameter("post_place_home_pose", [57.0, 0.0, 215.0, 0.0, 85.0, 0.0])
         self.declare_parameter("base_odom_topic", "/odom")
         self.declare_parameter(
@@ -820,6 +839,64 @@ class PipelineOrchestratorNode(Node):
         except (KeyError, ParameterUninitializedException):
             return False
 
+    def _target_card_aruco_map(self) -> tuple[object, dict[int, str]]:
+        """Load the taught physical-card ID map without depending on ROS dict params."""
+        configured = str(self.get_parameter("target_card_aruco_map_path").value or "").strip()
+        default = Path(__file__).resolve().parents[1] / "config" / "target_card_aruco_map.yaml"
+        path = Path(configured).expanduser().resolve() if configured else default
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except OSError as error:
+            raise RuntimeError(f"target-card ArUco map unavailable: {path}: {error}") from error
+        dictionary_name = str(payload.get("aruco_dictionary") or "DICT_6X6_50").strip()
+        dictionary_id = getattr(cv2.aruco, dictionary_name, None) if hasattr(cv2, "aruco") else None
+        if dictionary_id is None:
+            raise RuntimeError(f"unsupported target-card ArUco dictionary: {dictionary_name}")
+        raw_mapping = payload.get("mapping") or {}
+        mapping = {int(marker_id): str(item_id) for marker_id, item_id in raw_mapping.items()}
+        if not mapping:
+            raise RuntimeError(f"target-card ArUco map has no entries: {path}")
+        unknown = sorted(set(mapping.values()) - set(self._item_catalog().items))
+        if unknown:
+            raise RuntimeError(f"target-card ArUco map contains unknown items: {unknown}")
+        return cv2.aruco.getPredefinedDictionary(dictionary_id), mapping
+
+    def _target_card_aruco_detections(
+        self,
+        image: np.ndarray,
+        *,
+        roi_norm: tuple[float, float, float, float],
+    ) -> tuple[LabelDetection, ...]:
+        if not bool(self.get_parameter("target_card_aruco_enabled").value):
+            return ()
+        dictionary, mapping = self._target_card_aruco_map()
+        detector = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
+        corners, marker_ids, _ = detector.detectMarkers(np.asarray(image))
+        if marker_ids is None:
+            return ()
+        _, roi_xywh = ReferenceLabelMatcher._roi(np.asarray(image), roi_norm)
+        rx, ry, rw, rh = roi_xywh
+        detections: list[LabelDetection] = []
+        for corner, marker_id in zip(corners, marker_ids.flatten()):
+            item_id = mapping.get(int(marker_id))
+            if item_id is None:
+                continue
+            points = np.asarray(corner).reshape(-1, 2)
+            x0, y0 = points.min(axis=0)
+            x1, y1 = points.max(axis=0)
+            center_x, center_y = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            if not (rx <= center_x <= rx + rw and ry <= center_y <= ry + rh):
+                continue
+            detections.append(
+                LabelDetection(
+                    item_id=item_id,
+                    confidence=0.99,
+                    bbox_xywh=(int(x0), int(y0), int(x1 - x0), int(y1 - y0)),
+                    method=f"aruco_target_card:{int(marker_id)}",
+                )
+            )
+        return tuple(detections)
+
     @staticmethod
     def _select_target_card_detection(
         detections: tuple[LabelDetection, ...] | list[LabelDetection],
@@ -967,18 +1044,23 @@ class PipelineOrchestratorNode(Node):
                 )
                 image = color_msg_to_bgr(capture.color_image)
                 scene_id = str(capture.scene_id)
-            detections, current_search_roi = self._target_card_matcher().match_all(
-                image,
-                roi_norm=roi_values,
-                threshold=float(
-                    self.get_parameter("target_card_match_threshold").value
-                ),
-                # A target card contains a catalog photograph, unlike the six
-                # box labels where direct HSV marker detection is useful.
-                # Template-only matching prevents chair/box reflections and
-                # real objects from winning on color alone.
-                marker_detection_enabled=False,
+            aruco_detections = self._target_card_aruco_detections(
+                image, roi_norm=roi_values
             )
+            # An explicitly mapped code is authoritative.  Do not mix it
+            # with a weak photo-template result from the same frame.
+            if aruco_detections:
+                detections = aruco_detections
+                _, current_search_roi = ReferenceLabelMatcher._roi(image, roi_values)
+            else:
+                detections, current_search_roi = self._target_card_matcher().match_all(
+                    image,
+                    roi_norm=roi_values,
+                    threshold=float(
+                        self.get_parameter("target_card_match_threshold").value
+                    ),
+                    marker_detection_enabled=False,
+                )
             search_roi = current_search_roi
             overlay = image.copy()
             roi_x, roi_y, roi_w, roi_h = current_search_roi
@@ -1117,12 +1199,14 @@ class PipelineOrchestratorNode(Node):
             float(value)
             for value in list(self.get_parameter("target_card_search_roi_norm").value or [])
         )
-        detections, _roi = self._target_card_matcher().match_all(
-            image,
-            roi_norm=roi_values,
-            threshold=float(self.get_parameter("target_card_match_threshold").value),
-            marker_detection_enabled=False,
-        )
+        detections = self._target_card_aruco_detections(image, roi_norm=roi_values)
+        if not detections:
+            detections, _roi = self._target_card_matcher().match_all(
+                image,
+                roi_norm=roi_values,
+                threshold=float(self.get_parameter("target_card_match_threshold").value),
+                marker_detection_enabled=False,
+            )
         return tuple(detections), sequence
 
     def _identify_target_card(self, *, run_id: str) -> tuple[object, dict[str, object]]:
@@ -1936,6 +2020,42 @@ class PipelineOrchestratorNode(Node):
             "target_item_id": target_item_id,
         }
 
+    def _advance_base_before_grasp_scan(
+        self, *, run_id: str, target_item_id: str
+    ) -> dict[str, object]:
+        """Move from navigation's pickup pre-stop to the scan start point."""
+        distance_m = float(
+            self.get_parameter("base_grasp_pre_scan_advance_m").value
+        )
+        if distance_m <= 0.01:
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": "base_grasp_pre_scan_advance_m is disabled",
+                "phase": "before_grasp_scan",
+                "target_item_id": target_item_id,
+            }
+        speed_mps = float(
+            self.get_parameter("base_grasp_pre_scan_speed_mps").value
+        )
+        timeout_s = float(
+            self.get_parameter("base_grasp_pre_scan_timeout_s").value
+        )
+        self._publish_status(
+            f"advancing_base_before_grasp_scan: run_id={run_id} "
+            f"item={target_item_id} distance={distance_m:.3f}m"
+        )
+        movement = self._move_base_for_scan(
+            distance_m,
+            timeout_s=timeout_s,
+            speed_mps=speed_mps,
+        )
+        return {
+            **movement,
+            "phase": "before_grasp_scan",
+            "target_item_id": target_item_id,
+        }
+
     def _advance_base_after_place(self, *, run_id: str, item_id: str) -> dict[str, object]:
         distance_m = float(self.get_parameter("post_place_base_advance_m").value)
         speed_mps = float(
@@ -1974,6 +2094,9 @@ class PipelineOrchestratorNode(Node):
         if len(home_values) != 6:
             raise RuntimeError("post_place_home_pose must contain 6 mm/deg values")
 
+        advance_base = bool(
+            self.get_parameter("post_place_base_advance_enabled").value
+        )
         base_result: dict[str, object] | None = None
         base_errors: list[BaseException] = []
 
@@ -1988,14 +2111,20 @@ class PipelineOrchestratorNode(Node):
                 base_errors.append(exc)
 
         self._publish_status(
-            f"returning_home_and_advancing_base_after_place: run_id={run_id}"
+            (
+                f"returning_home_and_advancing_base_after_place: run_id={run_id}"
+                if advance_base
+                else f"returning_home_after_place: run_id={run_id}; navigation owns base"
+            )
         )
-        base_thread = threading.Thread(
-            target=base_worker,
-            daemon=True,
-            name=f"post-place-base-advance-{run_id}",
-        )
-        base_thread.start()
+        base_thread = None
+        if advance_base:
+            base_thread = threading.Thread(
+                target=base_worker,
+                daemon=True,
+                name=f"post-place-base-advance-{run_id}",
+            )
+            base_thread.start()
         try:
             home_response = self._execute_named_pose(
                 name="home_after_place",
@@ -2010,11 +2139,13 @@ class PipelineOrchestratorNode(Node):
                 timeout_s=60.0,
             )
         except BaseException:
-            if base_thread.is_alive():
+            if base_thread is not None and base_thread.is_alive():
                 self._request_base_scan_stop()
-            base_thread.join()
+            if base_thread is not None:
+                base_thread.join()
             raise
-        base_thread.join()
+        if base_thread is not None:
+            base_thread.join()
         if base_errors:
             self.get_logger().warning(
                 "post-place base advance failed after a successful release: "
@@ -2024,7 +2155,13 @@ class PipelineOrchestratorNode(Node):
                 "success": False,
                 "error": str(base_errors[0]),
             }
-        if base_result is None:
+        if not advance_base:
+            base_result = {
+                "success": True,
+                "skipped": True,
+                "reason": "navigation handoff owns post-place movement",
+            }
+        elif base_result is None:
             base_result = {
                 "success": False,
                 "error": "post-place base advance returned no result",
@@ -4183,6 +4320,10 @@ class PipelineOrchestratorNode(Node):
                 ),
             )
             taught_map = load_mapping_for_item(item.item_id)
+            taught_u_margin_px = max(
+                0.0,
+                float(self.get_parameter("base_target_taught_u_margin_px").value),
+            )
             taught_align_u_px = (
                 None if taught_map is None else taught_map.align_u_px
             )
@@ -4210,14 +4351,28 @@ class PipelineOrchestratorNode(Node):
                 return abs(u_px / width - label_align_u_norm(width))
 
             def label_is_centered(label: dict[str, object]) -> bool:
-                center_error = label_center_error(label)
-                return bool(
+                if not bool(
                     str(label.get("matched_item_id") or "") == item.item_id
                     and float(label.get("confidence") or 0.0)
                     >= float(self.get_parameter("label_match_threshold").value)
-                    and math.isfinite(center_error)
-                    and center_error <= center_limit
-                )
+                ):
+                    return False
+                bbox = list(label.get("bbox_xywh") or [])
+                if len(bbox) != 4:
+                    return False
+                u_px = float(bbox[0]) + (0.5 * float(bbox[2]))
+                # The label must enter the horizontal range represented by
+                # this item's taught UV map.  It is much wider than an image
+                # center gate, while rejecting partial edge detections.
+                if taught_map is not None:
+                    lower, upper = taught_map.u_px_range
+                    return bool(
+                        float(lower) - taught_u_margin_px
+                        <= u_px
+                        <= float(upper) + taught_u_margin_px
+                    )
+                center_error = label_center_error(label)
+                return bool(math.isfinite(center_error) and center_error <= center_limit)
 
             def preview_label_probe(**kwargs):
                 matched = self._match_box_label_from_preview(
@@ -4307,12 +4462,7 @@ class PipelineOrchestratorNode(Node):
                     if bool(label["centered"]):
                         selected_view = view
                         break
-                    target_seen = bool(
-                        str(label.get("matched_item_id") or "") == item.item_id
-                        and float(label.get("confidence") or 0.0)
-                        >= float(self.get_parameter("label_match_threshold").value)
-                        and math.isfinite(center_error_norm)
-                    )
+                    target_seen = bool(label["centered"])
                     if target_seen:
                         had_target = True
                         target_miss_streak = 0
@@ -4433,6 +4583,7 @@ class PipelineOrchestratorNode(Node):
                 "selected_confidence": float(selected_label.get("confidence") or 0.0),
                 "selected_center_error_norm": float(selected_label.get("center_error_norm") or 0.0),
                 "center_tolerance_norm": center_limit,
+                "taught_u_margin_px": taught_u_margin_px,
                 "align_u_px": (
                     None if taught_align_u_px is None else float(taught_align_u_px)
                 ),
@@ -4451,10 +4602,10 @@ class PipelineOrchestratorNode(Node):
             payload = {
                 "success": validation_ok,
                 "validation_message": (
-                    "target label centered and base stopped"
+                    "target label detected and base stopped; UV mapping will determine release pose"
                     if validation_ok
                     else (
-                        f"target label {item.item_id} was not centered within "
+                        f"target label {item.item_id} was not detected within "
                         f"{len(views)} views / {current_offset:.3f}m"
                     )
                 ),
@@ -4483,8 +4634,8 @@ class PipelineOrchestratorNode(Node):
             self._result_pub.publish(String(data=json_dumps(payload)))
             response.success = validation_ok
             response.message = (
-                f"Scout stopped aligned to {item.item_id}; "
-                f"center_error={float(selected_label.get('center_error_norm') or 0.0):.3f}"
+                f"Scout stopped after detecting {item.item_id}; "
+                f"center_error(record-only)={float(selected_label.get('center_error_norm') or 0.0):.3f}"
                 if validation_ok
                 else payload["validation_message"]
             )
@@ -5305,6 +5456,20 @@ class PipelineOrchestratorNode(Node):
             request_payload["execute"] = bool(self.get_parameter("execute").value)
 
             if base_grasp_scan_requested:
+                # Nav2 has deliberately stopped at the pickup pre-stop.  The
+                # target card is already resolved above, so only the arm
+                # pipeline may now command the short move into the pickup
+                # scan lane.  Do this once, not again for recognition retries.
+                pre_scan_movement = self._advance_base_before_grasp_scan(
+                    run_id=run_id,
+                    target_item_id=target_item_id,
+                )
+                result_payload["pre_grasp_scan_base_advance"] = pre_scan_movement
+                diagnostics.append(
+                    "pre-grasp scan base advance: "
+                    f"requested={float(pre_scan_movement.get('requested_distance_m', 0.0)):.3f}m "
+                    f"traveled={float(pre_scan_movement.get('traveled_m', 0.0)):.3f}m"
+                )
                 scan_retries = self._recognition_max_retries("grasp_scan_max_retries")
                 cycle = None
                 grasp_scan_payload = None

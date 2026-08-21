@@ -992,11 +992,27 @@ class ReferenceLabelMatcher:
                 item_id = yolo_item_id
                 fraction = 0.0
                 method = "yolo6_green_fallback"
+            # Orange and yellow intentionally overlap in HSV: their printed
+            # cards are both warm colours, so hue alone cannot reliably
+            # separate them (especially under the RealSense's red cast).
+            # For just this pair, retain the trained six-class YOLO result
+            # when it is confident.  The model was trained on the actual box
+            # labels and is therefore a stronger discriminator than the
+            # overlapping HSV masks.  A modest threshold still lets HSV
+            # handle uncertain detections rather than inventing a class.
+            if (
+                yolo_item_id in {"orange_bottle", "yellow_block"}
+                and item_id in {"orange_bottle", "yellow_block"}
+                and item_id != yolo_item_id
+                and yolo_score >= 0.65
+            ):
+                item_id = yolo_item_id
+                method = "yolo6_warm_label_disambiguated"
             if item_id is None:
                 continue
             confidence = (
                 min(0.99, yolo_score)
-                if method == "yolo6_green_fallback"
+                if method in {"yolo6_green_fallback", "yolo6_warm_label_disambiguated"}
                 else min(0.99, (0.55 * yolo_score) + (0.45 * fraction))
             )
             detections.append(

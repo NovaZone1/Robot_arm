@@ -72,10 +72,16 @@ grasp_pipeline:
     # first recognize one printed catalog photo on the adjacent target-card
     # table; only then start the forward base scan for that resolved item.
     auto_target_from_card: true
-    # The card can shift inside the upper-center observation area. Recognition
-    # uses photograph-template evidence only inside this broad window; direct
-    # color-marker proposals are reserved for the separate six-box scan.
-    target_card_search_roi_norm: [0.35, 0.01, 0.88, 0.50]
+    # Read the unique ArUco code printed on each physical target card before
+    # falling back to photo-template matching.  The taught mapping lives in
+    # config/target_card_aruco_map.yaml and survives restarts.
+    target_card_aruco_enabled: true
+    target_card_aruco_map_path: "/home/nvidia/auto/Robot_arm/source/config/target_card_aruco_map.yaml"
+    # Current right-side observation places the target-card table on the left
+    # half of the D435 image.  The old x=0.35 start excluded most of a card at
+    # x≈0.11–0.42, so even a plainly visible red-block photo was never passed
+    # to the template matcher. Direct color-marker proposals remain disabled.
+    target_card_search_roi_norm: [0.05, 0.05, 0.55, 0.85]
     target_card_match_threshold: 0.50
     target_card_min_confidence: 0.53
     target_card_min_margin: 0.08
@@ -153,6 +159,10 @@ grasp_pipeline:
     # perfect before stopping; identity still requires strict template/YOLO
     # verification before any release path may execute.
     base_target_center_tolerance_norm: 0.12
+    # Target labels may stop anywhere inside the sampled horizontal UV range
+    # for their class, plus this left/right allowance.  This replaces the
+    # former narrow image-center requirement.
+    base_target_taught_u_margin_px: 45.0
     # Operator-recorded target centers, calibrated from the standard RGB-D
     # frames under config/calibration/target_center on 2026-08-08. Separate
     # vertical references account for the bottle/block height difference.
@@ -172,6 +182,12 @@ grasp_pipeline:
     # missed views, preventing single-frame color proposals from making Scout
     # shuttle around the scan origin.
     grasp_scan_lost_frames_before_reverse: 2
+    # Navigation/arm bridge routes may stop Nav2 at a pickup pre-stop, then
+    # enable this short odometry-closed-loop advance only after the target
+    # photo card has been identified. It remains off for dashboard runs.
+    base_grasp_pre_scan_advance_m: 0.0
+    base_grasp_pre_scan_speed_mps: 0.10
+    base_grasp_pre_scan_timeout_s: 20.0
     # For any catalog target found by the base grasp scan (bottle or block),
     # advance only after the grasp executor has closed and retreated, before
     # placement observation.
@@ -183,6 +199,9 @@ grasp_pipeline:
     post_place_base_advance_m: 1.50
     post_place_base_advance_speed_mps: 0.16
     post_place_base_advance_timeout_s: 50.0
+    # Normal dashboard placement retains the old transfer advance. Route
+    # bridges temporarily turn this off so Nav2 exclusively owns the next leg.
+    post_place_base_advance_enabled: true
     # After release and vertical retreat, fold Home while Scout performs the
     # post-place transfer leg. The two actions start together.
     post_place_home_pose: [57.0, 0.0, 215.0, 0.0, 85.0, 0.0]

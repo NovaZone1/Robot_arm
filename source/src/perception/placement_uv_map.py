@@ -154,6 +154,39 @@ def _release_waypoint(
     )
 
 
+def _angle_delta_deg(first: float, second: float) -> float:
+    return ((float(first) - float(second) + 180.0) % 360.0) - 180.0
+
+
+def _validate_consistent_release_orientation(
+    samples: Iterable[dict[str, object]], *, tolerance_deg: float = 15.0
+) -> None:
+    """Reject a map containing manually taught wrist orientations that differ.
+
+    The fitted model replays one wrist orientation.  Combining poses with a
+    rotated wrist creates an XY fit that looks numerically good but can sweep
+    the gripper through a box's label baffle during the real approach.
+    """
+    items = list(samples)
+    if not items:
+        return
+    reference = dict(items[0].get("release_pose_mm_deg") or {})
+    for index, sample in enumerate(items[1:], start=2):
+        pose = dict(sample.get("release_pose_mm_deg") or {})
+        for axis in ("roll_deg", "pitch_deg", "yaw_deg"):
+            delta = abs(
+                _angle_delta_deg(
+                    float(pose.get(axis) or 0.0), float(reference.get(axis) or 0.0)
+                )
+            )
+            if delta > float(tolerance_deg):
+                raise RuntimeError(
+                    "inconsistent taught release orientation: "
+                    f"sample {index} {axis} differs by {delta:.1f}° "
+                    f"(limit {tolerance_deg:.1f}°). Re-record this item with a fixed wrist orientation."
+                )
+
+
 def _rpy_from_center_sample(
     samples: Iterable[dict[str, object]],
 ) -> tuple[float, float, float] | None:
@@ -173,6 +206,7 @@ def fit_placement_uv_map(
     samples = list(samples_payload.get("samples") or [])
     if len(samples) < 5:
         raise RuntimeError("need at least 5 taught (u, v, X, Y) samples")
+    _validate_consistent_release_orientation(samples)
     u = np.array([float(sample["u_px"]) for sample in samples], dtype=np.float64)
     v = np.array([float(sample["v_px"]) for sample in samples], dtype=np.float64)
     x = np.array(
